@@ -4,6 +4,9 @@ use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
+pub mod selection;
+pub use selection::Selection;
+
 /// A directory entry discovered during listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -27,6 +30,11 @@ impl Entry {
 
     pub fn is_dir(&self) -> bool {
         self.is_dir
+    }
+
+    /// Returns the [`Location`] corresponding to this entry.
+    pub fn location(&self) -> Location {
+        Location::Local(self.path.clone())
     }
 
     /// Returns a lossy string representation of the entry name with control characters replaced
@@ -138,15 +146,31 @@ pub fn list_dir(path: &Path) -> io::Result<Listing> {
 }
 
 /// Identifies a target location to be browsed or operated on.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Location {
     Local(PathBuf),
     Remote { profile_id: String, path: PathBuf },
 }
 
+impl Location {
+    /// Returns the filesystem path for this location.
+    pub fn path(&self) -> &Path {
+        match self {
+            Location::Local(path) => path,
+            Location::Remote { path, .. } => path,
+        }
+    }
+}
+
 impl From<PathBuf> for Location {
     fn from(path: PathBuf) -> Self {
         Location::Local(path)
+    }
+}
+
+impl From<&PathBuf> for Location {
+    fn from(path: &PathBuf) -> Self {
+        Location::Local(path.clone())
     }
 }
 
@@ -159,6 +183,24 @@ impl From<&Path> for Location {
 impl From<&str> for Location {
     fn from(path: &str) -> Self {
         Location::Local(PathBuf::from(path))
+    }
+}
+
+impl From<&Entry> for Location {
+    fn from(entry: &Entry) -> Self {
+        Location::Local(entry.path.clone())
+    }
+}
+
+impl From<Entry> for Location {
+    fn from(entry: Entry) -> Self {
+        Location::Local(entry.path)
+    }
+}
+
+impl From<&Location> for Location {
+    fn from(loc: &Location) -> Self {
+        loc.clone()
     }
 }
 
