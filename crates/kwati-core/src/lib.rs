@@ -1,8 +1,10 @@
 mod settings;
 mod trash;
+mod watcher;
 
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use trash::trash;
+pub use watcher::DirWatcher;
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
