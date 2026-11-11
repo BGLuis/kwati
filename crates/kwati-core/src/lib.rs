@@ -1,5 +1,7 @@
+mod settings;
 mod trash;
 
+pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use trash::trash;
 
 use std::ffi::{OsStr, OsString};
