@@ -1,3 +1,7 @@
+mod trash;
+
+pub use trash::trash;
+
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
