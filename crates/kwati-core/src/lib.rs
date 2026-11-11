@@ -1,8 +1,25 @@
+mod copy;
+mod search;
+mod settings;
+mod trash;
+mod watcher;
+
+pub use copy::{
+    copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
+};
+pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
+pub use settings::{default_path as settings_path, Settings, SettingsWarning};
+pub use trash::trash;
+pub use watcher::DirWatcher;
+
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+
+pub mod selection;
+pub use selection::Selection;
 
 /// A directory entry discovered during listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +44,11 @@ impl Entry {
 
     pub fn is_dir(&self) -> bool {
         self.is_dir
+    }
+
+    /// Returns the [`Location`] corresponding to this entry.
+    pub fn location(&self) -> Location {
+        Location::Local(self.path.clone())
     }
 
     /// Returns a lossy string representation of the entry name with control characters replaced
@@ -137,16 +159,154 @@ pub fn list_dir(path: &Path) -> io::Result<Listing> {
     Ok(Listing::new(entries))
 }
 
+fn contains_path_separator(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str()
+            .as_bytes()
+            .iter()
+            .any(|&b| b == b'/' || b == b'\\')
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .any(|c| c == b'/' as u16 || c == b'\\' as u16)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        path.to_string_lossy()
+            .chars()
+            .any(|c| c == '/' || c == '\\' || std::path::is_separator(c))
+    }
+}
+
+/// Renames a directory entry to a new name.
+///
+/// Refuses to rename if the target already exists or if the new name contains a path separator.
+pub fn rename_entry(from: impl AsRef<Path>, new_name: impl AsRef<Path>) -> io::Result<()> {
+    let from = from.as_ref();
+    let new_name = new_name.as_ref();
+
+    if from.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source path cannot be empty",
+        ));
+    }
+
+    if new_name.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "new name cannot be empty",
+        ));
+    }
+
+    if from.symlink_metadata().is_err() {
+        return Err(from.symlink_metadata().unwrap_err());
+    }
+
+    let parent = match from.parent() {
+        Some(p) => p,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot rename filesystem root",
+            ));
+        }
+    };
+
+    let (target, candidate_name) = if from.parent().is_some() && new_name.parent() == from.parent()
+    {
+        let file_name = match new_name.file_name() {
+            Some(name) => Path::new(name),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid destination path",
+                ));
+            }
+        };
+        (new_name.to_path_buf(), file_name)
+    } else {
+        (parent.join(new_name), new_name)
+    };
+
+    if candidate_name == Path::new(".") || candidate_name == Path::new("..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid entry name",
+        ));
+    }
+
+    if contains_path_separator(candidate_name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name cannot contain path separators",
+        ));
+    }
+
+    if target.symlink_metadata().is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "target already exists",
+        ));
+    }
+
+    fs::rename(from, &target)
+}
+
+/// Creates a new directory at the given path.
+///
+/// Refuses to create the directory if a file or directory already exists at the target path.
+pub fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path cannot be empty",
+        ));
+    }
+
+    if path.symlink_metadata().is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "target already exists",
+        ));
+    }
+
+    fs::create_dir(path)
+}
+
 /// Identifies a target location to be browsed or operated on.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Location {
     Local(PathBuf),
     Remote { profile_id: String, path: PathBuf },
 }
 
+impl Location {
+    /// Returns the filesystem path for this location.
+    pub fn path(&self) -> &Path {
+        match self {
+            Location::Local(path) => path,
+            Location::Remote { path, .. } => path,
+        }
+    }
+}
+
 impl From<PathBuf> for Location {
     fn from(path: PathBuf) -> Self {
         Location::Local(path)
+    }
+}
+
+impl From<&PathBuf> for Location {
+    fn from(path: &PathBuf) -> Self {
+        Location::Local(path.clone())
     }
 }
 
@@ -159,6 +319,24 @@ impl From<&Path> for Location {
 impl From<&str> for Location {
     fn from(path: &str) -> Self {
         Location::Local(PathBuf::from(path))
+    }
+}
+
+impl From<&Entry> for Location {
+    fn from(entry: &Entry) -> Self {
+        Location::Local(entry.path.clone())
+    }
+}
+
+impl From<Entry> for Location {
+    fn from(entry: Entry) -> Self {
+        Location::Local(entry.path)
+    }
+}
+
+impl From<&Location> for Location {
+    fn from(loc: &Location) -> Self {
+        loc.clone()
     }
 }
 
@@ -238,3 +416,6 @@ impl Backend for LocalBackend {
 
 pub mod preview;
 pub use preview::*;
+
+pub mod history;
+pub use history::History;
