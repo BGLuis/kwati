@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 use gpui::{actions, prelude::*, px, size, App, Application, Bounds, WindowBounds, WindowOptions};
-use kwati_core::{list_dir, Location};
+use kwati_core::Location;
 use kwati_gui::actions::register_keybindings;
 use kwati_gui::components::register_text_input_keybindings;
 use kwati_gui::state::AppState;
@@ -31,20 +31,12 @@ fn main() {
                     ..Default::default()
                 },
                 |_, cx| {
-                    let mut state = AppState::new(initial_location.clone());
-                    // Perform initial synchronous load or populate initial entries
-                    if let Location::Local(path) = &initial_location {
-                        match list_dir(path) {
-                            Ok(listing) => {
-                                state.set_entries(listing.into_entries());
-                            }
-                            Err(err) => {
-                                state.set_status(format!("Failed to read directory: {}", err));
-                            }
-                        }
-                    }
-
-                    let app_state = cx.new(|_| state);
+                    let app_state = cx.new(|cx| {
+                        let mut state = AppState::new(initial_location.clone());
+                        state.attach(cx);
+                        state.reload_entries();
+                        state
+                    });
                     cx.new(|cx| MainView::new(app_state, cx))
                 },
             )

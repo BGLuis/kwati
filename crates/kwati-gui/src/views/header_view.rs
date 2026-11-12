@@ -9,6 +9,8 @@ use gpui::{
     MouseDownEvent, SharedString, Window,
 };
 
+use kwati_core::Location;
+
 use crate::components::TextInput;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -16,6 +18,9 @@ use crate::theme::Theme;
 pub struct HeaderView {
     pub app_state: Entity<AppState>,
     pub address_input: Entity<TextInput>,
+    // The address field is rewritten only when this changes, so a refresh of the same
+    // directory does not erase a path being typed.
+    shown_location: Location,
     pub theme: Theme,
 }
 
@@ -32,9 +37,19 @@ impl HeaderView {
             input.set_text(initial_path, cx);
             input
         });
+        let shown_location = app_state.read(cx).current_location.clone();
+        cx.observe(&app_state, |this, app_state, cx| {
+            let location = app_state.read(cx).current_location.clone();
+            if this.shown_location != location {
+                this.shown_location = location;
+                this.sync_address_input(cx);
+            }
+        })
+        .detach();
         Self {
             app_state,
             address_input,
+            shown_location,
             theme: Theme::dark(),
         }
     }
