@@ -1,4 +1,5 @@
 mod copy;
+mod move_entry;
 mod search;
 mod settings;
 mod trash;
@@ -8,6 +9,7 @@ mod watcher;
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
+pub use move_entry::{move_entry, move_entry_with};
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use trash::trash;
