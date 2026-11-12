@@ -3,6 +3,7 @@ mod connection;
 mod copy;
 mod delete;
 mod move_entry;
+pub mod places;
 mod profiles;
 mod search;
 mod secrets;
@@ -10,6 +11,7 @@ mod settings;
 mod transfer;
 mod trash;
 mod volume;
+pub mod volumes;
 mod watcher;
 
 pub use bounded::{
@@ -21,6 +23,10 @@ pub use copy::{
 };
 pub use delete::{delete_permanently, Confirmed};
 pub use move_entry::{move_entry, move_entry_with};
+pub use places::{
+    list_places, resolve_bookmarks, standard_places, standard_places_from, Bookmark, Place,
+    PlaceKind, ResolvedBookmark, SidebarPlaces,
+};
 pub use profiles::{
     default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
     PendingSecret, Protocol,
@@ -31,6 +37,9 @@ pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
+pub use volumes::{
+    filter_volumes, is_pseudo_filesystem, list_volumes, mounted_volumes, Volume, VolumeManager,
+};
 pub use watcher::DirWatcher;
 
 use std::ffi::{OsStr, OsString};
