@@ -277,6 +277,86 @@ impl AppState {
         }
     }
 
+    /// Moves the selection to the next entry in the list, returning the new index.
+    pub fn select_next(&mut self) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let next_ix = match self.selected_index() {
+            Some(ix) => (ix + 1).min(self.entries.len() - 1),
+            None => 0,
+        };
+        self.select_index(next_ix);
+        Some(next_ix)
+    }
+
+    /// Moves the selection to the previous entry in the list, returning the new index.
+    pub fn select_previous(&mut self) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let prev_ix = match self.selected_index() {
+            Some(ix) => ix.saturating_sub(1),
+            None => self.entries.len() - 1,
+        };
+        self.select_index(prev_ix);
+        Some(prev_ix)
+    }
+
+    /// Moves the selection to the first entry in the list.
+    pub fn select_first(&mut self) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        self.select_index(0);
+        Some(0)
+    }
+
+    /// Moves the selection to the last entry in the list.
+    pub fn select_last(&mut self) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let last_ix = self.entries.len() - 1;
+        self.select_index(last_ix);
+        Some(last_ix)
+    }
+
+    /// Moves the selection up by `page_size` entries.
+    pub fn select_page_up(&mut self, page_size: usize) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let ix = self.selected_index().unwrap_or(0);
+        let target = ix.saturating_sub(page_size);
+        self.select_index(target);
+        Some(target)
+    }
+
+    /// Moves the selection down by `page_size` entries.
+    pub fn select_page_down(&mut self, page_size: usize) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let ix = self.selected_index().unwrap_or(0);
+        let target = (ix + page_size).min(self.entries.len() - 1);
+        self.select_index(target);
+        Some(target)
+    }
+
+    /// Opens the currently selected entry: if directory, enters it; returns true if navigated.
+    pub fn open_selected_entry(&mut self) -> bool {
+        if let Some(ix) = self.selected_index() {
+            if let Some(entry) = self.entries.get(ix).cloned() {
+                if entry.is_dir() {
+                    self.navigate_to(entry.location());
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Sets or clears the status message shown in the footer.
     pub fn set_status(&mut self, message: impl Into<String>) {
         self.status_message = Some(message.into());

@@ -13,6 +13,8 @@ actions!(
         SelectPrevious,
         SelectFirst,
         SelectLast,
+        PageUp,
+        PageDown,
         Refresh,
         ToggleHidden,
     ]

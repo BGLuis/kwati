@@ -271,3 +271,69 @@ fn sorting_headers_and_hidden_files_toggle() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn keyboard_navigation_selection_enter_and_backspace() {
+    let temp_root = std::env::temp_dir().join(format!("kwati_test_keynav_{}", std::process::id()));
+    let subfolder = temp_root.join("subfolder_1");
+    let _ = std::fs::remove_dir_all(&temp_root);
+    std::fs::create_dir_all(&subfolder).unwrap();
+
+    let mut state = AppState::new(Location::Local(temp_root.clone()));
+    let mut entries = Vec::new();
+    entries.push(Entry::new(
+        OsString::from("subfolder_1"),
+        subfolder.clone(),
+        true,
+    ));
+    for i in 1..50 {
+        entries.push(
+            Entry::new(
+                OsString::from(format!("file_{:02}.txt", i)),
+                temp_root.join(format!("file_{:02}.txt", i)),
+                false,
+            )
+            .with_size((i as u64) * 100),
+        );
+    }
+    state.set_entries(entries);
+
+    assert_eq!(state.selected_index(), None);
+
+    // 1. Arrow Down (SelectNext)
+    assert_eq!(state.select_next(), Some(0));
+    assert_eq!(state.select_next(), Some(1));
+
+    // 2. Arrow Up (SelectPrevious)
+    assert_eq!(state.select_previous(), Some(0));
+    // At boundary 0, does not go below 0
+    assert_eq!(state.select_previous(), Some(0));
+
+    // 3. End (SelectLast)
+    assert_eq!(state.select_last(), Some(49));
+    // At boundary 49, select_next does not exceed 49
+    assert_eq!(state.select_next(), Some(49));
+
+    // 4. Home (SelectFirst)
+    assert_eq!(state.select_first(), Some(0));
+
+    // 5. PageDown / PageUp
+    assert_eq!(state.select_page_down(20), Some(20));
+    assert_eq!(state.select_page_down(20), Some(40));
+    assert_eq!(state.select_page_down(20), Some(49)); // clamped to last
+    assert_eq!(state.select_page_up(20), Some(29));
+    assert_eq!(state.select_page_up(20), Some(9));
+    assert_eq!(state.select_page_up(20), Some(0)); // clamped to 0
+
+    // 6. Enter opens folder
+    assert_eq!(state.selected_index(), Some(0));
+    assert!(state.entries[0].is_dir());
+    assert!(state.open_selected_entry());
+    assert_eq!(state.current_location, Location::Local(subfolder.clone()));
+
+    // 7. Backspace navigates to parent
+    assert!(state.go_up());
+    assert_eq!(state.current_location, Location::Local(temp_root.clone()));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}

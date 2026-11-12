@@ -5,11 +5,15 @@
 
 use gpui::{
     div, prelude::*, px, relative, rgb, rgba, uniform_list, Context, CursorStyle, Entity,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    ScrollStrategy, UniformListScrollHandle, Window,
+    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, ScrollStrategy, UniformListScrollHandle, Window,
 };
 use kwati_core::{Entry, Location, SortColumn, SortDirection};
 
+use crate::actions::navigation::{
+    GoBack, GoForward, GoUp, OpenSelected, PageDown, PageUp, Refresh, SelectFirst, SelectLast,
+    SelectNext, SelectPrevious, ToggleHidden,
+};
 use crate::components::ScrollbarState;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -73,16 +77,24 @@ pub fn format_modified(time: Option<std::time::SystemTime>) -> String {
 pub struct ListView {
     pub app_state: Entity<AppState>,
     pub theme: Theme,
+    pub focus_handle: FocusHandle,
     pub scroll_handle: UniformListScrollHandle,
     pub scrollbar_state: ScrollbarState,
     pub row_height: Pixels,
 }
 
+impl Focusable for ListView {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl ListView {
-    pub fn new(app_state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self {
             app_state,
             theme: Theme::dark(),
+            focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             scrollbar_state: ScrollbarState::default(),
             row_height: px(26.),
@@ -129,6 +141,71 @@ impl ListView {
                 state.selection.select_only(entry.location());
             });
         }
+    }
+
+    pub fn select_next(&mut self, cx: &mut Context<Self>) {
+        let new_ix = self.app_state.update(cx, |state, _cx| state.select_next());
+        if let Some(ix) = new_ix {
+            self.scroll_to_item(ix);
+        }
+        cx.notify();
+    }
+
+    pub fn select_previous(&mut self, cx: &mut Context<Self>) {
+        let new_ix = self
+            .app_state
+            .update(cx, |state, _cx| state.select_previous());
+        if let Some(ix) = new_ix {
+            self.scroll_to_item(ix);
+        }
+        cx.notify();
+    }
+
+    pub fn select_first(&mut self, cx: &mut Context<Self>) {
+        let new_ix = self.app_state.update(cx, |state, _cx| state.select_first());
+        if new_ix.is_some() {
+            self.scroll_to_top();
+        }
+        cx.notify();
+    }
+
+    pub fn select_last(&mut self, cx: &mut Context<Self>) {
+        let new_ix = self.app_state.update(cx, |state, _cx| state.select_last());
+        if new_ix.is_some() {
+            self.scroll_to_bottom();
+        }
+        cx.notify();
+    }
+
+    pub fn select_page_up(&mut self, cx: &mut Context<Self>) {
+        let new_ix = self
+            .app_state
+            .update(cx, |state, _cx| state.select_page_up(20));
+        if let Some(ix) = new_ix {
+            self.scroll_to_item(ix);
+        }
+        cx.notify();
+    }
+
+    pub fn select_page_down(&mut self, cx: &mut Context<Self>) {
+        let new_ix = self
+            .app_state
+            .update(cx, |state, _cx| state.select_page_down(20));
+        if let Some(ix) = new_ix {
+            self.scroll_to_item(ix);
+        }
+        cx.notify();
+    }
+
+    pub fn open_selected(&mut self, cx: &mut Context<Self>) {
+        self.app_state
+            .update(cx, |state, _cx| state.open_selected_entry());
+        cx.notify();
+    }
+
+    pub fn go_up(&mut self, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, _cx| state.go_up());
+        cx.notify();
     }
 
     fn on_sort_column_click(&mut self, column: SortColumn, cx: &mut Context<Self>) {
@@ -261,11 +338,51 @@ impl Render for ListView {
             .flex_col()
             .size_full()
             .bg(self.theme.bg_content)
+            .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(|this, _: &SelectNext, _window, cx| this.select_next(cx)))
+            .on_action(
+                cx.listener(|this, _: &SelectPrevious, _window, cx| this.select_previous(cx)),
+            )
+            .on_action(cx.listener(|this, _: &SelectFirst, _window, cx| this.select_first(cx)))
+            .on_action(cx.listener(|this, _: &SelectLast, _window, cx| this.select_last(cx)))
+            .on_action(cx.listener(|this, _: &PageUp, _window, cx| this.select_page_up(cx)))
+            .on_action(cx.listener(|this, _: &PageDown, _window, cx| this.select_page_down(cx)))
+            .on_action(cx.listener(|this, _: &OpenSelected, _window, cx| this.open_selected(cx)))
+            .on_action(cx.listener(|this, _: &GoUp, _window, cx| this.go_up(cx)))
+            .on_action(cx.listener(|this, _: &GoBack, _window, cx| {
+                this.app_state.update(cx, |state, _cx| {
+                    state.go_back();
+                });
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &GoForward, _window, cx| {
+                this.app_state.update(cx, |state, _cx| {
+                    state.go_forward();
+                });
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleHidden, _window, cx| this.on_toggle_hidden_click(cx)),
+            )
+            .on_action(cx.listener(|this, _: &Refresh, _window, cx| {
+                this.app_state.update(cx, |state, _cx| {
+                    state.reload_entries();
+                });
+                cx.notify();
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                if (event.keystroke.modifiers.control && event.keystroke.key == "h")
-                    || event.keystroke.key == "."
-                {
-                    this.on_toggle_hidden_click(cx);
+                match event.keystroke.key.as_str() {
+                    "down" => this.select_next(cx),
+                    "up" => this.select_previous(cx),
+                    "home" => this.select_first(cx),
+                    "end" => this.select_last(cx),
+                    "pageup" => this.select_page_up(cx),
+                    "pagedown" => this.select_page_down(cx),
+                    "enter" => this.open_selected(cx),
+                    "backspace" => this.go_up(cx),
+                    "." => this.on_toggle_hidden_click(cx),
+                    "h" if event.keystroke.modifiers.control => this.on_toggle_hidden_click(cx),
+                    _ => {}
                 }
             }))
             // Column Headers Bar
