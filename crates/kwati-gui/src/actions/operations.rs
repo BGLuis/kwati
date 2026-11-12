@@ -512,3 +512,159 @@ pub fn execute_permanent_delete(state: &mut AppState, paths: &[PathBuf]) -> Resu
         Ok(deleted.len())
     }
 }
+
+/// Undoes the last reversible file operation from the undo stack.
+/// Supports Rename, CreateDir, Copy, Move, and handles refusal when preconditions fail.
+pub fn execute_undo(state: &mut AppState) -> Result<String, String> {
+    let Some(op) = state.undo_stack.pop() else {
+        let msg = "Nothing to undo".to_string();
+        state.set_status(&msg);
+        return Err(msg);
+    };
+
+    match op {
+        UndoOperation::Rename { from, to } => {
+            let from_name = from
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if !to.exists() && to.symlink_metadata().is_err() {
+                let refusal = format!(
+                    "Cannot undo rename: '{}' no longer exists",
+                    to.file_name().unwrap_or_default().to_string_lossy()
+                );
+                state.set_status(&refusal);
+                return Err(refusal);
+            }
+
+            if from.exists() || from.symlink_metadata().is_ok() {
+                let refusal = format!(
+                    "Cannot undo rename: original name '{}' already exists",
+                    from_name
+                );
+                state.set_status(&refusal);
+                return Err(refusal);
+            }
+
+            if let Err(err) = rename_entry(&to, &from_name) {
+                let refusal = format!("Failed to undo rename: {}", err);
+                state.set_status(&refusal);
+                return Err(refusal);
+            }
+
+            if let Location::Local(current_path) = &state.current_location {
+                if let Ok(listing) = list_dir(current_path) {
+                    state.set_entries(listing.into_entries());
+                }
+            }
+
+            state.selection.select_only(Location::Local(from.clone()));
+
+            let msg = format!("Undid rename of '{}'", from_name);
+            state.set_status(&msg);
+            Ok(msg)
+        }
+        UndoOperation::CreateDir { path } => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if !path.exists() {
+                let refusal = format!("Cannot undo folder creation: '{}' no longer exists", name);
+                state.set_status(&refusal);
+                return Err(refusal);
+            }
+
+            if let Err(err) = std::fs::remove_dir(&path) {
+                let refusal = format!("Cannot undo folder creation: {}", err);
+                state.set_status(&refusal);
+                return Err(refusal);
+            }
+
+            state.selection.deselect(&Location::Local(path.clone()));
+
+            if let Location::Local(current_path) = &state.current_location {
+                if let Ok(listing) = list_dir(current_path) {
+                    state.set_entries(listing.into_entries());
+                }
+            }
+
+            let msg = format!("Undid create folder '{}'", name);
+            state.set_status(&msg);
+            Ok(msg)
+        }
+        UndoOperation::Copy { destinations } => {
+            for dest in &destinations {
+                if let Ok(meta) = std::fs::symlink_metadata(dest) {
+                    if meta.is_dir() {
+                        let _ = std::fs::remove_dir_all(dest);
+                    } else {
+                        let _ = std::fs::remove_file(dest);
+                    }
+                    state.selection.deselect(&Location::Local(dest.clone()));
+                }
+            }
+
+            if let Location::Local(current_path) = &state.current_location {
+                if let Ok(listing) = list_dir(current_path) {
+                    state.set_entries(listing.into_entries());
+                }
+            }
+
+            let msg = "Undid copy operation".to_string();
+            state.set_status(&msg);
+            Ok(msg)
+        }
+        UndoOperation::Move { from, to } => {
+            // Verify all targets exist and origins are free before moving back
+            for (f, t) in from.iter().zip(to.iter()) {
+                if !t.exists() && t.symlink_metadata().is_err() {
+                    let refusal = format!("Cannot undo move: '{}' no longer exists", t.display());
+                    state.set_status(&refusal);
+                    return Err(refusal);
+                }
+                if f.exists() || f.symlink_metadata().is_ok() {
+                    let refusal = format!(
+                        "Cannot undo move: destination '{}' already exists",
+                        f.display()
+                    );
+                    state.set_status(&refusal);
+                    return Err(refusal);
+                }
+            }
+
+            for (f, t) in from.iter().zip(to.iter()) {
+                if f.parent() == t.parent() {
+                    let _ = std::fs::rename(t, f);
+                } else if let Some(parent) = f.parent() {
+                    let cancel_flag = Arc::new(AtomicBool::new(false));
+                    let options = CopyOptions::new(ConflictPolicy::Replace, cancel_flag);
+                    let mut dummy = |_: kwati_core::Progress| {};
+                    let _ = move_entry(t, parent, &options, &mut dummy);
+                }
+            }
+
+            if let Location::Local(current_path) = &state.current_location {
+                if let Ok(listing) = list_dir(current_path) {
+                    state.set_entries(listing.into_entries());
+                }
+            }
+
+            if let Some(first) = from.first() {
+                state.selection.select_only(Location::Local(first.clone()));
+            }
+
+            let msg = "Undid move operation".to_string();
+            state.set_status(&msg);
+            Ok(msg)
+        }
+        UndoOperation::Trash { original_paths: _ } => {
+            let refusal =
+                "Cannot undo trash: system trash does not support automatic restore".to_string();
+            state.set_status(&refusal);
+            Err(refusal)
+        }
+    }
+}

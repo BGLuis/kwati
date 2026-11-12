@@ -5,7 +5,7 @@ use kwati_core::{list_dir, ConflictPolicy, CopyOutcome, Location};
 use kwati_gui::actions::operations::{
     check_paste_conflict, clear_clipboard, copy_to_clipboard, cut_to_clipboard, execute_copy,
     execute_create_folder, execute_move, execute_permanent_delete, execute_rename, execute_trash,
-    get_clipboard, validate_entry_name,
+    execute_undo, get_clipboard, validate_entry_name,
 };
 use kwati_gui::state::{AppState, UndoOperation};
 
@@ -575,4 +575,197 @@ fn test_permanent_delete_cancel_leaves_file_in_place() {
     assert!(state.undo_stack.is_empty());
 
     let _ = fs::remove_dir_all(test_dir);
+}
+
+// =========================================================================
+// Issue #65: Undo stack for reversible file operations with feedback
+// =========================================================================
+
+#[test]
+fn test_undo_rename_restores_original_name_and_status() {
+    let test_dir = create_temp_test_dir("undo_rename");
+    let original = test_dir.join("file_a.txt");
+    fs::write(&original, "data").unwrap();
+
+    let mut state = AppState::new(Location::Local(test_dir.clone()));
+    let initial_listing = list_dir(&test_dir).unwrap();
+    state.set_entries(initial_listing.into_entries());
+
+    // Rename file_a -> file_b
+    let new_path = execute_rename(&mut state, &original, "file_b.txt").unwrap();
+    assert!(new_path.exists());
+    assert!(!original.exists());
+    assert_eq!(state.undo_stack.len(), 1);
+
+    // Undo rename
+    let res = execute_undo(&mut state);
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap(), "Undid rename of 'file_a.txt'");
+    assert_eq!(
+        state.status_message.as_deref(),
+        Some("Undid rename of 'file_a.txt'")
+    );
+
+    // File name restored on disk
+    assert!(original.exists());
+    assert!(!new_path.exists());
+
+    // State refreshed and restored entry selected
+    assert!(state.entries.iter().any(|e| e.name == "file_a.txt"));
+    assert!(state.selection.contains(&Location::Local(original)));
+
+    // Undo stack now empty
+    assert!(state.undo_stack.is_empty());
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+#[test]
+fn test_undo_rename_refusal_when_destination_missing() {
+    let test_dir = create_temp_test_dir("undo_rename_missing");
+    let original = test_dir.join("orig.txt");
+    fs::write(&original, "x").unwrap();
+
+    let mut state = AppState::new(Location::Local(test_dir.clone()));
+    let new_path = execute_rename(&mut state, &original, "target.txt").unwrap();
+
+    // Destination is deleted out-of-band
+    fs::remove_file(&new_path).unwrap();
+
+    // Undo should be refused
+    let res = execute_undo(&mut state);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().contains("no longer exists"));
+    assert!(state.status_message.unwrap().contains("no longer exists"));
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+#[test]
+fn test_undo_rename_refusal_when_original_exists() {
+    let test_dir = create_temp_test_dir("undo_rename_conflict");
+    let original = test_dir.join("source.txt");
+    fs::write(&original, "x").unwrap();
+
+    let mut state = AppState::new(Location::Local(test_dir.clone()));
+    let _ = execute_rename(&mut state, &original, "renamed.txt").unwrap();
+
+    // Recreate original name out-of-band
+    fs::write(&original, "collision").unwrap();
+
+    // Undo should be refused
+    let res = execute_undo(&mut state);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().contains("already exists"));
+    assert!(state.status_message.unwrap().contains("already exists"));
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+#[test]
+fn test_undo_create_folder_removes_folder() {
+    let test_dir = create_temp_test_dir("undo_folder");
+    let mut state = AppState::new(Location::Local(test_dir.clone()));
+
+    let folder = execute_create_folder(&mut state, &test_dir, "to_undo_dir").unwrap();
+    assert!(folder.is_dir());
+
+    let res = execute_undo(&mut state);
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap(), "Undid create folder 'to_undo_dir'");
+    assert!(!folder.exists());
+    assert!(!state.entries.iter().any(|e| e.name == "to_undo_dir"));
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+#[test]
+fn test_undo_copy_removes_destinations() {
+    let src_dir = create_temp_test_dir("undo_copy_src");
+    let file = src_dir.join("copied.txt");
+    fs::write(&file, "copy").unwrap();
+
+    let dst_dir = create_temp_test_dir("undo_copy_dst");
+    let mut state = AppState::new(Location::Local(dst_dir.clone()));
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let _ = execute_copy(
+        &mut state,
+        std::slice::from_ref(&file),
+        &dst_dir,
+        ConflictPolicy::Replace,
+        cancel_flag,
+    );
+    let copied_target = dst_dir.join("copied.txt");
+    assert!(copied_target.exists());
+
+    let res = execute_undo(&mut state);
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap(), "Undid copy operation");
+    assert!(!copied_target.exists());
+    assert!(file.exists()); // Source untouched
+
+    let _ = fs::remove_dir_all(src_dir);
+    let _ = fs::remove_dir_all(dst_dir);
+}
+
+#[test]
+fn test_undo_move_restores_source() {
+    let src_dir = create_temp_test_dir("undo_move_src");
+    let file = src_dir.join("move_me.txt");
+    fs::write(&file, "moved").unwrap();
+
+    let dst_dir = create_temp_test_dir("undo_move_dst");
+    let mut state = AppState::new(Location::Local(dst_dir.clone()));
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let _ = execute_move(
+        &mut state,
+        std::slice::from_ref(&file),
+        &dst_dir,
+        ConflictPolicy::Replace,
+        cancel_flag,
+        false,
+    );
+    let target = dst_dir.join("move_me.txt");
+    assert!(target.exists());
+    assert!(!file.exists());
+
+    let res = execute_undo(&mut state);
+    assert!(res.is_ok());
+    assert_eq!(res.unwrap(), "Undid move operation");
+    assert!(file.exists());
+    assert!(!target.exists());
+
+    let _ = fs::remove_dir_all(src_dir);
+    let _ = fs::remove_dir_all(dst_dir);
+}
+
+#[test]
+fn test_undo_trash_refused_with_reason() {
+    let mut state = AppState::new(Location::Local(PathBuf::from("/tmp")));
+    state.undo_stack.push(UndoOperation::Trash {
+        original_paths: vec![PathBuf::from("/tmp/trashed.txt")],
+    });
+
+    let res = execute_undo(&mut state);
+    assert!(res.is_err());
+    assert!(res
+        .unwrap_err()
+        .contains("system trash does not support automatic restore"));
+    assert!(state
+        .status_message
+        .unwrap()
+        .contains("system trash does not support automatic restore"));
+}
+
+#[test]
+fn test_undo_empty_stack_reports_nothing_to_undo() {
+    let mut state = AppState::new(Location::Local(PathBuf::from("/tmp")));
+    assert!(state.undo_stack.is_empty());
+
+    let res = execute_undo(&mut state);
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err(), "Nothing to undo");
+    assert_eq!(state.status_message.as_deref(), Some("Nothing to undo"));
 }
