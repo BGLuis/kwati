@@ -162,3 +162,119 @@ fn test_password_prompt_saving_behavior() {
     // Next connection can read remembered password
     assert_eq!(stored_passwords.get(host).unwrap(), "persistent_secret_456");
 }
+
+#[test]
+fn test_remote_auto_refresh_toggle_and_interval() {
+    use kwati_gui::actions::remote_sync::{
+        RemotePollingState, RemoteSyncController, DEFAULT_REMOTE_POLL_INTERVAL_SECS,
+        MIN_REMOTE_POLL_INTERVAL_SECS,
+    };
+
+    let mut controller = RemoteSyncController::new();
+    assert!(!controller.auto_refresh_enabled);
+    assert_eq!(controller.polling_state, RemotePollingState::Disabled);
+    assert_eq!(
+        controller.poll_interval_secs,
+        DEFAULT_REMOTE_POLL_INTERVAL_SECS
+    );
+    assert_eq!(controller.status_indicator(), "Auto-refresh: Off");
+
+    // Enable with interval
+    controller.enable_auto_refresh(20);
+    assert!(controller.auto_refresh_enabled);
+    assert_eq!(controller.poll_interval_secs, 20);
+    assert_eq!(controller.polling_state, RemotePollingState::Active);
+    assert!(controller.can_poll());
+
+    // Interval below minimum is clamped to MIN_REMOTE_POLL_INTERVAL_SECS (10s)
+    controller.set_poll_interval(3);
+    assert_eq!(controller.poll_interval_secs, MIN_REMOTE_POLL_INTERVAL_SECS);
+
+    // Polling start and finish transitions
+    assert!(controller.start_poll());
+    assert_eq!(controller.polling_state, RemotePollingState::Polling);
+    controller.finish_poll();
+    assert_eq!(controller.polling_state, RemotePollingState::Active);
+    assert!(controller.last_poll_time.is_some());
+
+    // Disable auto-refresh
+    controller.disable_auto_refresh();
+    assert!(!controller.auto_refresh_enabled);
+    assert_eq!(controller.polling_state, RemotePollingState::Disabled);
+    assert!(!controller.can_poll());
+}
+
+#[test]
+fn test_remote_poll_pauses_when_window_unfocused() {
+    use kwati_gui::actions::remote_sync::{RemotePollingState, RemoteSyncController};
+    use std::sync::atomic::Ordering;
+
+    let mut controller = RemoteSyncController::new();
+    controller.enable_auto_refresh(15);
+    assert!(controller.can_poll());
+    assert_eq!(controller.polling_state, RemotePollingState::Active);
+    assert!(!controller.paused_flag().load(Ordering::SeqCst));
+
+    // When the window loses focus, polling must pause immediately
+    controller.set_window_focused(false);
+    assert_eq!(
+        controller.polling_state,
+        RemotePollingState::PausedUnfocused
+    );
+    assert!(!controller.can_poll());
+    assert!(controller.paused_flag().load(Ordering::SeqCst));
+    assert_eq!(
+        controller.status_indicator(),
+        "Auto-refresh: Paused (window unfocused)"
+    );
+
+    // Attempting to poll while unfocused fails
+    assert!(!controller.start_poll());
+
+    // When window regains focus, polling resumes automatically
+    controller.set_window_focused(true);
+    assert_eq!(controller.polling_state, RemotePollingState::Active);
+    assert!(controller.can_poll());
+    assert!(!controller.paused_flag().load(Ordering::SeqCst));
+}
+
+#[test]
+fn test_remote_refresh_retains_selection_by_location() {
+    use kwati_core::{Entry, Selection};
+    use kwati_gui::actions::remote_sync::RemoteSyncController;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    let e1 = Entry::new(
+        OsString::from("file1.txt"),
+        PathBuf::from("/remote/file1.txt"),
+        false,
+    );
+    let e2 = Entry::new(
+        OsString::from("file2.txt"),
+        PathBuf::from("/remote/file2.txt"),
+        false,
+    );
+    let e3 = Entry::new(
+        OsString::from("file3.txt"),
+        PathBuf::from("/remote/file3.txt"),
+        false,
+    );
+
+    let loc1 = Location::from(&e1.path);
+    let loc2 = Location::from(&e2.path);
+
+    let mut selection = Selection::new();
+    selection.select(loc1.clone());
+    selection.select(loc2.clone());
+    assert_eq!(selection.len(), 2);
+
+    // A refresh arrives: e1 still exists, e2 was deleted on remote, e3 was newly added
+    let new_entries = vec![e1.clone(), e3.clone()];
+    RemoteSyncController::retain_selection(&mut selection, &new_entries);
+
+    // e1 must still be selected; e2 must be dropped because it no longer exists
+    assert!(selection.is_selected(&loc1));
+    assert!(!selection.is_selected(&loc2));
+    assert_eq!(selection.len(), 1);
+}
