@@ -46,3 +46,56 @@ fn virtualized_list_selection_and_scrollbar_metrics() {
     assert_eq!(scrollbar.current_offset, 975);
     assert_eq!(scrollbar.scroll_ratio(), 1.0);
 }
+
+#[test]
+fn navigation_buttons_and_history_integration() {
+    let mut state = AppState::new(Location::Local(PathBuf::from("/tmp/folder_a")));
+    assert!(!state.history.can_go_back());
+    assert!(!state.history.can_go_forward());
+
+    // Navigate to folder B
+    state.navigate_to(Location::Local(PathBuf::from("/tmp/folder_b")));
+    assert!(state.history.can_go_back());
+    assert!(!state.history.can_go_forward());
+    assert_eq!(
+        state.current_location,
+        Location::Local(PathBuf::from("/tmp/folder_b"))
+    );
+
+    // Navigate to subfolder
+    state.navigate_to(Location::Local(PathBuf::from("/tmp/folder_b/sub")));
+    assert!(state.history.can_go_back());
+
+    // Back to folder B
+    assert!(state.go_back());
+    assert_eq!(
+        state.current_location,
+        Location::Local(PathBuf::from("/tmp/folder_b"))
+    );
+    assert!(state.history.can_go_forward());
+
+    // Back to folder A
+    assert!(state.go_back());
+    assert_eq!(
+        state.current_location,
+        Location::Local(PathBuf::from("/tmp/folder_a"))
+    );
+    assert!(!state.history.can_go_back());
+
+    // Cannot go back further
+    assert!(!state.go_back());
+
+    // Forward to folder B
+    assert!(state.go_forward());
+    assert_eq!(
+        state.current_location,
+        Location::Local(PathBuf::from("/tmp/folder_b"))
+    );
+
+    // Up to parent /tmp
+    assert!(state.go_up());
+    assert_eq!(
+        state.current_location,
+        Location::Local(PathBuf::from("/tmp"))
+    );
+}

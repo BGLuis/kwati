@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kwati_core::{Entry, History, Location, Selection, Settings};
+use kwati_core::{
+    list_dir_with_options, Entry, History, ListOptions, Location, Selection, Settings, SortColumn,
+    SortDirection,
+};
 
 /// Classification of background file operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +145,9 @@ pub struct AppState {
     pub search_query: Option<String>,       // Owned by inspect-worker
     pub network_status: NetworkMountStatus, // Owned by guinet-worker
     pub status_message: Option<String>,
+    pub sort_column: SortColumn,
+    pub sort_direction: SortDirection,
+    pub show_hidden: bool,
 }
 
 impl AppState {
@@ -158,6 +164,26 @@ impl AppState {
             search_query: None,
             network_status: NetworkMountStatus::Disconnected,
             status_message: None,
+            sort_column: SortColumn::Name,
+            sort_direction: SortDirection::Ascending,
+            show_hidden: false,
+        }
+    }
+
+    /// Reloads the entries of the current local directory using current sort and hidden options.
+    pub fn reload_entries(&mut self) {
+        if let Location::Local(path) = &self.current_location {
+            if path.is_dir() {
+                let options = ListOptions {
+                    show_hidden: self.show_hidden,
+                    sort_column: self.sort_column,
+                    sort_direction: self.sort_direction,
+                };
+                if let Ok(listing) = list_dir_with_options(path, &options) {
+                    self.set_entries(listing.into_entries());
+                    self.clear_status();
+                }
+            }
         }
     }
 
@@ -167,6 +193,44 @@ impl AppState {
         self.current_location = location;
         self.selection.clear();
         self.preview_state = None;
+        self.reload_entries();
+    }
+
+    /// Navigates back in history, returning true if history moved.
+    pub fn go_back(&mut self) -> bool {
+        if let Some(prev) = self.history.back().cloned() {
+            self.current_location = prev;
+            self.selection.clear();
+            self.preview_state = None;
+            self.reload_entries();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Navigates forward in history, returning true if history moved.
+    pub fn go_forward(&mut self) -> bool {
+        if let Some(next) = self.history.forward().cloned() {
+            self.current_location = next;
+            self.selection.clear();
+            self.preview_state = None;
+            self.reload_entries();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Navigates up to the parent directory, returning true if parent exists.
+    pub fn go_up(&mut self) -> bool {
+        if let Some(parent) = self.current_location.path().parent() {
+            if !parent.as_os_str().is_empty() {
+                self.navigate_to(parent.into());
+                return true;
+            }
+        }
+        false
     }
 
     /// Replaces the listed entries.
