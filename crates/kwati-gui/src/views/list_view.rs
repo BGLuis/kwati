@@ -5,14 +5,69 @@
 
 use gpui::{
     div, prelude::*, px, relative, rgb, rgba, uniform_list, Context, CursorStyle, Entity,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollStrategy,
-    UniformListScrollHandle, Window,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    ScrollStrategy, UniformListScrollHandle, Window,
 };
-use kwati_core::{Entry, Location};
+use kwati_core::{Entry, Location, SortColumn, SortDirection};
 
 use crate::components::ScrollbarState;
 use crate::state::AppState;
 use crate::theme::Theme;
+
+/// Formats a file size in human-readable units (B, KB, MB, GB, TB).
+pub fn format_size(bytes: Option<u64>, is_dir: bool) -> String {
+    if is_dir {
+        return "--".to_string();
+    }
+    let Some(b) = bytes else {
+        return "--".to_string();
+    };
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    const TB: u64 = 1024 * GB;
+
+    if b < KB {
+        format!("{} B", b)
+    } else if b < MB {
+        format!("{:.1} KB", b as f64 / KB as f64)
+    } else if b < GB {
+        format!("{:.1} MB", b as f64 / MB as f64)
+    } else if b < TB {
+        format!("{:.1} GB", b as f64 / GB as f64)
+    } else {
+        format!("{:.1} TB", b as f64 / TB as f64)
+    }
+}
+
+/// Formats a `SystemTime` timestamp into UTC `YYYY-MM-DD HH:MM`.
+pub fn format_modified(time: Option<std::time::SystemTime>) -> String {
+    let Some(time) = time else {
+        return "--".to_string();
+    };
+    let Ok(duration) = time.duration_since(std::time::UNIX_EPOCH) else {
+        return "--".to_string();
+    };
+    let secs = duration.as_secs();
+    let days = secs / 86400;
+    let rem_secs = secs % 86400;
+    let hours = rem_secs / 3600;
+    let minutes = (rem_secs % 3600) / 60;
+
+    // Civil calendar algorithm
+    let z = days as i64 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hours, minutes)
+}
 
 /// View rendering directory entries in a windowed list with a draggable scrollbar.
 pub struct ListView {
@@ -74,6 +129,20 @@ impl ListView {
                 state.selection.select_only(entry.location());
             });
         }
+    }
+
+    fn on_sort_column_click(&mut self, column: SortColumn, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, _cx| {
+            state.toggle_sort(column);
+        });
+        cx.notify();
+    }
+
+    fn on_toggle_hidden_click(&mut self, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, _cx| {
+            state.toggle_hidden();
+        });
+        cx.notify();
     }
 
     fn on_scrollbar_mouse_down(
@@ -159,6 +228,9 @@ impl Render for ListView {
         let entries = state.entries.clone();
         let selection = state.selection.clone();
         let entry_count = entries.len();
+        let sort_column = state.sort_column;
+        let sort_direction = state.sort_direction;
+        let show_hidden = state.show_hidden;
 
         let current_top = self
             .scroll_handle
@@ -173,12 +245,30 @@ impl Render for ListView {
 
         let entries_clone = entries.clone();
 
+        let sort_indicator = |col: SortColumn| -> &'static str {
+            if sort_column == col {
+                match sort_direction {
+                    SortDirection::Ascending => " ▲",
+                    SortDirection::Descending => " ▼",
+                }
+            } else {
+                ""
+            }
+        };
+
         div()
             .flex()
             .flex_col()
             .size_full()
             .bg(self.theme.bg_content)
-            // Column Headers
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if (event.keystroke.modifiers.control && event.keystroke.key == "h")
+                    || event.keystroke.key == "."
+                {
+                    this.on_toggle_hidden_click(cx);
+                }
+            }))
+            // Column Headers Bar
             .child(
                 div()
                     .flex()
@@ -191,9 +281,82 @@ impl Render for ListView {
                     .bg(self.theme.bg_header)
                     .text_color(self.theme.text_muted)
                     .text_size(px(12.))
-                    .child(div().flex_1().child("Name"))
-                    .child(div().w(px(100.)).child("Size"))
-                    .child(div().w(px(150.)).child("Modified")),
+                    // Name column header
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.text_color(self.theme.text_primary))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.on_sort_column_click(SortColumn::Name, cx)
+                                }),
+                            )
+                            .child(format!("Name{}", sort_indicator(SortColumn::Name))),
+                    )
+                    // Size column header
+                    .child(
+                        div()
+                            .w(px(100.))
+                            .flex()
+                            .items_center()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.text_color(self.theme.text_primary))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.on_sort_column_click(SortColumn::Size, cx)
+                                }),
+                            )
+                            .child(format!("Size{}", sort_indicator(SortColumn::Size))),
+                    )
+                    // Modified column header
+                    .child(
+                        div()
+                            .w(px(150.))
+                            .flex()
+                            .items_center()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.text_color(self.theme.text_primary))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.on_sort_column_click(SortColumn::Date, cx)
+                                }),
+                            )
+                            .child(format!("Modified{}", sort_indicator(SortColumn::Date))),
+                    )
+                    // Hidden toggle button
+                    .child(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_sm()
+                            .cursor(CursorStyle::PointingHand)
+                            .bg(if show_hidden {
+                                rgba(0x89b4fa33)
+                            } else {
+                                rgba(0x00000000)
+                            })
+                            .text_color(if show_hidden {
+                                rgb(0x89b4fa)
+                            } else {
+                                self.theme.text_muted
+                            })
+                            .hover(|s| s.bg(rgba(0xffffff14)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.on_toggle_hidden_click(cx)),
+                            )
+                            .child(if show_hidden {
+                                "Hidden: On"
+                            } else {
+                                "Hidden: Off"
+                            }),
+                    ),
             )
             // Row list + Scrollbar container
             .child(
@@ -215,7 +378,10 @@ impl Render for ListView {
                                         let loc: Location = entry.location();
                                         let is_selected = selection.contains(&loc);
                                         let is_dir = entry.is_dir();
+                                        let is_hidden = entry.is_hidden;
                                         let name = entry.display_name();
+                                        let size_str = format_size(entry.size, is_dir);
+                                        let date_str = format_modified(entry.modified);
                                         let entry_for_click = entry.clone();
 
                                         items.push(
@@ -234,7 +400,9 @@ impl Render for ListView {
                                                 })
                                                 .hover(|s| s.bg(rgba(0xffffff0d)))
                                                 .text_size(px(13.))
-                                                .text_color(if is_dir {
+                                                .text_color(if is_hidden {
+                                                    rgb(0x6c7086)
+                                                } else if is_dir {
                                                     rgb(0x89b4fa)
                                                 } else {
                                                     rgb(0xcdd6f4)
@@ -268,13 +436,13 @@ impl Render for ListView {
                                                     div()
                                                         .w(px(100.))
                                                         .text_color(rgb(0x6c7086))
-                                                        .child(if is_dir { "--" } else { "" }),
+                                                        .child(size_str),
                                                 )
                                                 .child(
                                                     div()
                                                         .w(px(150.))
                                                         .text_color(rgb(0x6c7086))
-                                                        .child(""),
+                                                        .child(date_str),
                                                 )
                                                 .into_any_element(),
                                         );

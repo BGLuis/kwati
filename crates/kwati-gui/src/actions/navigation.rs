@@ -14,5 +14,6 @@ actions!(
         SelectFirst,
         SelectLast,
         Refresh,
+        ToggleHidden,
     ]
 );

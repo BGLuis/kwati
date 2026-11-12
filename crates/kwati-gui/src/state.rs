@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kwati_core::{
-    list_dir_with_options, Entry, History, ListOptions, Location, Selection, Settings, SortColumn,
-    SortDirection,
+    list_dir_with_options, sort_entries_by, Entry, History, ListOptions, Location, Selection,
+    Settings, SortColumn, SortDirection,
 };
 
 /// Classification of background file operations.
@@ -220,6 +220,30 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    /// Toggles sorting on the given column.
+    /// Clicking the active column inverts direction; clicking another resets to Ascending.
+    pub fn toggle_sort(&mut self, column: SortColumn) {
+        if self.sort_column == column {
+            self.sort_direction = match self.sort_direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            };
+        } else {
+            self.sort_column = column;
+            self.sort_direction = SortDirection::Ascending;
+        }
+
+        let mut entries = (*self.entries).clone();
+        sort_entries_by(&mut entries, self.sort_column, self.sort_direction);
+        self.set_entries(entries);
+    }
+
+    /// Toggles the visibility of hidden files and reloads the directory listing.
+    pub fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.reload_entries();
     }
 
     /// Navigates up to the parent directory, returning true if parent exists.

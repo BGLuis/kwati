@@ -154,3 +154,120 @@ fn address_bar_path_entry_and_validation() {
 
     let _ = std::fs::remove_dir_all(&temp_root);
 }
+
+#[test]
+fn sorting_headers_and_hidden_files_toggle() {
+    use kwati_core::{SortColumn, SortDirection};
+    use kwati_gui::views::list_view::{format_modified, format_size};
+    use std::time::{Duration, SystemTime};
+
+    // 1. Formatters
+    assert_eq!(format_size(Some(500), false), "500 B");
+    assert_eq!(format_size(Some(2048), false), "2.0 KB");
+    assert_eq!(format_size(Some(10 * 1024 * 1024), false), "10.0 MB");
+    assert_eq!(format_size(Some(2048), true), "--");
+    assert_eq!(format_size(None, false), "--");
+
+    assert_eq!(
+        format_modified(Some(SystemTime::UNIX_EPOCH)),
+        "1970-01-01 00:00"
+    );
+    assert_eq!(
+        format_modified(Some(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(86400 * 365 + 3600 * 14 + 1800)
+        )),
+        "1971-01-01 14:30"
+    );
+
+    // 2. Sorting by column and toggling direction, directories always first
+    let dir_b = Entry::new(OsString::from("dir_b"), PathBuf::from("/tmp/dir_b"), true);
+    let dir_a = Entry::new(OsString::from("dir_a"), PathBuf::from("/tmp/dir_a"), true);
+    let file_z = Entry::new(
+        OsString::from("file_z.txt"),
+        PathBuf::from("/tmp/file_z.txt"),
+        false,
+    )
+    .with_size(100);
+    let file_x = Entry::new(
+        OsString::from("file_x.txt"),
+        PathBuf::from("/tmp/file_x.txt"),
+        false,
+    )
+    .with_size(500);
+
+    let mut state = AppState::new(Location::Local(PathBuf::from("/tmp")));
+    state.set_entries(vec![
+        dir_b.clone(),
+        file_z.clone(),
+        dir_a.clone(),
+        file_x.clone(),
+    ]);
+
+    // Initial state: Name, Ascending
+    state.toggle_sort(SortColumn::Name);
+    // Was Name Ascending, now toggle reverses to Name Descending
+    assert_eq!(state.sort_column, SortColumn::Name);
+    assert_eq!(state.sort_direction, SortDirection::Descending);
+    assert_eq!(state.entries[0].display_name(), "dir_b");
+    assert_eq!(state.entries[1].display_name(), "dir_a");
+    assert_eq!(state.entries[2].display_name(), "file_z.txt");
+    assert_eq!(state.entries[3].display_name(), "file_x.txt");
+
+    // Second click reverses back to Name Ascending
+    state.toggle_sort(SortColumn::Name);
+    assert_eq!(state.sort_direction, SortDirection::Ascending);
+    assert_eq!(state.entries[0].display_name(), "dir_a");
+    assert_eq!(state.entries[1].display_name(), "dir_b");
+    assert_eq!(state.entries[2].display_name(), "file_x.txt");
+    assert_eq!(state.entries[3].display_name(), "file_z.txt");
+
+    // Switch to Size Ascending
+    state.toggle_sort(SortColumn::Size);
+    assert_eq!(state.sort_column, SortColumn::Size);
+    assert_eq!(state.sort_direction, SortDirection::Ascending);
+    // Directories first
+    assert!(state.entries[0].is_dir());
+    assert!(state.entries[1].is_dir());
+    assert_eq!(state.entries[2].display_name(), "file_z.txt"); // 100 B
+    assert_eq!(state.entries[3].display_name(), "file_x.txt"); // 500 B
+
+    // Size Descending
+    state.toggle_sort(SortColumn::Size);
+    assert_eq!(state.sort_direction, SortDirection::Descending);
+    assert!(state.entries[0].is_dir());
+    assert!(state.entries[1].is_dir());
+    assert_eq!(state.entries[2].display_name(), "file_x.txt"); // 500 B
+    assert_eq!(state.entries[3].display_name(), "file_z.txt"); // 100 B
+
+    // 3. Hidden files toggle
+    let temp_dir = std::env::temp_dir().join(format!("kwati_test_hidden_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::write(temp_dir.join("normal.txt"), "hello").unwrap();
+    std::fs::write(temp_dir.join(".hidden.txt"), "secret").unwrap();
+
+    let mut state_hidden = AppState::new(Location::Local(temp_dir.clone()));
+    state_hidden.reload_entries();
+
+    // Hidden files off by default: only normal.txt is listed
+    assert!(!state_hidden.show_hidden);
+    assert_eq!(state_hidden.entries.len(), 1);
+    assert_eq!(state_hidden.entries[0].display_name(), "normal.txt");
+
+    // Toggle hidden files on: both appear
+    state_hidden.toggle_hidden();
+    assert!(state_hidden.show_hidden);
+    assert_eq!(state_hidden.entries.len(), 2);
+    assert!(state_hidden
+        .entries
+        .iter()
+        .any(|e| e.display_name() == ".hidden.txt"));
+
+    // Toggle hidden files off: hidden disappears
+    state_hidden.toggle_hidden();
+    assert!(!state_hidden.show_hidden);
+    assert_eq!(state_hidden.entries.len(), 1);
+    assert_eq!(state_hidden.entries[0].display_name(), "normal.txt");
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
