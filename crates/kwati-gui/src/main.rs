@@ -30,14 +30,14 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |_, cx| {
+                |window, cx| {
                     let app_state = cx.new(|cx| {
                         let mut state = AppState::new(initial_location.clone());
                         state.attach(cx);
                         state.reload_entries();
                         state
                     });
-                    cx.new(|cx| MainView::new(app_state, cx))
+                    cx.new(|cx| MainView::new(app_state, window, cx))
                 },
             )
             .expect("failed to open main window");

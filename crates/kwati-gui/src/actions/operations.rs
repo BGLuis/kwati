@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use gpui::actions;
 use kwati_core::{
-    copy_entry, create_dir, list_dir, move_entry, move_entry_with, rename_entry, trash,
-    ConflictPolicy, CopyOptions, CopyOutcome, Location,
+    copy_entry, create_dir, move_entry, move_entry_with, rename_entry, trash, ConflictPolicy,
+    CopyOptions, CopyOutcome, Location,
 };
 
 use crate::state::{AppState, JobKind, JobStatus, UndoOperation};
@@ -93,8 +93,249 @@ pub fn check_paste_conflict(sources: &[PathBuf], dest_dir: &Path) -> Option<Stri
     None
 }
 
-/// Copies files or folders into `dest_dir` with progress reporting, cancellation,
-/// and conflict resolution policy. Updates AppState jobs, undo stack, and selection.
+/// A copy or a move of `sources` into `dest_dir`.
+#[derive(Debug, Clone)]
+pub struct Transfer {
+    pub kind: JobKind,
+    pub sources: Vec<PathBuf>,
+    pub dest_dir: PathBuf,
+    pub policy: ConflictPolicy,
+    pub cancel: Arc<AtomicBool>,
+    simulate_cross_device: bool,
+}
+
+impl Transfer {
+    pub fn copy(sources: Vec<PathBuf>, dest_dir: PathBuf, policy: ConflictPolicy) -> Self {
+        Self {
+            kind: JobKind::Copy,
+            sources,
+            dest_dir,
+            policy,
+            cancel: Arc::new(AtomicBool::new(false)),
+            simulate_cross_device: false,
+        }
+    }
+
+    pub fn moving(sources: Vec<PathBuf>, dest_dir: PathBuf, policy: ConflictPolicy) -> Self {
+        Self {
+            kind: JobKind::Move,
+            ..Self::copy(sources, dest_dir, policy)
+        }
+    }
+
+    fn is_move(&self) -> bool {
+        self.kind == JobKind::Move
+    }
+}
+
+/// What a transfer did on disk, gathered without touching [`AppState`] so it can be produced
+/// off the main thread.
+struct TransferReport {
+    outcome: CopyOutcome,
+    transferred: usize,
+    // Only entries whose target did not exist before: undoing anything else would delete or
+    // move a file the user already had under that name.
+    undo_from: Vec<PathBuf>,
+    undo_to: Vec<PathBuf>,
+    error: Option<String>,
+}
+
+fn begin_transfer(state: &mut AppState, transfer: &Transfer) -> u64 {
+    let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst);
+    register_job_cancel(job_id, transfer.cancel.clone());
+
+    let verb = if transfer.is_move() {
+        "Moving"
+    } else {
+        "Copying"
+    };
+    let title = match transfer.sources.as_slice() {
+        [single] => format!(
+            "{verb} '{}'",
+            single.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        sources => format!("{verb} {} items", sources.len()),
+    };
+    let total_bytes = transfer
+        .sources
+        .iter()
+        .filter_map(|src| std::fs::symlink_metadata(src).ok())
+        .map(|meta| meta.len())
+        .sum();
+
+    state.add_job(JobStatus::new(
+        job_id,
+        title,
+        transfer.kind.clone(),
+        total_bytes,
+    ));
+    job_id
+}
+
+fn run_transfer(transfer: &Transfer, bytes_done: &AtomicU64) -> TransferReport {
+    let mut report = TransferReport {
+        outcome: CopyOutcome::Completed,
+        transferred: 0,
+        undo_from: Vec::new(),
+        undo_to: Vec::new(),
+        error: None,
+    };
+    let mut finished_bytes = 0u64;
+
+    for src in &transfer.sources {
+        if transfer.cancel.load(Ordering::Relaxed) {
+            report.outcome = CopyOutcome::Cancelled;
+            break;
+        }
+
+        let target = src.file_name().map(|name| transfer.dest_dir.join(name));
+        let target_existed = target
+            .as_ref()
+            .is_some_and(|target| target.symlink_metadata().is_ok());
+        let options = CopyOptions::new(transfer.policy, transfer.cancel.clone());
+        let mut on_progress = |p: kwati_core::Progress| {
+            bytes_done.store(finished_bytes + p.bytes_done, Ordering::Relaxed);
+        };
+
+        let result = if !transfer.is_move() {
+            copy_entry(src, &transfer.dest_dir, &options, &mut on_progress)
+        } else if transfer.simulate_cross_device {
+            move_entry_with(
+                src,
+                &transfer.dest_dir,
+                &options,
+                &mut on_progress,
+                &|_, _| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::CrossesDevices,
+                        "cross device",
+                    ))
+                },
+            )
+        } else {
+            move_entry(src, &transfer.dest_dir, &options, &mut on_progress)
+        };
+
+        match result {
+            Ok(CopyOutcome::Completed) => {
+                finished_bytes = bytes_done.load(Ordering::Relaxed);
+                if let Some(target) = target {
+                    report.transferred += 1;
+                    if !target_existed {
+                        report.undo_from.push(src.clone());
+                        report.undo_to.push(target);
+                    }
+                }
+            }
+            Ok(CopyOutcome::Cancelled) => {
+                report.outcome = CopyOutcome::Cancelled;
+                break;
+            }
+            Err(err) => {
+                report.error = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    report
+}
+
+fn finish_transfer(
+    state: &mut AppState,
+    job_id: u64,
+    transfer: &Transfer,
+    report: TransferReport,
+) -> Result<CopyOutcome, String> {
+    unregister_job_cancel(job_id);
+    state.remove_job(job_id);
+
+    let (noun, past) = if transfer.is_move() {
+        ("Move", "Moved")
+    } else {
+        ("Copy", "Copied")
+    };
+
+    if let Some(err) = report.error {
+        let msg = format!("{noun} failed: {err}");
+        state.set_status(msg.clone());
+        return Err(msg);
+    }
+    if report.outcome == CopyOutcome::Cancelled {
+        state.set_status(format!("{noun} operation cancelled"));
+        return Ok(report.outcome);
+    }
+
+    if report.transferred > 0 {
+        let first_target = transfer
+            .sources
+            .first()
+            .and_then(|src| src.file_name())
+            .map(|name| transfer.dest_dir.join(name));
+        let viewing_destination = state.current_location.path() == transfer.dest_dir;
+
+        if !report.undo_to.is_empty() {
+            state.undo_stack.push(if transfer.is_move() {
+                UndoOperation::Move {
+                    from: report.undo_from,
+                    to: report.undo_to,
+                }
+            } else {
+                UndoOperation::Copy {
+                    destinations: report.undo_to,
+                }
+            });
+        }
+
+        state.reload_entries();
+        if let Some(first) = first_target {
+            if viewing_destination || transfer.is_move() {
+                state.selection.select_only(Location::Local(first));
+            }
+        }
+        if transfer.is_move() {
+            clear_clipboard();
+        }
+    }
+    state.set_status(format!("{past} {} item(s)", report.transferred));
+    Ok(report.outcome)
+}
+
+/// Starts `transfer` as a job in the jobs panel. With an attached [`AppState`] the files are
+/// copied on the background executor and the panel is refreshed while they are.
+pub fn start_transfer(state: &mut AppState, transfer: Transfer) {
+    if transfer.sources.is_empty() {
+        return;
+    }
+    let job_id = begin_transfer(state, &transfer);
+    let bytes_done = Arc::new(AtomicU64::new(0));
+
+    let work = {
+        let transfer = transfer.clone();
+        let bytes_done = bytes_done.clone();
+        move || run_transfer(&transfer, &bytes_done)
+    };
+    let tick = move |state: &mut AppState| {
+        if let Some(job) = state.active_jobs.iter_mut().find(|j| j.id == job_id) {
+            job.update_progress(bytes_done.load(Ordering::Relaxed));
+        }
+    };
+    let done = move |state: &mut AppState, report| {
+        let _ = finish_transfer(state, job_id, &transfer, report);
+    };
+    state.spawn_job(work, tick, done);
+}
+
+fn execute_transfer(state: &mut AppState, transfer: Transfer) -> Result<CopyOutcome, String> {
+    if transfer.sources.is_empty() {
+        return Ok(CopyOutcome::Completed);
+    }
+    let job_id = begin_transfer(state, &transfer);
+    let report = run_transfer(&transfer, &AtomicU64::new(0));
+    finish_transfer(state, job_id, &transfer, report)
+}
+
+/// Copies files or folders into `dest_dir` on the calling thread and waits for the result.
+/// The interface uses [`start_transfer`] instead, which does not block.
 pub fn execute_copy(
     state: &mut AppState,
     sources: &[PathBuf],
@@ -102,99 +343,13 @@ pub fn execute_copy(
     policy: ConflictPolicy,
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<CopyOutcome, String> {
-    if sources.is_empty() {
-        return Ok(CopyOutcome::Completed);
-    }
-
-    let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst);
-    register_job_cancel(job_id, cancel_flag.clone());
-
-    let title = if sources.len() == 1 {
-        format!(
-            "Copying '{}'",
-            sources[0].file_name().unwrap_or_default().to_string_lossy()
-        )
-    } else {
-        format!("Copying {} items", sources.len())
-    };
-
-    // Calculate total size
-    let mut total_bytes = 0u64;
-    for src in sources {
-        if let Ok(meta) = std::fs::symlink_metadata(src) {
-            total_bytes += meta.len();
-        }
-    }
-
-    let mut job_status = JobStatus::new(job_id, title, JobKind::Copy, total_bytes);
-    state.add_job(job_status.clone());
-
-    let mut destinations = Vec::new();
-    let mut outcome = CopyOutcome::Completed;
-
-    for src in sources {
-        if cancel_flag.load(Ordering::Relaxed) {
-            outcome = CopyOutcome::Cancelled;
-            break;
-        }
-
-        let options = CopyOptions::new(policy, cancel_flag.clone());
-        let mut progress_fn = |p: kwati_core::Progress| {
-            job_status.update_progress(p.bytes_done);
-            if let Some(j) = state.active_jobs.iter_mut().find(|j| j.id == job_id) {
-                j.bytes_processed = p.bytes_done;
-                j.progress_pct = job_status.progress_pct;
-            }
-        };
-
-        match copy_entry(src, dest_dir, &options, &mut progress_fn) {
-            Ok(CopyOutcome::Completed) => {
-                if let Some(name) = src.file_name() {
-                    destinations.push(dest_dir.join(name));
-                }
-            }
-            Ok(CopyOutcome::Cancelled) => {
-                outcome = CopyOutcome::Cancelled;
-                break;
-            }
-            Err(err) => {
-                state.remove_job(job_id);
-                unregister_job_cancel(job_id);
-                let msg = format!("Copy failed: {}", err);
-                state.set_status(msg.clone());
-                return Err(msg);
-            }
-        }
-    }
-
-    unregister_job_cancel(job_id);
-    state.remove_job(job_id);
-
-    if outcome == CopyOutcome::Completed {
-        if !destinations.is_empty() {
-            state.undo_stack.push(UndoOperation::Copy {
-                destinations: destinations.clone(),
-            });
-
-            if state.current_location.path() == dest_dir {
-                if let Ok(listing) = list_dir(dest_dir) {
-                    state.set_entries(listing.into_entries());
-                }
-                if let Some(first) = destinations.first() {
-                    state.selection.select_only(Location::Local(first.clone()));
-                }
-            }
-        }
-        state.set_status(format!("Copied {} item(s)", destinations.len()));
-    } else {
-        state.set_status("Copy operation cancelled");
-    }
-
-    Ok(outcome)
+    let mut transfer = Transfer::copy(sources.to_vec(), dest_dir.to_path_buf(), policy);
+    transfer.cancel = cancel_flag;
+    execute_transfer(state, transfer)
 }
 
-/// Moves files or folders into `dest_dir` with progress reporting, cross-device fallback,
-/// cancellation, and conflict resolution policy. Updates AppState jobs, undo stack, and selection.
+/// Moves files or folders into `dest_dir` on the calling thread and waits for the result.
+/// The interface uses [`start_transfer`] instead, which does not block.
 pub fn execute_move(
     state: &mut AppState,
     sources: &[PathBuf],
@@ -203,112 +358,10 @@ pub fn execute_move(
     cancel_flag: Arc<AtomicBool>,
     simulate_cross_device: bool,
 ) -> Result<CopyOutcome, String> {
-    if sources.is_empty() {
-        return Ok(CopyOutcome::Completed);
-    }
-
-    let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst);
-    register_job_cancel(job_id, cancel_flag.clone());
-
-    let title = if sources.len() == 1 {
-        format!(
-            "Moving '{}'",
-            sources[0].file_name().unwrap_or_default().to_string_lossy()
-        )
-    } else {
-        format!("Moving {} items", sources.len())
-    };
-
-    let mut total_bytes = 0u64;
-    for src in sources {
-        if let Ok(meta) = std::fs::symlink_metadata(src) {
-            total_bytes += meta.len();
-        }
-    }
-
-    let mut job_status = JobStatus::new(job_id, title, JobKind::Move, total_bytes);
-    state.add_job(job_status.clone());
-
-    let mut moved_from = Vec::new();
-    let mut moved_to = Vec::new();
-    let mut outcome = CopyOutcome::Completed;
-
-    for src in sources {
-        if cancel_flag.load(Ordering::Relaxed) {
-            outcome = CopyOutcome::Cancelled;
-            break;
-        }
-
-        let options = CopyOptions::new(policy, cancel_flag.clone());
-        let mut progress_fn = |p: kwati_core::Progress| {
-            job_status.update_progress(p.bytes_done);
-            if let Some(j) = state.active_jobs.iter_mut().find(|j| j.id == job_id) {
-                j.bytes_processed = p.bytes_done;
-                j.progress_pct = job_status.progress_pct;
-            }
-        };
-
-        let move_res = if simulate_cross_device {
-            move_entry_with(src, dest_dir, &options, &mut progress_fn, &|_, _| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::CrossesDevices,
-                    "cross device",
-                ))
-            })
-        } else {
-            move_entry(src, dest_dir, &options, &mut progress_fn)
-        };
-
-        match move_res {
-            Ok(CopyOutcome::Completed) => {
-                if let Some(name) = src.file_name() {
-                    moved_from.push(src.clone());
-                    moved_to.push(dest_dir.join(name));
-                }
-            }
-            Ok(CopyOutcome::Cancelled) => {
-                outcome = CopyOutcome::Cancelled;
-                break;
-            }
-            Err(err) => {
-                state.remove_job(job_id);
-                unregister_job_cancel(job_id);
-                let msg = format!("Move failed: {}", err);
-                state.set_status(msg.clone());
-                return Err(msg);
-            }
-        }
-    }
-
-    unregister_job_cancel(job_id);
-    state.remove_job(job_id);
-
-    if outcome == CopyOutcome::Completed {
-        if !moved_to.is_empty() {
-            state.undo_stack.push(UndoOperation::Move {
-                from: moved_from,
-                to: moved_to.clone(),
-            });
-
-            // Reload listing if currently viewing source or destination directory
-            if let Location::Local(current_path) = &state.current_location {
-                if let Ok(listing) = list_dir(current_path) {
-                    state.set_entries(listing.into_entries());
-                }
-            }
-
-            if let Some(first) = moved_to.first() {
-                state.selection.select_only(Location::Local(first.clone()));
-            }
-
-            clear_clipboard();
-        }
-        state.set_status(format!("Moved {} item(s)", moved_to.len()));
-    } else {
-        state.set_status("Move operation cancelled");
-    }
-
-    Ok(outcome)
+    let mut transfer = Transfer::moving(sources.to_vec(), dest_dir.to_path_buf(), policy);
+    transfer.cancel = cancel_flag;
+    transfer.simulate_cross_device = simulate_cross_device;
+    execute_transfer(state, transfer)
 }
 
 /// Validates that a filename/foldername is non-empty, does not contain path separators,
@@ -357,9 +410,7 @@ pub fn execute_rename(
 
     // Refresh listing if currently browsing the parent
     if state.current_location.path() == parent {
-        if let Ok(listing) = list_dir(parent) {
-            state.set_entries(listing.into_entries());
-        }
+        state.reload_entries();
     }
 
     // Select the renamed entry
@@ -396,9 +447,7 @@ pub fn execute_create_folder(
 
     // Refresh listing if currently browsing the parent
     if state.current_location.path() == parent {
-        if let Ok(listing) = list_dir(parent) {
-            state.set_entries(listing.into_entries());
-        }
+        state.reload_entries();
     }
 
     // Select the newly created folder
@@ -441,11 +490,7 @@ pub fn execute_trash(state: &mut AppState, paths: &[PathBuf]) -> Result<usize, S
         }
 
         // Refresh listing
-        if let Location::Local(current_dir) = &state.current_location {
-            if let Ok(listing) = list_dir(current_dir) {
-                state.set_entries(listing.into_entries());
-            }
-        }
+        state.reload_entries();
     }
 
     if let Some(err) = last_err {
@@ -496,11 +541,7 @@ pub fn execute_permanent_delete(state: &mut AppState, paths: &[PathBuf]) -> Resu
         for p in &deleted {
             state.selection.deselect(&Location::Local(p.clone()));
         }
-        if let Location::Local(current_path) = &state.current_location {
-            if let Ok(listing) = list_dir(current_path) {
-                state.set_entries(listing.into_entries());
-            }
-        }
+        state.reload_entries();
     }
 
     if let Some(err) = last_err {
@@ -553,11 +594,7 @@ pub fn execute_undo(state: &mut AppState) -> Result<String, String> {
                 return Err(refusal);
             }
 
-            if let Location::Local(current_path) = &state.current_location {
-                if let Ok(listing) = list_dir(current_path) {
-                    state.set_entries(listing.into_entries());
-                }
-            }
+            state.reload_entries();
 
             state.selection.select_only(Location::Local(from.clone()));
 
@@ -585,11 +622,7 @@ pub fn execute_undo(state: &mut AppState) -> Result<String, String> {
 
             state.selection.deselect(&Location::Local(path.clone()));
 
-            if let Location::Local(current_path) = &state.current_location {
-                if let Ok(listing) = list_dir(current_path) {
-                    state.set_entries(listing.into_entries());
-                }
-            }
+            state.reload_entries();
 
             let msg = format!("Undid create folder '{}'", name);
             state.set_status(&msg);
@@ -607,11 +640,7 @@ pub fn execute_undo(state: &mut AppState) -> Result<String, String> {
                 }
             }
 
-            if let Location::Local(current_path) = &state.current_location {
-                if let Ok(listing) = list_dir(current_path) {
-                    state.set_entries(listing.into_entries());
-                }
-            }
+            state.reload_entries();
 
             let msg = "Undid copy operation".to_string();
             state.set_status(&msg);
@@ -646,11 +675,7 @@ pub fn execute_undo(state: &mut AppState) -> Result<String, String> {
                 }
             }
 
-            if let Location::Local(current_path) = &state.current_location {
-                if let Ok(listing) = list_dir(current_path) {
-                    state.set_entries(listing.into_entries());
-                }
-            }
+            state.reload_entries();
 
             if let Some(first) = from.first() {
                 state.selection.select_only(Location::Local(first.clone()));

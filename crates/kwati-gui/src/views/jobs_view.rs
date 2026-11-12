@@ -38,6 +38,7 @@ impl JobsView {
             state.remove_job(job_id);
             state.set_status(format!("Cancelled job #{}", job_id));
         });
+        cx.notify();
     }
 }
 
