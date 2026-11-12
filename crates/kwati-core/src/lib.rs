@@ -9,6 +9,7 @@ pub mod remote_poll;
 mod search;
 mod secrets;
 mod settings;
+mod sftp;
 mod transfer;
 mod trash;
 pub mod volume;
@@ -39,6 +40,7 @@ pub use settings::{
     default_path as settings_path, Settings, SettingsWarning, DEFAULT_REFRESH_INTERVAL_SECS,
     DEFAULT_REMOTE_POLL_INTERVAL_SECS, MIN_REMOTE_POLL_INTERVAL_SECS,
 };
+pub use sftp::{known_hosts_path, HostKeyChanged, HostKeyUnknown, KnownHosts, SftpBackend};
 pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
