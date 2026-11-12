@@ -49,37 +49,36 @@ fn virtualized_list_selection_and_scrollbar_metrics() {
 
 #[test]
 fn navigation_buttons_and_history_integration() {
-    let mut state = AppState::new(Location::Local(PathBuf::from("/tmp/folder_a")));
+    let root = std::env::temp_dir().join(format!("kwati_test_history_{}", std::process::id()));
+    let folder_a = root.join("folder_a");
+    let folder_b = root.join("folder_b");
+    let sub = folder_b.join("sub");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&folder_a).unwrap();
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let mut state = AppState::new(Location::Local(folder_a.clone()));
     assert!(!state.history.can_go_back());
     assert!(!state.history.can_go_forward());
 
     // Navigate to folder B
-    state.navigate_to(Location::Local(PathBuf::from("/tmp/folder_b")));
+    state.navigate_to(Location::Local(folder_b.clone()));
     assert!(state.history.can_go_back());
     assert!(!state.history.can_go_forward());
-    assert_eq!(
-        state.current_location,
-        Location::Local(PathBuf::from("/tmp/folder_b"))
-    );
+    assert_eq!(state.current_location, Location::Local(folder_b.clone()));
 
     // Navigate to subfolder
-    state.navigate_to(Location::Local(PathBuf::from("/tmp/folder_b/sub")));
+    state.navigate_to(Location::Local(sub.clone()));
     assert!(state.history.can_go_back());
 
     // Back to folder B
     assert!(state.go_back());
-    assert_eq!(
-        state.current_location,
-        Location::Local(PathBuf::from("/tmp/folder_b"))
-    );
+    assert_eq!(state.current_location, Location::Local(folder_b.clone()));
     assert!(state.history.can_go_forward());
 
     // Back to folder A
     assert!(state.go_back());
-    assert_eq!(
-        state.current_location,
-        Location::Local(PathBuf::from("/tmp/folder_a"))
-    );
+    assert_eq!(state.current_location, Location::Local(folder_a.clone()));
     assert!(!state.history.can_go_back());
 
     // Cannot go back further
@@ -87,17 +86,44 @@ fn navigation_buttons_and_history_integration() {
 
     // Forward to folder B
     assert!(state.go_forward());
-    assert_eq!(
-        state.current_location,
-        Location::Local(PathBuf::from("/tmp/folder_b"))
-    );
+    assert_eq!(state.current_location, Location::Local(folder_b.clone()));
 
-    // Up to parent /tmp
+    // Up to the parent
     assert!(state.go_up());
-    assert_eq!(
-        state.current_location,
-        Location::Local(PathBuf::from("/tmp"))
-    );
+    assert_eq!(state.current_location, Location::Local(root.clone()));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn failed_navigation_reports_and_keeps_the_current_directory() {
+    let root = std::env::temp_dir().join(format!("kwati_test_failed_nav_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("kept.txt"), "kept").unwrap();
+
+    let mut state = AppState::new(Location::Local(root.clone()));
+    state.reload_entries();
+    let listing_before = state.entries.clone();
+    assert_eq!(listing_before.len(), 1);
+
+    let unreadable = root.join("gone");
+    state.navigate_to(Location::Local(unreadable.clone()));
+
+    let status = state
+        .status_message
+        .clone()
+        .expect("the failure is reported");
+    assert!(status.contains(&unreadable.display().to_string()));
+    assert_eq!(state.current_location, Location::Local(root.clone()));
+    assert_eq!(state.entries, listing_before);
+    assert!(!state.history.can_go_back());
+
+    // A later successful read clears the report.
+    state.reload_entries();
+    assert!(state.status_message.is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

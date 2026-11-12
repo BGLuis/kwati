@@ -50,6 +50,8 @@ impl MainView {
         let dialogs = cx.new(|cx| DialogsView::new(app_state.clone(), cx));
         let remote_dialogs = cx.new(|cx| RemoteDialogsView::new(app_state.clone(), cx));
 
+        cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
+
         Self {
             app_state,
             header,
