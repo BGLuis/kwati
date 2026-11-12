@@ -103,7 +103,7 @@ fn symlink() {
 
 #[test]
 fn non_utf8() {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         use std::os::unix::ffi::OsStrExt;
 
