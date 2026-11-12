@@ -4,7 +4,7 @@
 //! (name, size, date), sort headers, and scrollbar synchronization.
 
 use gpui::{
-    div, prelude::*, px, relative, rgb, rgba, uniform_list, Context, CursorStyle, Entity,
+    div, prelude::*, px, relative, transparent_black, uniform_list, Context, CursorStyle, Entity,
     FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, ScrollStrategy, UniformListScrollHandle, Window,
 };
@@ -332,6 +332,12 @@ impl Render for ListView {
             .set_metrics(entry_count, visible_items, current_top);
 
         let entries_clone = entries.clone();
+        let (row_selected, row_hover, row_text, row_muted) = (
+            self.theme.selection,
+            self.theme.surface_raised,
+            self.theme.text,
+            self.theme.text_muted,
+        );
 
         let sort_indicator = |col: SortColumn| -> &'static str {
             if sort_column == col {
@@ -348,7 +354,7 @@ impl Render for ListView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(self.theme.bg_content)
+            .bg(self.theme.surface)
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(|this, _: &SelectNext, _window, cx| this.select_next(cx)))
             .on_action(
@@ -406,7 +412,7 @@ impl Render for ListView {
                     .items_center()
                     .border_b_1()
                     .border_color(self.theme.border)
-                    .bg(self.theme.bg_header)
+                    .bg(self.theme.surface_raised)
                     .text_color(self.theme.text_muted)
                     .text_size(px(12.))
                     // Name column header
@@ -416,7 +422,7 @@ impl Render for ListView {
                             .flex()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.text_color(self.theme.text_primary))
+                            .hover(|s| s.text_color(self.theme.text))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -432,7 +438,7 @@ impl Render for ListView {
                             .flex()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.text_color(self.theme.text_primary))
+                            .hover(|s| s.text_color(self.theme.text))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -448,7 +454,7 @@ impl Render for ListView {
                             .flex()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.text_color(self.theme.text_primary))
+                            .hover(|s| s.text_color(self.theme.text))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -465,16 +471,16 @@ impl Render for ListView {
                             .rounded_sm()
                             .cursor(CursorStyle::PointingHand)
                             .bg(if show_hidden {
-                                rgba(0x89b4fa33)
+                                self.theme.selection
                             } else {
-                                rgba(0x00000000)
+                                transparent_black().into()
                             })
                             .text_color(if show_hidden {
-                                rgb(0x89b4fa)
+                                self.theme.text
                             } else {
                                 self.theme.text_muted
                             })
-                            .hover(|s| s.bg(rgba(0xffffff14)))
+                            .hover(|s| s.bg(self.theme.surface_raised))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.on_toggle_hidden_click(cx)),
@@ -521,19 +527,15 @@ impl Render for ListView {
                                                 .px_3()
                                                 .items_center()
                                                 .cursor_pointer()
-                                                .bg(if is_selected {
-                                                    rgba(0x89b4fa26)
-                                                } else {
-                                                    rgba(0x00000000)
+                                                .when(is_selected, |s| s.bg(row_selected))
+                                                .when(!is_selected, |s| {
+                                                    s.hover(|s| s.bg(row_hover))
                                                 })
-                                                .hover(|s| s.bg(rgba(0xffffff0d)))
                                                 .text_size(px(13.))
-                                                .text_color(if is_hidden {
-                                                    rgb(0x6c7086)
-                                                } else if is_dir {
-                                                    rgb(0x89b4fa)
+                                                .text_color(if is_hidden && !is_selected {
+                                                    row_muted
                                                 } else {
-                                                    rgb(0xcdd6f4)
+                                                    row_text
                                                 })
                                                 .on_mouse_down(
                                                     MouseButton::Left,
@@ -563,13 +565,13 @@ impl Render for ListView {
                                                 .child(
                                                     div()
                                                         .w(px(100.))
-                                                        .text_color(rgb(0x6c7086))
+                                                        .text_color(if is_selected { row_text } else { row_muted })
                                                         .child(size_str),
                                                 )
                                                 .child(
                                                     div()
                                                         .w(px(150.))
-                                                        .text_color(rgb(0x6c7086))
+                                                        .text_color(if is_selected { row_text } else { row_muted })
                                                         .child(date_str),
                                                 )
                                                 .into_any_element(),
@@ -588,7 +590,6 @@ impl Render for ListView {
                         div()
                             .w(px(10.))
                             .h_full()
-                            .bg(rgba(0x00000014))
                             .border_l_1()
                             .border_color(self.theme.border)
                             .relative()
@@ -615,11 +616,11 @@ impl Render for ListView {
                                     ))
                                     .rounded_sm()
                                     .bg(if self.scrollbar_state.is_dragging {
-                                        rgba(0xffffff80)
+                                        self.theme.text_muted
                                     } else {
-                                        rgba(0xffffff40)
+                                        self.theme.border_strong
                                     })
-                                    .hover(|s| s.bg(rgba(0xffffff70)))
+                                    .hover(|s| s.bg(self.theme.text_muted))
                                     .cursor(CursorStyle::Arrow),
                             ),
                     ),

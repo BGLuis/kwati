@@ -2,9 +2,7 @@
 //!
 //! Displays progress of running copy, move, and file operations with cancellation support.
 
-use gpui::{
-    div, prelude::*, px, relative, rgba, Context, Entity, MouseButton, MouseDownEvent, Window,
-};
+use gpui::{div, prelude::*, px, relative, Context, Entity, MouseButton, MouseDownEvent, Window};
 
 use crate::actions::operations::cancel_active_job;
 use crate::state::AppState;
@@ -57,7 +55,7 @@ impl Render for JobsView {
             .w_full()
             .p_2()
             .gap_2()
-            .bg(self.theme.bg_panel)
+            .bg(self.theme.surface)
             .border_t_1()
             .border_color(self.theme.border)
             .children(jobs.into_iter().map(|job| {
@@ -69,7 +67,7 @@ impl Render for JobsView {
                     .flex_col()
                     .p_2()
                     .rounded_md()
-                    .bg(self.theme.bg_header)
+                    .bg(self.theme.surface_raised)
                     .gap_1()
                     .child(
                         div()
@@ -78,7 +76,7 @@ impl Render for JobsView {
                             .justify_between()
                             .items_center()
                             .text_size(px(12.))
-                            .text_color(self.theme.text_primary)
+                            .text_color(self.theme.text)
                             .child(job.title)
                             .child(
                                 div()
@@ -91,8 +89,8 @@ impl Render for JobsView {
                                             .px_2()
                                             .py(px(2.))
                                             .rounded_sm()
-                                            .bg(rgba(0xf38ba830))
-                                            .text_color(self.theme.text_error)
+                                            .hover(|s| s.bg(self.theme.surface_raised))
+                                            .text_color(self.theme.danger)
                                             .cursor_pointer()
                                             .child("Cancel")
                                             .on_mouse_down(
@@ -110,7 +108,7 @@ impl Render for JobsView {
                             .w_full()
                             .h(px(4.))
                             .rounded_sm()
-                            .bg(rgba(0xffffff20))
+                            .bg(self.theme.border)
                             .child(
                                 div()
                                     .h_full()

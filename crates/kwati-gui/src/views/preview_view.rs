@@ -259,7 +259,7 @@ impl Render for PreviewView {
                 .w(px(280.))
                 .h_full()
                 .p_4()
-                .bg(self.theme.bg_panel)
+                .bg(self.theme.surface)
                 .border_l_1()
                 .border_color(self.theme.border)
                 .flex()
@@ -301,7 +301,7 @@ impl Render for PreviewView {
             .w(px(280.))
             .h_full()
             .p_3()
-            .bg(self.theme.bg_panel)
+            .bg(self.theme.surface)
             .border_l_1()
             .border_color(self.theme.border)
             .flex()
@@ -321,7 +321,7 @@ impl Render for PreviewView {
                         div()
                             .text_size(px(14.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(self.theme.text_primary)
+                            .text_color(self.theme.text)
                             .overflow_hidden()
                             .child(file_name),
                     )
@@ -343,8 +343,8 @@ impl Render for PreviewView {
                     .flex_1()
                     .p_2()
                     .rounded_md()
-                    .bg(self.theme.bg_content)
-                    .text_color(self.theme.text_secondary)
+                    .bg(self.theme.surface)
+                    .text_color(self.theme.text_muted)
                     .text_size(px(11.))
                     .overflow_hidden()
                     .child(text),
@@ -354,7 +354,7 @@ impl Render for PreviewView {
                     .items_center()
                     .justify_center()
                     .p_2()
-                    .bg(self.theme.bg_content)
+                    .bg(self.theme.surface)
                     .rounded_md()
                     .child(img(path).max_w_full().max_h_full()),
                 PreviewKind::Binary { name, size } => div()
@@ -366,7 +366,7 @@ impl Render for PreviewView {
                     .gap_2()
                     .p_4()
                     .rounded_md()
-                    .bg(self.theme.bg_content)
+                    .bg(self.theme.surface)
                     .child(
                         div()
                             .text_size(px(28.))
@@ -377,7 +377,7 @@ impl Render for PreviewView {
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(self.theme.text_primary)
+                            .text_color(self.theme.text)
                             .child(name),
                     )
                     .child(

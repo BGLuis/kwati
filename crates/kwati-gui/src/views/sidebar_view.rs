@@ -5,7 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, FontWeight, MouseButton, Window};
+use gpui::{
+    div, prelude::*, px, transparent_black, Context, Entity, FontWeight, MouseButton, Window,
+};
 use kwati_core::Location;
 
 use crate::state::AppState;
@@ -333,7 +335,7 @@ impl Render for SidebarView {
             .w(px(220.))
             .h_full()
             .p_3()
-            .bg(self.theme.bg_sidebar)
+            .bg(self.theme.surface_raised)
             .border_r_1()
             .border_color(self.theme.border)
             .flex()
@@ -363,17 +365,13 @@ impl Render for SidebarView {
                             .rounded_md()
                             .cursor_pointer()
                             .bg(if is_active {
-                                rgba(0x89b4fa20)
+                                self.theme.selection
                             } else {
-                                rgba(0x00000000)
+                                transparent_black().into()
                             })
-                            .hover(|s| s.bg(rgba(0xffffff0d)))
+                            .hover(|s| s.bg(self.theme.surface_raised))
                             .text_size(px(13.))
-                            .text_color(if is_active {
-                                self.theme.accent
-                            } else {
-                                self.theme.text_primary
-                            })
+                            .text_color(self.theme.text)
                             .flex()
                             .items_center()
                             .gap_2()
@@ -412,11 +410,11 @@ impl Render for SidebarView {
                                 .rounded_md()
                                 .cursor_pointer()
                                 .bg(if is_active {
-                                    rgba(0x89b4fa20)
+                                    self.theme.selection
                                 } else {
-                                    rgba(0x00000000)
+                                    transparent_black().into()
                                 })
-                                .hover(|s| s.bg(rgba(0xffffff0d)))
+                                .hover(|s| s.bg(self.theme.surface_raised))
                                 .text_size(px(13.))
                                 .flex()
                                 .items_center()
@@ -430,11 +428,9 @@ impl Render for SidebarView {
                                         .child(
                                             div()
                                                 .text_color(if is_missing {
-                                                    self.theme.text_error
-                                                } else if is_active {
-                                                    self.theme.accent
+                                                    self.theme.danger
                                                 } else {
-                                                    self.theme.text_primary
+                                                    self.theme.text
                                                 })
                                                 .child(bm.name),
                                         ),
@@ -444,7 +440,7 @@ impl Render for SidebarView {
                                         .px_1()
                                         .text_size(px(11.))
                                         .text_color(self.theme.text_muted)
-                                        .hover(|s| s.text_color(self.theme.text_error))
+                                        .hover(|s| s.text_color(self.theme.danger))
                                         .child("✕")
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -492,9 +488,9 @@ impl Render for SidebarView {
                                 .p_2()
                                 .rounded_md()
                                 .bg(if is_active {
-                                    rgba(0x89b4fa15)
+                                    self.theme.selection
                                 } else {
-                                    rgba(0xffffff05)
+                                    transparent_black().into()
                                 })
                                 .border_1()
                                 .border_color(if is_active {
@@ -527,7 +523,7 @@ impl Render for SidebarView {
                                                     div()
                                                         .text_size(px(13.))
                                                         .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(self.theme.text_primary)
+                                                        .text_color(self.theme.text)
                                                         .child(vol.name),
                                                 ),
                                         )
@@ -538,10 +534,10 @@ impl Render for SidebarView {
                                                     .px_2()
                                                     .py(px(1.))
                                                     .rounded_sm()
-                                                    .bg(self.theme.bg_header)
-                                                    .hover(|s| s.bg(rgba(0xf38ba830)))
+                                                    .bg(self.theme.surface)
+                                                    .hover(|s| s.bg(self.theme.selection))
                                                     .text_size(px(11.))
-                                                    .text_color(self.theme.text_secondary)
+                                                    .text_color(self.theme.text_muted)
                                                     .cursor_pointer()
                                                     .child("⏏ Eject")
                                                     .on_mouse_down(
@@ -601,7 +597,7 @@ impl Render for SidebarView {
                                                     .py(px(1.))
                                                     .rounded_sm()
                                                     .bg(self.theme.accent)
-                                                    .text_color(rgb(0x181825))
+                                                    .text_color(self.theme.on_accent)
                                                     .text_size(px(11.))
                                                     .cursor_pointer()
                                                     .child("Mount")
@@ -655,7 +651,7 @@ impl Render for SidebarView {
                                                 .h_full()
                                                 .rounded_sm()
                                                 .bg(if used_pct > 90 {
-                                                    self.theme.text_error
+                                                    self.theme.danger
                                                 } else {
                                                     self.theme.accent
                                                 }),
@@ -665,7 +661,7 @@ impl Render for SidebarView {
                                     p.child(
                                         div()
                                             .text_size(px(10.))
-                                            .text_color(self.theme.text_warning)
+                                            .text_color(self.theme.warning)
                                             .child("⚠️ In use by open files"),
                                     )
                                 })

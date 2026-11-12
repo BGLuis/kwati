@@ -2,7 +2,7 @@
 //!
 //! Shows network status, timeouts, cancellation, and retry actions when browsing network shares.
 
-use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, MouseButton, MouseDownEvent, Window};
+use gpui::{div, prelude::*, px, Context, Entity, MouseButton, MouseDownEvent, Window};
 use kwati_core::{volume_kind, Location, VolumeKind};
 
 use crate::state::{AppState, NetworkMountStatus};
@@ -116,8 +116,8 @@ impl Render for NetworkView {
                         .w_full()
                         .px_3()
                         .py_1()
-                        .bg(rgba(0x89b4fa15))
-                        .text_color(self.theme.accent)
+                        .bg(self.theme.surface_raised)
+                        .text_color(self.theme.text)
                         .text_size(px(12.))
                         .flex()
                         .items_center()
@@ -125,7 +125,7 @@ impl Render for NetworkView {
                         .child("🌐 Network Share")
                         .child(
                             div()
-                                .text_color(self.theme.text_secondary)
+                                .text_color(self.theme.text_muted)
                                 .child(current_loc.path().to_string_lossy().to_string()),
                         )
                 } else {
@@ -140,8 +140,8 @@ impl Render for NetworkView {
                 .w_full()
                 .px_3()
                 .py_1()
-                .bg(rgba(0x89b4fa20))
-                .text_color(self.theme.accent)
+                .bg(self.theme.surface_raised)
+                .text_color(self.theme.text)
                 .text_size(px(12.))
                 .child(
                     div()
@@ -156,8 +156,8 @@ impl Render for NetworkView {
                         .px_2()
                         .py(px(2.))
                         .rounded_sm()
-                        .bg(self.theme.bg_header)
-                        .text_color(self.theme.text_secondary)
+                        .bg(self.theme.surface_raised)
+                        .text_color(self.theme.text_muted)
                         .cursor_pointer()
                         .child("Cancel")
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::on_cancel)),
@@ -168,8 +168,8 @@ impl Render for NetworkView {
                         .w_full()
                         .px_3()
                         .py_1()
-                        .bg(rgba(0xa6e3a115))
-                        .text_color(self.theme.accent)
+                        .bg(self.theme.surface_raised)
+                        .text_color(self.theme.secondary)
                         .text_size(px(12.))
                         .flex()
                         .items_center()
@@ -177,7 +177,7 @@ impl Render for NetworkView {
                         .child("🌐 Connected:")
                         .child(
                             div()
-                                .text_color(self.theme.text_primary)
+                                .text_color(self.theme.text)
                                 .child(current_loc.path().to_string_lossy().to_string()),
                         )
                 } else {
@@ -192,8 +192,8 @@ impl Render for NetworkView {
                 .w_full()
                 .px_3()
                 .py_1()
-                .bg(rgba(0xf38ba830))
-                .text_color(self.theme.text_error)
+                .bg(self.theme.surface_raised)
+                .text_color(self.theme.danger)
                 .text_size(px(12.))
                 .child(
                     div()
@@ -217,7 +217,7 @@ impl Render for NetworkView {
                                 .py(px(2.))
                                 .rounded_sm()
                                 .bg(self.theme.accent)
-                                .text_color(rgb(0x181825))
+                                .text_color(self.theme.on_accent)
                                 .cursor_pointer()
                                 .child("Retry")
                                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_retry)),
@@ -227,8 +227,8 @@ impl Render for NetworkView {
                                 .px_2()
                                 .py(px(2.))
                                 .rounded_sm()
-                                .bg(self.theme.bg_header)
-                                .text_color(self.theme.text_secondary)
+                                .bg(self.theme.surface_raised)
+                                .text_color(self.theme.text_muted)
                                 .cursor_pointer()
                                 .child("Cancel")
                                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_cancel)),
@@ -242,8 +242,8 @@ impl Render for NetworkView {
                 .w_full()
                 .px_3()
                 .py_1()
-                .bg(rgba(0xf9e2af30))
-                .text_color(self.theme.text_warning)
+                .bg(self.theme.surface_raised)
+                .text_color(self.theme.warning)
                 .text_size(px(12.))
                 .child(
                     div()
@@ -264,7 +264,7 @@ impl Render for NetworkView {
                                 .py(px(2.))
                                 .rounded_sm()
                                 .bg(self.theme.accent)
-                                .text_color(rgb(0x181825))
+                                .text_color(self.theme.on_accent)
                                 .cursor_pointer()
                                 .child("Retry")
                                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_retry)),
@@ -274,8 +274,8 @@ impl Render for NetworkView {
                                 .px_2()
                                 .py(px(2.))
                                 .rounded_sm()
-                                .bg(self.theme.bg_header)
-                                .text_color(self.theme.text_secondary)
+                                .bg(self.theme.surface_raised)
+                                .text_color(self.theme.text_muted)
                                 .cursor_pointer()
                                 .child("Cancel")
                                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_cancel)),

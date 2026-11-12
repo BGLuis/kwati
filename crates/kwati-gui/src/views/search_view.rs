@@ -8,7 +8,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
 use gpui::{
-    actions, div, prelude::*, px, rgb, rgba, App, Context, Entity, FontWeight, KeyBinding,
+    actions, div, prelude::*, px, transparent_black, App, Context, Entity, FontWeight, KeyBinding,
     MouseButton, Subscription, Window,
 };
 use kwati_core::{Location, SearchHandle, SearchHit, SearchOptions, Searcher};
@@ -373,11 +373,11 @@ impl Render for SearchView {
                     .px_3()
                     .cursor_pointer()
                     .bg(if is_selected {
-                        rgba(0x89b4fa26)
+                        self.theme.selection
                     } else {
-                        rgba(0x00000000)
+                        transparent_black().into()
                     })
-                    .hover(|s| s.bg(rgba(0xffffff0d)))
+                    .hover(|s| s.bg(self.theme.surface_raised))
                     .text_size(px(12.))
                     .child(
                         div()
@@ -387,11 +387,7 @@ impl Render for SearchView {
                             .child("📄")
                             .child(
                                 div()
-                                    .text_color(if is_selected {
-                                        self.theme.accent
-                                    } else {
-                                        self.theme.text_primary
-                                    })
+                                    .text_color(self.theme.text)
                                     .font_weight(if is_selected {
                                         FontWeight::SEMIBOLD
                                     } else {
@@ -425,7 +421,7 @@ impl Render for SearchView {
             .w_full()
             .flex()
             .flex_col()
-            .bg(self.theme.bg_header)
+            .bg(self.theme.bg)
             .border_b_1()
             .border_color(self.theme.border)
             .on_action(cx.listener(|this, _: &ToggleSearch, _, cx| this.toggle(cx)))
@@ -462,14 +458,14 @@ impl Render for SearchView {
                             .py_1()
                             .rounded_md()
                             .bg(if self.respect_ignore {
-                                self.theme.bg_content
+                                self.theme.surface
                             } else {
                                 self.theme.accent
                             })
                             .text_color(if self.respect_ignore {
-                                self.theme.text_secondary
+                                self.theme.text_muted
                             } else {
-                                rgb(0x181825)
+                                self.theme.on_accent
                             })
                             .text_size(px(11.))
                             .cursor_pointer()
@@ -493,7 +489,7 @@ impl Render for SearchView {
                             .rounded_md()
                             .text_size(px(13.))
                             .text_color(self.theme.text_muted)
-                            .hover(|s| s.text_color(self.theme.text_primary))
+                            .hover(|s| s.text_color(self.theme.text))
                             .cursor_pointer()
                             .child("✕")
                             .on_mouse_down(

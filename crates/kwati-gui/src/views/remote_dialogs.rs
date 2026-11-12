@@ -5,7 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, FontWeight, MouseButton, Window};
+use gpui::{
+    div, prelude::*, px, transparent_black, Context, Entity, FontWeight, MouseButton, Window,
+};
 use kwati_core::ConnectionProfile;
 
 use crate::components::TextInput;
@@ -178,13 +180,13 @@ impl Render for RemoteDialogsView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba(0x00000080))
+                    .bg(self.theme.scrim)
                     .child(
                         div()
                             .w(px(460.))
                             .p_5()
                             .rounded_lg()
-                            .bg(self.theme.bg_panel)
+                            .bg(self.theme.surface)
                             .border_1()
                             .border_color(self.theme.border)
                             .flex()
@@ -197,13 +199,13 @@ impl Render for RemoteDialogsView {
                                     .gap_2()
                                     .text_size(px(16.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(self.theme.text_primary)
+                                    .text_color(self.theme.text)
                                     .child("🔒 Authenticate Host Key"),
                             )
                             .child(
                                 div()
                                     .text_size(px(13.))
-                                    .text_color(self.theme.text_secondary)
+                                    .text_color(self.theme.text_muted)
                                     .child(format!(
                                         "The authenticity of host '{}' cannot be established.",
                                         host_str
@@ -213,7 +215,7 @@ impl Render for RemoteDialogsView {
                                 div()
                                     .p_3()
                                     .rounded_md()
-                                    .bg(self.theme.bg_header)
+                                    .bg(self.theme.surface_raised)
                                     .border_1()
                                     .border_color(self.theme.border)
                                     .flex()
@@ -229,7 +231,7 @@ impl Render for RemoteDialogsView {
                                         div()
                                             .text_size(px(12.))
                                             .font_family(".SystemUIFont")
-                                            .text_color(self.theme.text_primary)
+                                            .text_color(self.theme.text)
                                             .child(format!("Fingerprint: {}", fp_str)),
                                     ),
                             )
@@ -250,8 +252,8 @@ impl Render for RemoteDialogsView {
                                             .px_3()
                                             .py_1()
                                             .rounded_md()
-                                            .bg(self.theme.bg_header)
-                                            .text_color(self.theme.text_secondary)
+                                            .bg(self.theme.surface_raised)
+                                            .text_color(self.theme.text_muted)
                                             .cursor_pointer()
                                             .child("Decline")
                                             .on_mouse_down(
@@ -267,7 +269,7 @@ impl Render for RemoteDialogsView {
                                             .py_1()
                                             .rounded_md()
                                             .bg(self.theme.accent)
-                                            .text_color(rgb(0x181825))
+                                            .text_color(self.theme.on_accent)
                                             .font_weight(FontWeight::MEDIUM)
                                             .cursor_pointer()
                                             .child("Trust & Connect")
@@ -298,15 +300,15 @@ impl Render for RemoteDialogsView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba(0x00000080))
+                    .bg(self.theme.scrim)
                     .child(
                         div()
                             .w(px(500.))
                             .p_5()
                             .rounded_lg()
-                            .bg(self.theme.bg_panel)
+                            .bg(self.theme.surface)
                             .border_2()
-                            .border_color(self.theme.text_error)
+                            .border_color(self.theme.danger)
                             .flex()
                             .flex_col()
                             .gap_4()
@@ -317,39 +319,39 @@ impl Render for RemoteDialogsView {
                                     .gap_2()
                                     .text_size(px(16.))
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(self.theme.text_error)
+                                    .text_color(self.theme.danger)
                                     .child("🚨 WARNING: HOST IDENTIFICATION HAS CHANGED!"),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(self.theme.text_primary)
-                                    .child(format!(
-                                        "The host key for '{}' does not match the key saved locally.",
-                                        host_str
-                                    )),
-                            )
+                            .child(div().text_size(px(13.)).text_color(self.theme.text).child(
+                                format!(
+                                    "The host key for '{}' does not match the key saved locally.",
+                                    host_str
+                                ),
+                            ))
                             .child(
                                 div()
                                     .p_3()
                                     .rounded_md()
-                                    .bg(rgba(0xf38ba815))
+                                    .bg(self.theme.surface_raised)
                                     .border_1()
-                                    .border_color(self.theme.text_error)
+                                    .border_color(self.theme.danger)
                                     .flex()
                                     .flex_col()
                                     .gap_2()
                                     .child(
                                         div()
                                             .text_size(px(12.))
-                                            .text_color(self.theme.text_secondary)
-                                            .child(format!("Stored key fingerprint:\n{}", known_str)),
+                                            .text_color(self.theme.text_muted)
+                                            .child(format!(
+                                                "Stored key fingerprint:\n{}",
+                                                known_str
+                                            )),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(12.))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(self.theme.text_error)
+                                            .text_color(self.theme.danger)
                                             .child(format!(
                                                 "Server offered fingerprint:\n{}",
                                                 presented_str
@@ -361,29 +363,25 @@ impl Render for RemoteDialogsView {
                                     .text_size(px(12.))
                                     .text_color(self.theme.text_muted)
                                     .child(
-                                        "Someone could be eavesdropping or spoofing this connection. \
+                                    "Someone could be eavesdropping or spoofing this connection. \
                                          For security, connection is strictly refused.",
-                                    ),
+                                ),
                             )
                             .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .justify_end()
-                                    .child(
-                                        div()
-                                            .px_4()
-                                            .py_1()
-                                            .rounded_md()
-                                            .bg(self.theme.bg_header)
-                                            .text_color(self.theme.text_primary)
-                                            .cursor_pointer()
-                                            .child("Close (Refuse Connection)")
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| this.close(cx)),
-                                            ),
-                                    ),
+                                div().flex().flex_row().justify_end().child(
+                                    div()
+                                        .px_4()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(self.theme.surface_raised)
+                                        .text_color(self.theme.text)
+                                        .cursor_pointer()
+                                        .child("Close (Refuse Connection)")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| this.close(cx)),
+                                        ),
+                                ),
                             ),
                     )
             }
@@ -405,13 +403,13 @@ impl Render for RemoteDialogsView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba(0x00000080))
+                    .bg(self.theme.scrim)
                     .child(
                         div()
                             .w(px(400.))
                             .p_5()
                             .rounded_lg()
-                            .bg(self.theme.bg_panel)
+                            .bg(self.theme.surface)
                             .border_1()
                             .border_color(self.theme.border)
                             .flex()
@@ -421,13 +419,13 @@ impl Render for RemoteDialogsView {
                                 div()
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(self.theme.text_primary)
+                                    .text_color(self.theme.text)
                                     .child(format!("Authenticate to {}", host_str)),
                             )
                             .child(
                                 div()
                                     .text_size(px(13.))
-                                    .text_color(self.theme.text_secondary)
+                                    .text_color(self.theme.text_muted)
                                     .child(format!("User: {}", user_str)),
                             )
                             .child(self.password_input.clone())
@@ -435,7 +433,7 @@ impl Render for RemoteDialogsView {
                                 parent.child(
                                     div()
                                         .text_size(px(12.))
-                                        .text_color(self.theme.text_error)
+                                        .text_color(self.theme.danger)
                                         .child(err),
                                 )
                             })
@@ -456,7 +454,7 @@ impl Render for RemoteDialogsView {
                                     .child(
                                         div()
                                             .text_size(px(12.))
-                                            .text_color(self.theme.text_secondary)
+                                            .text_color(self.theme.text_muted)
                                             .child("Remember password in keyring"),
                                     ),
                             )
@@ -471,8 +469,8 @@ impl Render for RemoteDialogsView {
                                             .px_3()
                                             .py_1()
                                             .rounded_md()
-                                            .bg(self.theme.bg_header)
-                                            .text_color(self.theme.text_secondary)
+                                            .bg(self.theme.surface_raised)
+                                            .text_color(self.theme.text_muted)
                                             .cursor_pointer()
                                             .child("Cancel")
                                             .on_mouse_down(
@@ -486,7 +484,7 @@ impl Render for RemoteDialogsView {
                                             .py_1()
                                             .rounded_md()
                                             .bg(self.theme.accent)
-                                            .text_color(rgb(0x181825))
+                                            .text_color(self.theme.on_accent)
                                             .font_weight(FontWeight::MEDIUM)
                                             .cursor_pointer()
                                             .child("Connect")
@@ -520,14 +518,14 @@ impl Render for RemoteDialogsView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgba(0x00000080))
+                    .bg(self.theme.scrim)
                     .child(
                         div()
                             .w(px(480.))
                             .max_h(px(400.))
                             .p_5()
                             .rounded_lg()
-                            .bg(self.theme.bg_panel)
+                            .bg(self.theme.surface)
                             .border_1()
                             .border_color(self.theme.border)
                             .flex()
@@ -537,7 +535,7 @@ impl Render for RemoteDialogsView {
                                 div()
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(self.theme.text_primary)
+                                    .text_color(self.theme.text)
                                     .child("Saved Connection Profiles"),
                             )
                             .child(div().flex().flex_col().gap_1().children(
@@ -548,9 +546,9 @@ impl Render for RemoteDialogsView {
                                         .py_2()
                                         .rounded_md()
                                         .bg(if is_selected {
-                                            rgba(0x89b4fa20)
+                                            self.theme.selection
                                         } else {
-                                            rgba(0x00000000)
+                                            transparent_black().into()
                                         })
                                         .border_1()
                                         .border_color(if is_selected {
@@ -568,7 +566,7 @@ impl Render for RemoteDialogsView {
                                                 .child(
                                                     div()
                                                         .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(self.theme.text_primary)
+                                                        .text_color(self.theme.text)
                                                         .child(p.name),
                                                 )
                                                 .child(
@@ -589,8 +587,8 @@ impl Render for RemoteDialogsView {
                                         .px_3()
                                         .py_1()
                                         .rounded_md()
-                                        .bg(self.theme.bg_header)
-                                        .text_color(self.theme.text_secondary)
+                                        .bg(self.theme.surface_raised)
+                                        .text_color(self.theme.text_muted)
                                         .cursor_pointer()
                                         .child("Close")
                                         .on_mouse_down(

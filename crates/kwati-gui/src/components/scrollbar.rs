@@ -8,7 +8,11 @@
 //!   `uniform_list` and scrollable containers, custom styling tokens.
 //! - **Platforms:** Passes build on Linux (Wayland/X11), macOS, and Windows.
 
-use gpui::{div, prelude::*, px, relative, rgba, Context, CursorStyle, Pixels, Rgba, Window};
+use gpui::{
+    div, prelude::*, px, relative, transparent_black, Context, CursorStyle, Pixels, Rgba, Window,
+};
+
+use crate::theme::Theme;
 
 /// Configuration and current scroll position for a Scrollbar.
 #[derive(Debug, Clone)]
@@ -83,11 +87,12 @@ pub struct Scrollbar {
 
 impl Default for Scrollbar {
     fn default() -> Self {
+        let theme = Theme::default();
         Self {
             state: ScrollbarState::default(),
-            track_color: rgba(0x00000018),
-            thumb_color: rgba(0xffffff40),
-            thumb_hover_color: rgba(0xffffff70),
+            track_color: transparent_black().into(),
+            thumb_color: theme.border_strong,
+            thumb_hover_color: theme.text_muted,
             width: px(8.),
         }
     }

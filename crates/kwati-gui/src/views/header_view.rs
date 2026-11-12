@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::*, px, rgba, Context, CursorStyle, Entity, KeyDownEvent, MouseButton,
-    MouseDownEvent, SharedString, Window,
+    div, prelude::*, px, Context, CursorStyle, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
+    SharedString, Window,
 };
 
 use kwati_core::Location;
@@ -159,7 +159,7 @@ impl Render for HeaderView {
             .py_1()
             .items_center()
             .gap_2()
-            .bg(self.theme.bg_header)
+            .bg(self.theme.bg)
             .border_b_1()
             .border_color(self.theme.border)
             // Back button
@@ -174,12 +174,13 @@ impl Render for HeaderView {
                         CursorStyle::Arrow
                     })
                     .text_color(if can_go_back {
-                        self.theme.text_primary
+                        self.theme.text
                     } else {
                         self.theme.text_muted
                     })
-                    .bg(rgba(0x00000000))
-                    .when(can_go_back, |s| s.hover(|h| h.bg(rgba(0xffffff14))))
+                    .when(can_go_back, |s| {
+                        s.hover(|h| h.bg(self.theme.surface_raised))
+                    })
                     .when(can_go_back, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_back_click))
                     })
@@ -197,12 +198,13 @@ impl Render for HeaderView {
                         CursorStyle::Arrow
                     })
                     .text_color(if can_go_forward {
-                        self.theme.text_primary
+                        self.theme.text
                     } else {
                         self.theme.text_muted
                     })
-                    .bg(rgba(0x00000000))
-                    .when(can_go_forward, |s| s.hover(|h| h.bg(rgba(0xffffff14))))
+                    .when(can_go_forward, |s| {
+                        s.hover(|h| h.bg(self.theme.surface_raised))
+                    })
                     .when(can_go_forward, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_forward_click))
                     })
@@ -220,12 +222,11 @@ impl Render for HeaderView {
                         CursorStyle::Arrow
                     })
                     .text_color(if can_go_up {
-                        self.theme.text_primary
+                        self.theme.text
                     } else {
                         self.theme.text_muted
                     })
-                    .bg(rgba(0x00000000))
-                    .when(can_go_up, |s| s.hover(|h| h.bg(rgba(0xffffff14))))
+                    .when(can_go_up, |s| s.hover(|h| h.bg(self.theme.surface_raised)))
                     .when(can_go_up, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_up_click))
                     })

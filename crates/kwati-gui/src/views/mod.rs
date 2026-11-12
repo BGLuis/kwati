@@ -276,7 +276,7 @@ impl Render for MainView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(self.theme.bg_app)
+            .bg(self.theme.bg)
             .relative()
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_cut))
@@ -321,7 +321,7 @@ impl Render for MainView {
                     .items_center()
                     .h(px(24.))
                     .px_3()
-                    .bg(self.theme.bg_status)
+                    .bg(self.theme.bg)
                     .border_t_1()
                     .border_color(self.theme.border)
                     .text_size(px(11.))
@@ -340,7 +340,7 @@ impl Render for MainView {
                     .child(
                         div()
                             .text_color(if status_msg.is_some() {
-                                self.theme.text_warning
+                                self.theme.warning
                             } else {
                                 self.theme.text_muted
                             })

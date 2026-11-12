@@ -91,6 +91,6 @@ fn theme_defaults() {
     let dark = Theme::dark();
     let light = Theme::light();
 
-    assert_ne!(dark.bg_app, light.bg_app);
-    assert_ne!(dark.text_primary, light.text_primary);
+    assert_ne!(dark.bg, light.bg);
+    assert_ne!(dark.text, light.text);
 }
