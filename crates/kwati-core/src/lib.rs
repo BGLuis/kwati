@@ -1,4 +1,5 @@
 mod copy;
+mod profiles;
 mod search;
 mod settings;
 mod trash;
@@ -6,6 +7,10 @@ mod watcher;
 
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
+};
+pub use profiles::{
+    default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
+    PendingSecret, Protocol,
 };
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};

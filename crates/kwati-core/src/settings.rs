@@ -59,6 +59,32 @@ fn take_u32_or_default(
     }
 }
 
+/// Writes `text` to a temporary file beside `path`, then renames it over `path`.
+/// `between_write_and_rename` runs in between, so tests can simulate a crash.
+pub(crate) fn write_atomic(
+    path: &Path,
+    text: &str,
+    between_write_and_rename: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut tmp_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?
+        .to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let result = fs::write(&tmp_path, text)
+        .and_then(|()| between_write_and_rename())
+        .and_then(|()| fs::rename(&tmp_path, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
 impl Settings {
     /// Reads settings from `path`. A missing file yields the defaults; an invalid value falls
     /// back to its default and is reported. A file that is not valid TOML is an error, so the
@@ -114,23 +140,7 @@ impl Settings {
         let text = toml::to_string(&table)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
-        let mut tmp_name = path
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?
-            .to_os_string();
-        tmp_name.push(".tmp");
-        let tmp_path = path.with_file_name(tmp_name);
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let result = fs::write(&tmp_path, text)
-            .and_then(|()| between_write_and_rename())
-            .and_then(|()| fs::rename(&tmp_path, path));
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp_path);
-        }
-        result
+        write_atomic(path, &text, between_write_and_rename)
     }
 }
 
