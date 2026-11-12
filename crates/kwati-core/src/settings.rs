@@ -9,6 +9,8 @@ use crate::places::Bookmark;
 pub const CURRENT_VERSION: u32 = 1;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 5;
 pub const DEFAULT_LIST_TIMEOUT_SECS: u32 = 10;
+pub const DEFAULT_REMOTE_POLL_INTERVAL_SECS: u32 = 30;
+pub const MIN_REMOTE_POLL_INTERVAL_SECS: u32 = 10;
 
 /// A value in the settings file that was ignored in favour of its default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +26,8 @@ pub struct Settings {
     pub refresh_interval_secs: u32,
     /// Seconds a directory listing may take before it is abandoned (see `list_dir_bounded`).
     pub list_timeout_secs: u32,
+    pub remote_poll_enabled: bool,
+    pub remote_poll_interval_secs: u32,
     pub bookmarks: Vec<Bookmark>,
     /// Keys this version does not know, kept so a newer version's file survives a save.
     unknown: Table,
@@ -35,6 +39,8 @@ impl Default for Settings {
             version: CURRENT_VERSION,
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
             list_timeout_secs: DEFAULT_LIST_TIMEOUT_SECS,
+            remote_poll_enabled: false,
+            remote_poll_interval_secs: DEFAULT_REMOTE_POLL_INTERVAL_SECS,
             bookmarks: Vec::new(),
             unknown: Table::new(),
         }
@@ -52,6 +58,27 @@ fn take_u32_or_default(
     default: u32,
     warnings: &mut Vec<SettingsWarning>,
 ) -> u32 {
+    let Some(value) = table.remove(key) else {
+        return default;
+    };
+    match value.try_into() {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warnings.push(SettingsWarning {
+                key,
+                message: err.to_string(),
+            });
+            default
+        }
+    }
+}
+
+fn take_bool_or_default(
+    table: &mut Table,
+    key: &'static str,
+    default: bool,
+    warnings: &mut Vec<SettingsWarning>,
+) -> bool {
     let Some(value) = table.remove(key) else {
         return default;
     };
@@ -94,6 +121,16 @@ pub(crate) fn write_atomic(
 }
 
 impl Settings {
+    /// Sets the remote polling interval in seconds. Rejects values below [`MIN_REMOTE_POLL_INTERVAL_SECS`].
+    pub fn set_remote_poll_interval_secs(&mut self, secs: u32) -> Result<(), &'static str> {
+        if secs < MIN_REMOTE_POLL_INTERVAL_SECS {
+            Err("remote poll interval cannot be below minimum of 10 seconds")
+        } else {
+            self.remote_poll_interval_secs = secs;
+            Ok(())
+        }
+    }
+
     /// Reads settings from `path`. A missing file yields the defaults; an invalid value falls
     /// back to its default and is reported. A file that is not valid TOML is an error, so the
     /// caller never overwrites it by accident.
@@ -124,6 +161,30 @@ impl Settings {
             defaults.list_timeout_secs,
             &mut warnings,
         );
+        let remote_poll_enabled = take_bool_or_default(
+            &mut table,
+            "remote_poll_enabled",
+            defaults.remote_poll_enabled,
+            &mut warnings,
+        );
+        let raw_remote_poll_interval = take_u32_or_default(
+            &mut table,
+            "remote_poll_interval_secs",
+            defaults.remote_poll_interval_secs,
+            &mut warnings,
+        );
+        let remote_poll_interval_secs = if raw_remote_poll_interval < MIN_REMOTE_POLL_INTERVAL_SECS
+        {
+            warnings.push(SettingsWarning {
+                key: "remote_poll_interval_secs",
+                message: format!(
+                    "remote poll interval ({raw_remote_poll_interval}s) is below minimum of {MIN_REMOTE_POLL_INTERVAL_SECS}s"
+                ),
+            });
+            defaults.remote_poll_interval_secs
+        } else {
+            raw_remote_poll_interval
+        };
 
         let mut bookmarks = Vec::new();
         if let Some(val) = table.remove("bookmarks") {
@@ -171,6 +232,8 @@ impl Settings {
             version,
             refresh_interval_secs,
             list_timeout_secs,
+            remote_poll_enabled,
+            remote_poll_interval_secs,
             bookmarks,
             unknown: table,
         };
@@ -250,6 +313,14 @@ impl Settings {
         table.insert(
             "list_timeout_secs".into(),
             Value::Integer(self.list_timeout_secs.into()),
+        );
+        table.insert(
+            "remote_poll_enabled".into(),
+            Value::Boolean(self.remote_poll_enabled),
+        );
+        table.insert(
+            "remote_poll_interval_secs".into(),
+            Value::Integer(self.remote_poll_interval_secs.into()),
         );
         let bookmark_tables: Vec<Value> = self
             .bookmarks

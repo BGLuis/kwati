@@ -5,12 +5,13 @@ mod delete;
 mod move_entry;
 pub mod places;
 mod profiles;
+pub mod remote_poll;
 mod search;
 mod secrets;
 mod settings;
 mod transfer;
 mod trash;
-mod volume;
+pub mod volume;
 pub mod volumes;
 mod watcher;
 
@@ -31,16 +32,20 @@ pub use profiles::{
     default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
     PendingSecret, Protocol,
 };
+pub use remote_poll::{RemotePoller, MIN_POLL_INTERVAL};
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use secrets::{KeyringSecrets, Secrets, SecretsError};
-pub use settings::{default_path as settings_path, Settings, SettingsWarning};
+pub use settings::{
+    default_path as settings_path, Settings, SettingsWarning, DEFAULT_REFRESH_INTERVAL_SECS,
+    DEFAULT_REMOTE_POLL_INTERVAL_SECS, MIN_REMOTE_POLL_INTERVAL_SECS,
+};
 pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
 pub use volumes::{
     filter_volumes, is_pseudo_filesystem, list_volumes, mounted_volumes, Volume, VolumeManager,
 };
-pub use watcher::DirWatcher;
+pub use watcher::{DirWatcher, WatcherBackend};
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
