@@ -2,8 +2,11 @@
 //!
 //! Provides navigation buttons (Back, Forward, Up) and the interactive address bar.
 
+use std::path::PathBuf;
+
 use gpui::{
-    div, prelude::*, px, rgba, Context, CursorStyle, Entity, MouseButton, MouseDownEvent, Window,
+    div, prelude::*, px, rgba, Context, CursorStyle, Entity, KeyDownEvent, MouseButton,
+    MouseDownEvent, SharedString, Window,
 };
 
 use crate::components::TextInput;
@@ -36,6 +39,14 @@ impl HeaderView {
         }
     }
 
+    /// Sets the text inside the address input.
+    pub fn set_address_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.address_input.update(cx, |input, cx| {
+            input.set_text(text, cx);
+        });
+    }
+
+    /// Synchronizes the address input text with the state's current location path.
     pub fn sync_address_input(&mut self, cx: &mut Context<Self>) {
         let path_str = self
             .app_state
@@ -47,6 +58,39 @@ impl HeaderView {
         self.address_input.update(cx, |input, cx| {
             input.set_text(path_str, cx);
         });
+    }
+
+    /// Validates the entered path and navigates to it if it exists and is a directory.
+    /// If missing, displays an error in the status bar and keeps current listing intact.
+    pub fn commit_address(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.address_input.read(cx).text().trim().to_string();
+        if typed.is_empty() {
+            return;
+        }
+
+        let target_path = PathBuf::from(&typed);
+        if target_path.exists() && target_path.is_dir() {
+            self.app_state.update(cx, |state, _cx| {
+                state.navigate_to(target_path.clone().into());
+                state.clear_status();
+            });
+            self.sync_address_input(cx);
+        } else {
+            let err_msg = format!("Directory not found: {}", typed);
+            self.app_state.update(cx, |state, _cx| {
+                state.set_status(err_msg);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Reverts the address input back to the current directory path and clears status error.
+    pub fn revert_address(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_address_input(cx);
+        self.app_state.update(cx, |state, _cx| {
+            state.clear_status();
+        });
+        cx.notify();
     }
 
     fn on_up_click(&mut self, _: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -172,7 +216,18 @@ impl Render for HeaderView {
                     })
                     .child("▲ Up"),
             )
-            // Address bar
-            .child(div().flex_1().child(self.address_input.clone()))
+            // Address bar with Enter and Escape key listeners
+            .child(
+                div()
+                    .flex_1()
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "enter" {
+                            this.commit_address(window, cx);
+                        } else if event.keystroke.key == "escape" {
+                            this.revert_address(window, cx);
+                        }
+                    }))
+                    .child(self.address_input.clone()),
+            )
     }
 }
