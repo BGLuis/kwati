@@ -6,6 +6,7 @@ use toml::{Table, Value};
 
 pub const CURRENT_VERSION: u32 = 1;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 5;
+pub const DEFAULT_LIST_TIMEOUT_SECS: u32 = 10;
 
 /// A value in the settings file that was ignored in favour of its default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +20,8 @@ pub struct SettingsWarning {
 pub struct Settings {
     pub version: u32,
     pub refresh_interval_secs: u32,
+    /// Seconds a directory listing may take before it is abandoned (see `list_dir_bounded`).
+    pub list_timeout_secs: u32,
     /// Keys this version does not know, kept so a newer version's file survives a save.
     unknown: Table,
 }
@@ -28,6 +31,7 @@ impl Default for Settings {
         Self {
             version: CURRENT_VERSION,
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
+            list_timeout_secs: DEFAULT_LIST_TIMEOUT_SECS,
             unknown: Table::new(),
         }
     }
@@ -59,6 +63,32 @@ fn take_u32_or_default(
     }
 }
 
+/// Writes `text` to a temporary file beside `path`, then renames it over `path`.
+/// `between_write_and_rename` runs in between, so tests can simulate a crash.
+pub(crate) fn write_atomic(
+    path: &Path,
+    text: &str,
+    between_write_and_rename: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut tmp_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?
+        .to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let result = fs::write(&tmp_path, text)
+        .and_then(|()| between_write_and_rename())
+        .and_then(|()| fs::rename(&tmp_path, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
 impl Settings {
     /// Reads settings from `path`. A missing file yields the defaults; an invalid value falls
     /// back to its default and is reported. A file that is not valid TOML is an error, so the
@@ -84,9 +114,16 @@ impl Settings {
             defaults.refresh_interval_secs,
             &mut warnings,
         );
+        let list_timeout_secs = take_u32_or_default(
+            &mut table,
+            "list_timeout_secs",
+            defaults.list_timeout_secs,
+            &mut warnings,
+        );
         let settings = Self {
             version,
             refresh_interval_secs,
+            list_timeout_secs,
             unknown: table,
         };
         Ok((settings, warnings))
@@ -111,26 +148,14 @@ impl Settings {
             "refresh_interval_secs".into(),
             Value::Integer(self.refresh_interval_secs.into()),
         );
+        table.insert(
+            "list_timeout_secs".into(),
+            Value::Integer(self.list_timeout_secs.into()),
+        );
         let text = toml::to_string(&table)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
-        let mut tmp_name = path
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?
-            .to_os_string();
-        tmp_name.push(".tmp");
-        let tmp_path = path.with_file_name(tmp_name);
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let result = fs::write(&tmp_path, text)
-            .and_then(|()| between_write_and_rename())
-            .and_then(|()| fs::rename(&tmp_path, path));
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp_path);
-        }
-        result
+        write_atomic(path, &text, between_write_and_rename)
     }
 }
 
@@ -187,6 +212,28 @@ mod tests {
         assert_eq!(settings.version, 7);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].key, "refresh_interval_secs");
+    }
+
+    #[test]
+    fn settings_list_timeout() {
+        let dir = TestDir::new("settings_list_timeout");
+        let path = dir.path.join("settings.toml");
+        assert_eq!(Settings::default().list_timeout_secs, 10);
+
+        fs::write(&path, "list_timeout_secs = 3\n").unwrap();
+        let (mut settings, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(settings.list_timeout_secs, 3);
+
+        settings.list_timeout_secs = 20;
+        settings.save_to(&path).unwrap();
+        let (saved, _) = Settings::load_from(&path).unwrap();
+        assert_eq!(saved.list_timeout_secs, 20);
+
+        fs::write(&path, "list_timeout_secs = -1\n").unwrap();
+        let (settings, warnings) = Settings::load_from(&path).unwrap();
+        assert_eq!(settings.list_timeout_secs, DEFAULT_LIST_TIMEOUT_SECS);
+        assert_eq!(warnings[0].key, "list_timeout_secs");
     }
 
     #[test]

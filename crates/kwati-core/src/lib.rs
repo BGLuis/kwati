@@ -1,15 +1,34 @@
+mod bounded;
+mod connection;
 mod copy;
+mod delete;
+mod move_entry;
+mod profiles;
 mod search;
+mod secrets;
 mod settings;
+mod transfer;
 mod trash;
+mod volume;
 mod watcher;
 
+pub use bounded::{list_dir_bounded, list_dir_bounded_with, DEFAULT_MAX_ABANDONED};
+pub use connection::{is_dropped_connection, ConnectionState, ReconnectingBackend, RetryPolicy};
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
+pub use delete::{delete_permanently, Confirmed};
+pub use move_entry::{move_entry, move_entry_with};
+pub use profiles::{
+    default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
+    PendingSecret, Protocol,
+};
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
+pub use secrets::{KeyringSecrets, Secrets, SecretsError};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
-pub use trash::trash;
+pub use transfer::{copy_between, move_between};
+pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
+pub use volume::{volume_kind, VolumeKind};
 pub use watcher::DirWatcher;
 
 use std::ffi::{OsStr, OsString};
@@ -101,9 +120,6 @@ impl Entry {
 }
 
 /// Determines whether an entry is hidden based on platform conventions.
-///
-/// On Windows, checks whether `FILE_ATTRIBUTE_HIDDEN` is set in the file attributes.
-/// On Unix-like systems, checks whether the file name starts with a dot (`.`).
 pub fn is_hidden_entry(name: &OsStr, _metadata: Option<&fs::Metadata>) -> bool {
     #[cfg(windows)]
     {
@@ -127,7 +143,6 @@ pub fn is_hidden_entry(name: &OsStr, _metadata: Option<&fs::Metadata>) -> bool {
     }
 }
 
-/// The column by which directory entries can be sorted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortColumn {
     #[default]
@@ -136,7 +151,6 @@ pub enum SortColumn {
     Date,
 }
 
-/// The direction in which directory entries can be sorted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortDirection {
     #[default]
@@ -144,7 +158,6 @@ pub enum SortDirection {
     Descending,
 }
 
-/// Combined sort column and direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SortOrder {
     pub column: SortColumn,
@@ -157,7 +170,6 @@ impl SortOrder {
     }
 }
 
-/// Options for listing directory entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListOptions {
     pub show_hidden: bool,
@@ -192,39 +204,31 @@ impl ListOptions {
     }
 }
 
-/// Sorts a slice of entries: directories first, then case-insensitive by name.
 pub fn sort_entries(entries: &mut [Entry]) {
     sort_entries_by(entries, SortColumn::Name, SortDirection::Ascending);
 }
 
-/// Sorts a slice of entries by the given column and direction, keeping directories first in both directions.
 pub fn sort_entries_by(entries: &mut [Entry], column: SortColumn, direction: SortDirection) {
     entries.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir).then_with(|| {
-            let ord = match column {
-                SortColumn::Name => {
-                    let a_lower = a.name.to_string_lossy().to_lowercase();
-                    let b_lower = b.name.to_string_lossy().to_lowercase();
-                    a_lower.cmp(&b_lower).then_with(|| a.name.cmp(&b.name))
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| {
+                let ord = match column {
+                    SortColumn::Name => {
+                        let a_lower = a.name.to_string_lossy().to_lowercase();
+                        let b_lower = b.name.to_string_lossy().to_lowercase();
+                        a_lower.cmp(&b_lower)
+                    }
+                    SortColumn::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
+                    SortColumn::Date => a.modified.cmp(&b.modified),
+                };
+                match direction {
+                    SortDirection::Ascending => ord,
+                    SortDirection::Descending => ord.reverse(),
                 }
-                SortColumn::Size => a.size.cmp(&b.size),
-                SortColumn::Date => a.modified.cmp(&b.modified),
-            };
-
-            let directed_ord = match direction {
-                SortDirection::Ascending => ord,
-                SortDirection::Descending => ord.reverse(),
-            };
-
-            directed_ord
-                .then_with(|| {
-                    let a_lower = a.name.to_string_lossy().to_lowercase();
-                    let b_lower = b.name.to_string_lossy().to_lowercase();
-                    a_lower.cmp(&b_lower)
-                })
-                .then_with(|| a.name.cmp(&b.name))
-                .then_with(|| a.path.cmp(&b.path))
-        })
+            })
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.path.cmp(&b.path))
     });
 }
 
@@ -237,15 +241,6 @@ pub struct Listing {
 impl Listing {
     pub fn new(mut entries: Vec<Entry>) -> Self {
         sort_entries(&mut entries);
-        Self { entries }
-    }
-
-    pub fn new_with_order(
-        mut entries: Vec<Entry>,
-        column: SortColumn,
-        direction: SortDirection,
-    ) -> Self {
-        sort_entries_by(&mut entries, column, direction);
         Self { entries }
     }
 
@@ -298,19 +293,14 @@ impl From<Vec<Entry>> for Listing {
     }
 }
 
-/// Lists a directory at the given path with default options.
+/// Lists a directory at the given path.
 ///
-/// Excludes hidden entries and sorts by name ascending, keeping directories first.
 /// Follows symlinks to determine if an entry is a directory. Dangling symlinks are listed
 /// as non-directories without failing the listing. Unreadable entries are skipped.
 pub fn list_dir(path: &Path) -> io::Result<Listing> {
     list_dir_with_options(path, &ListOptions::default())
 }
 
-/// Lists a directory at the given path with the specified [`ListOptions`].
-///
-/// Follows symlinks to determine if an entry is a directory. Dangling symlinks are listed
-/// as non-directories without failing the listing. Unreadable entries are skipped.
 pub fn list_dir_with_options(path: &Path, options: &ListOptions) -> io::Result<Listing> {
     let read_dir = fs::read_dir(path)?;
     let mut entries = Vec::new();
@@ -489,6 +479,22 @@ impl Location {
             Location::Remote { path, .. } => path,
         }
     }
+
+    /// The last component of the path, if any.
+    pub fn file_name(&self) -> Option<&OsStr> {
+        self.path().file_name()
+    }
+
+    /// The same location kind (and profile) with `name` appended to the path.
+    pub fn join(&self, name: &OsStr) -> Location {
+        match self {
+            Location::Local(path) => Location::Local(path.join(name)),
+            Location::Remote { profile_id, path } => Location::Remote {
+                profile_id: profile_id.clone(),
+                path: path.join(name),
+            },
+        }
+    }
 }
 
 impl From<PathBuf> for Location {
@@ -578,10 +584,32 @@ impl BackendError {
     pub fn is_unsupported(&self) -> bool {
         matches!(self, BackendError::Unsupported)
     }
+
+    /// Whether the backend refused to trash because it has no trash for the location.
+    pub fn is_trash_unavailable(&self) -> bool {
+        matches!(self, BackendError::Io(err) if is_trash_unavailable(err))
+    }
 }
 
-/// Trait representing a storage backend capable of listing directory contents.
-pub trait Backend {
+/// What a backend reports about one entry, without following symlinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryMeta {
+    pub kind: EntryKind,
+    /// Size in bytes for files; 0 for the other kinds.
+    pub len: u64,
+}
+
+/// A storage backend. Only [`Backend::list`] is required; every other operation defaults to
+/// [`BackendError::Unsupported`], and [`Backend::trash`] to a trash-unavailable error, so a
+/// backend implements what its protocol supports.
+pub trait Backend: Send + Sync {
     fn list(&self, location: &Location) -> Result<Listing, BackendError>;
 
     fn list_with_options(
@@ -594,23 +622,94 @@ pub trait Backend {
             Location::Remote { .. } => Err(BackendError::Unsupported),
         }
     }
+
+    fn stat(&self, _location: &Location) -> Result<EntryMeta, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    fn open_read(&self, _location: &Location) -> Result<Box<dyn io::Read + Send>, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Creates the file, or truncates it if it exists.
+    fn open_write(&self, _location: &Location) -> Result<Box<dyn io::Write + Send>, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Renames within this backend, replacing `to` when it is an existing file.
+    fn rename(&self, _from: &Location, _to: &Location) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    fn create_dir(&self, _location: &Location) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Deletes a file, a symlink (never followed) or a folder with its contents.
+    fn delete_permanently(
+        &self,
+        _location: &Location,
+        _confirmed: Confirmed,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    fn trash(&self, location: &Location) -> Result<(), BackendError> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            TrashUnavailable {
+                path: location.path().to_path_buf(),
+            },
+        )
+        .into())
+    }
 }
 
 /// The local filesystem backend.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+///
+/// Folders on a network or unidentified volume are listed with [`list_dir_bounded`], so a
+/// share that stops answering fails with a timeout instead of hanging the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalBackend {
+    list_timeout: std::time::Duration,
     options: ListOptions,
+}
+
+impl Default for LocalBackend {
+    fn default() -> Self {
+        Self {
+            list_timeout: std::time::Duration::from_secs(u64::from(
+                settings::DEFAULT_LIST_TIMEOUT_SECS,
+            )),
+            options: ListOptions::default(),
+        }
+    }
 }
 
 impl LocalBackend {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_list_timeout(list_timeout: std::time::Duration) -> Self {
         Self {
+            list_timeout,
             options: ListOptions::default(),
         }
     }
 
     pub fn with_options(options: ListOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            ..Self::default()
+        }
+    }
+}
+
+fn local_path(location: &Location) -> Result<&Path, BackendError> {
+    match location {
+        Location::Local(path) => Ok(path),
+        Location::Remote { .. } => Err(BackendError::Unsupported),
     }
 }
 
@@ -624,13 +723,67 @@ impl Backend for LocalBackend {
         location: &Location,
         options: &ListOptions,
     ) -> Result<Listing, BackendError> {
-        match location {
-            Location::Local(path) => {
-                let listing = list_dir_with_options(path, options)?;
-                Ok(listing)
+        let path = local_path(location)?;
+        let listing = match volume_kind(path) {
+            VolumeKind::Local => list_dir_with_options(path, options)?,
+            VolumeKind::Network | VolumeKind::Unknown => {
+                let mut l = list_dir_bounded(path, self.list_timeout)?;
+                if !options.show_hidden {
+                    l.entries.retain(|e| !e.is_hidden);
+                }
+                sort_entries_by(&mut l.entries, options.sort_column, options.sort_direction);
+                l
             }
-            Location::Remote { .. } => Err(BackendError::Unsupported),
-        }
+        };
+        Ok(listing)
+    }
+
+    fn stat(&self, location: &Location) -> Result<EntryMeta, BackendError> {
+        let meta = fs::symlink_metadata(local_path(location)?)?;
+        let kind = if meta.is_dir() {
+            EntryKind::Dir
+        } else if meta.is_file() {
+            EntryKind::File
+        } else {
+            EntryKind::Symlink
+        };
+        let len = if kind == EntryKind::File {
+            meta.len()
+        } else {
+            0
+        };
+        Ok(EntryMeta { kind, len })
+    }
+
+    fn open_read(&self, location: &Location) -> Result<Box<dyn io::Read + Send>, BackendError> {
+        Ok(Box::new(fs::File::open(local_path(location)?)?))
+    }
+
+    fn open_write(&self, location: &Location) -> Result<Box<dyn io::Write + Send>, BackendError> {
+        Ok(Box::new(fs::File::create(local_path(location)?)?))
+    }
+
+    fn rename(&self, from: &Location, to: &Location) -> Result<(), BackendError> {
+        Ok(fs::rename(local_path(from)?, local_path(to)?)?)
+    }
+
+    fn create_dir(&self, location: &Location) -> Result<(), BackendError> {
+        Ok(create_dir(local_path(location)?)?)
+    }
+
+    fn delete_permanently(
+        &self,
+        location: &Location,
+        confirmed: Confirmed,
+    ) -> Result<(), BackendError> {
+        Ok(delete_permanently(
+            &[local_path(location)?.to_path_buf()],
+            confirmed,
+        )?)
+    }
+
+    fn trash(&self, location: &Location) -> Result<(), BackendError> {
+        Ok(trash(local_path(location)?)?)
     }
 }
 
