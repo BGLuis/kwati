@@ -12,7 +12,9 @@ mod trash;
 mod volume;
 mod watcher;
 
-pub use bounded::{list_dir_bounded, list_dir_bounded_with, DEFAULT_MAX_ABANDONED};
+pub use bounded::{
+    list_dir_bounded, list_dir_bounded_with, list_dir_bounded_with_options, DEFAULT_MAX_ABANDONED,
+};
 pub use connection::{is_dropped_connection, ConnectionState, ReconnectingBackend, RetryPolicy};
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
@@ -727,12 +729,7 @@ impl Backend for LocalBackend {
         let listing = match volume_kind(path) {
             VolumeKind::Local => list_dir_with_options(path, options)?,
             VolumeKind::Network | VolumeKind::Unknown => {
-                let mut l = list_dir_bounded(path, self.list_timeout)?;
-                if !options.show_hidden {
-                    l.entries.retain(|e| !e.is_hidden);
-                }
-                sort_entries_by(&mut l.entries, options.sort_column, options.sort_direction);
-                l
+                list_dir_bounded_with_options(path, self.list_timeout, *options)?
             }
         };
         Ok(listing)
