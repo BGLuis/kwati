@@ -6,14 +6,11 @@ mod move_entry;
 mod profiles;
 mod search;
 mod secrets;
+pub mod remote_poll;
 mod settings;
 mod transfer;
 mod trash;
-<<<<<<< HEAD
-mod volume;
-=======
 pub mod volume;
->>>>>>> a76791f (feat(core): poll network mounts instead of waiting for change events (#32))
 mod watcher;
 
 pub use bounded::{list_dir_bounded, list_dir_bounded_with, DEFAULT_MAX_ABANDONED};
@@ -23,26 +20,21 @@ pub use copy::{
 };
 pub use delete::{delete_permanently, Confirmed};
 pub use move_entry::{move_entry, move_entry_with};
+pub use remote_poll::{RemotePoller, MIN_POLL_INTERVAL};
 pub use profiles::{
     default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
     PendingSecret, Protocol,
 };
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use secrets::{KeyringSecrets, Secrets, SecretsError};
-pub use settings::{default_path as settings_path, Settings, SettingsWarning};
-<<<<<<< HEAD
+pub use settings::{
+    default_path as settings_path, Settings, SettingsWarning, DEFAULT_REFRESH_INTERVAL_SECS,
+    DEFAULT_REMOTE_POLL_INTERVAL_SECS, MIN_REMOTE_POLL_INTERVAL_SECS,
+};
 pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
-pub use watcher::DirWatcher;
-=======
-pub use trash::trash;
-pub use volume::{
-    classify_linux_fstype, classify_macos_fstype, volume_kind, volume_kind_from_mountinfo,
-    VolumeKind,
-};
 pub use watcher::{DirWatcher, WatcherBackend};
->>>>>>> a76791f (feat(core): poll network mounts instead of waiting for change events (#32))
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
