@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Whether a path lives on a local disk or on a network mount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +15,51 @@ pub enum VolumeKind {
 /// unreadable mount table, unsupported platform), never [`VolumeKind::Local`].
 pub fn volume_kind(path: &Path) -> VolumeKind {
     platform_kind(path)
+}
+
+/// The mount point that holds `path`, used to group paths that share one filesystem.
+///
+/// Falls back to the filesystem root of `path` when the mount table cannot be read, so every
+/// path still gets a key.
+pub(crate) fn mount_key(path: &Path) -> PathBuf {
+    platform_mount(path).unwrap_or_else(|| path.ancestors().last().unwrap_or(path).to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn platform_mount(path: &Path) -> Option<PathBuf> {
+    let path = path.canonicalize().ok()?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    linux_mount(&mountinfo, &path).map(|(mount_point, _)| PathBuf::from(mount_point))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_mount(path: &Path) -> Option<PathBuf> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let mount_point = unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) };
+    Some(PathBuf::from(mount_point.to_string_lossy().into_owned()))
+}
+
+#[cfg(windows)]
+fn platform_mount(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let absolute = std::path::absolute(path).ok()?;
+    match absolute.components().next()? {
+        Component::Prefix(prefix) => Some(PathBuf::from(prefix.as_os_str())),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn platform_mount(_path: &Path) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -94,11 +139,12 @@ const LINUX_NETWORK_FS: &[&str] = &[
 #[cfg(any(target_os = "macos", test))]
 const MACOS_NETWORK_FS: &[&str] = &["smbfs", "nfs", "afpfs", "webdav"];
 
-/// Classifies `path` (already absolute and symlink-free) against `/proc/self/mountinfo`
-/// content; the longest matching mount point wins, and later entries shadow earlier ones.
+/// Finds the mount point and filesystem type of `path` (already absolute and symlink-free) in
+/// `/proc/self/mountinfo` content; the longest matching mount point wins, and later entries
+/// shadow earlier ones.
 #[cfg(any(target_os = "linux", test))]
-fn linux_kind(mountinfo: &str, path: &Path) -> VolumeKind {
-    let mut best: Option<(usize, &str)> = None;
+fn linux_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<(String, &'a str)> {
+    let mut best: Option<(String, &str)> = None;
     for line in mountinfo.lines() {
         let mut fields = line.split(' ');
         let Some(mount_point) = fields.nth(4) else {
@@ -108,11 +154,21 @@ fn linux_kind(mountinfo: &str, path: &Path) -> VolumeKind {
             continue;
         };
         let mount_point = unescape_octal(mount_point);
-        if path.starts_with(&mount_point) && best.is_none_or(|(len, _)| mount_point.len() >= len) {
-            best = Some((mount_point.len(), fstype));
+        if path.starts_with(&mount_point)
+            && best
+                .as_ref()
+                .is_none_or(|(best_point, _)| mount_point.len() >= best_point.len())
+        {
+            best = Some((mount_point, fstype));
         }
     }
-    match best {
+    best
+}
+
+/// Classifies `path` (already absolute and symlink-free) against `/proc/self/mountinfo` content.
+#[cfg(any(target_os = "linux", test))]
+fn linux_kind(mountinfo: &str, path: &Path) -> VolumeKind {
+    match linux_mount(mountinfo, path) {
         Some((_, fstype)) if LINUX_NETWORK_FS.contains(&fstype) => VolumeKind::Network,
         Some(_) => VolumeKind::Local,
         None => VolumeKind::Unknown,
@@ -198,6 +254,18 @@ mod tests {
     fn volume_kind_linux_longest_mount_wins_and_unescapes() {
         let nested = Path::new("/mnt/nas/local disk/f");
         assert_eq!(linux_kind(MOUNTINFO, nested), VolumeKind::Local);
+    }
+
+    #[test]
+    fn mount_point_is_the_longest_match() {
+        let mount = |path: &str| linux_mount(MOUNTINFO, Path::new(path)).map(|(point, _)| point);
+        assert_eq!(mount("/mnt/nas/docs/a.txt").as_deref(), Some("/mnt/nas"));
+        assert_eq!(
+            mount("/mnt/nas/local disk/f").as_deref(),
+            Some("/mnt/nas/local disk")
+        );
+        assert_eq!(mount("/home/user").as_deref(), Some("/"));
+        assert_eq!(linux_mount("", Path::new("/x")), None);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod bounded;
 mod copy;
 mod search;
 mod settings;
@@ -5,6 +6,7 @@ mod trash;
 mod volume;
 mod watcher;
 
+pub use bounded::{list_dir_bounded, list_dir_bounded_with, DEFAULT_MAX_ABANDONED};
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
