@@ -3,8 +3,9 @@ use std::path::PathBuf;
 
 use kwati_core::{list_dir, ConflictPolicy, CopyOutcome, Location};
 use kwati_gui::actions::operations::{
-    check_paste_conflict, clear_clipboard, copy_to_clipboard, execute_copy, execute_create_folder,
-    execute_rename, execute_trash, get_clipboard, validate_entry_name,
+    check_paste_conflict, clear_clipboard, copy_to_clipboard, cut_to_clipboard, execute_copy,
+    execute_create_folder, execute_move, execute_rename, execute_trash, get_clipboard,
+    validate_entry_name,
 };
 use kwati_gui::state::{AppState, UndoOperation};
 
@@ -400,6 +401,122 @@ fn test_copy_conflict_policies_skip_keep_both_replace() {
     );
     assert_eq!(outcome.unwrap(), CopyOutcome::Completed);
     assert_eq!(fs::read_to_string(&existing).unwrap(), "new version");
+
+    let _ = fs::remove_dir_all(src_dir);
+    let _ = fs::remove_dir_all(dst_dir);
+}
+
+// =========================================================================
+// Issue #23: Cut & Move entries across locations with progress
+// =========================================================================
+
+#[test]
+fn test_cut_and_move_same_fs_completes_and_removes_source() {
+    clear_clipboard();
+    let src_dir = create_temp_test_dir("move_src");
+    let file = src_dir.join("move_me.txt");
+    fs::write(&file, "move content").unwrap();
+
+    cut_to_clipboard(vec![file.clone()]);
+    let cb = get_clipboard().expect("clipboard must have cut data");
+    assert!(cb.is_cut);
+
+    let dst_dir = create_temp_test_dir("move_dst");
+    let mut state = AppState::new(Location::Local(dst_dir.clone()));
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let outcome = execute_move(
+        &mut state,
+        &cb.sources,
+        &dst_dir,
+        ConflictPolicy::Replace,
+        cancel_flag,
+        false,
+    );
+    assert_eq!(outcome.unwrap(), CopyOutcome::Completed);
+
+    let target_file = dst_dir.join("move_me.txt");
+    assert!(target_file.exists());
+    assert_eq!(fs::read_to_string(&target_file).unwrap(), "move content");
+    assert!(!file.exists()); // Source removed!
+
+    // Clipboard cleared after cut & paste
+    assert!(get_clipboard().is_none());
+
+    // Undo stack updated with Move
+    assert_eq!(state.undo_stack.len(), 1);
+    assert_eq!(
+        state.undo_stack.peek(),
+        Some(&UndoOperation::Move {
+            from: vec![file],
+            to: vec![target_file],
+        })
+    );
+
+    let _ = fs::remove_dir_all(src_dir);
+    let _ = fs::remove_dir_all(dst_dir);
+}
+
+#[test]
+fn test_cut_and_move_cross_device_fallback_completes_and_removes_source() {
+    let src_dir = create_temp_test_dir("move_cross_src");
+    let folder = src_dir.join("my_folder");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("nested.txt"), "nested content").unwrap();
+
+    let dst_dir = create_temp_test_dir("move_cross_dst");
+    let mut state = AppState::new(Location::Local(dst_dir.clone()));
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let outcome = execute_move(
+        &mut state,
+        std::slice::from_ref(&folder),
+        &dst_dir,
+        ConflictPolicy::Replace,
+        cancel_flag,
+        true, // simulate cross-device
+    );
+    assert_eq!(outcome.unwrap(), CopyOutcome::Completed);
+
+    let dest_folder = dst_dir.join("my_folder");
+    assert!(dest_folder.is_dir());
+    assert_eq!(
+        fs::read_to_string(dest_folder.join("nested.txt")).unwrap(),
+        "nested content"
+    );
+    assert!(!folder.exists()); // Source removed after cross-device copy!
+
+    let _ = fs::remove_dir_all(src_dir);
+    let _ = fs::remove_dir_all(dst_dir);
+}
+
+#[test]
+fn test_cut_and_move_cross_device_cancellation_keeps_source() {
+    let src_dir = create_temp_test_dir("move_cross_cancel_src");
+    let folder = src_dir.join("important_folder");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("doc.dat"), vec![0x99u8; 128 * 1024]).unwrap();
+
+    let dst_dir = create_temp_test_dir("move_cross_cancel_dst");
+    let mut state = AppState::new(Location::Local(dst_dir.clone()));
+
+    let cancel_flag = Arc::new(AtomicBool::new(true)); // Pre-cancelled
+    let outcome = execute_move(
+        &mut state,
+        std::slice::from_ref(&folder),
+        &dst_dir,
+        ConflictPolicy::Replace,
+        cancel_flag,
+        true, // simulate cross-device
+    );
+    assert_eq!(outcome.unwrap(), CopyOutcome::Cancelled);
+
+    // Source MUST remain listed and intact!
+    assert!(folder.exists());
+    assert!(folder.join("doc.dat").exists());
+
+    // Destination should be cleaned up
+    assert!(!dst_dir.join("important_folder").exists());
 
     let _ = fs::remove_dir_all(src_dir);
     let _ = fs::remove_dir_all(dst_dir);

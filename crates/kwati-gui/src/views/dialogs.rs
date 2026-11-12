@@ -11,7 +11,7 @@ use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, MouseButton, Window}
 use kwati_core::ConflictPolicy;
 
 use crate::actions::operations::{
-    execute_copy, execute_create_folder, execute_rename, execute_trash,
+    execute_copy, execute_create_folder, execute_move, execute_rename, execute_trash,
 };
 use crate::components::TextInput;
 use crate::state::AppState;
@@ -128,14 +128,22 @@ impl DialogsView {
     /// Resolves the current conflict with the chosen ConflictPolicy.
     pub fn resolve_conflict(&mut self, policy: ConflictPolicy, cx: &mut Context<Self>) {
         if let DialogKind::ConflictResolution {
-            sources, dest_dir, ..
+            sources,
+            dest_dir,
+            is_cut,
+            ..
         } = &self.current_dialog
         {
             let srcs = sources.clone();
             let dst = dest_dir.clone();
+            let cut = *is_cut;
             let cancel_flag = Arc::new(AtomicBool::new(false));
             self.app_state.update(cx, |state, _cx| {
-                let _ = execute_copy(state, &srcs, &dst, policy, cancel_flag);
+                if cut {
+                    let _ = execute_move(state, &srcs, &dst, policy, cancel_flag, false);
+                } else {
+                    let _ = execute_copy(state, &srcs, &dst, policy, cancel_flag);
+                }
             });
         }
         self.close(cx);
