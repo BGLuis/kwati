@@ -3,8 +3,11 @@
 //! Provides modals and inline prompts for rename, new folder, trash confirmation,
 //! and permanent delete warnings.
 
+use std::path::PathBuf;
+
 use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, MouseButton, Window};
 
+use crate::actions::operations::{execute_create_folder, execute_rename};
 use crate::components::TextInput;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -12,10 +15,21 @@ use crate::theme::Theme;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogKind {
     None,
-    NewFolder,
-    Rename { current_name: String },
-    ConfirmTrash { count: usize },
-    ConfirmDelete { count: usize },
+    NewFolder {
+        parent_path: PathBuf,
+        error: Option<String>,
+    },
+    Rename {
+        source_path: PathBuf,
+        current_name: String,
+        error: Option<String>,
+    },
+    ConfirmTrash {
+        count: usize,
+    },
+    ConfirmDelete {
+        count: usize,
+    },
 }
 
 pub struct DialogsView {
@@ -45,6 +59,101 @@ impl DialogsView {
         self.current_dialog = DialogKind::None;
         cx.notify();
     }
+
+    /// Opens the New Folder dialog with a default or cleared name.
+    pub fn open_new_folder(&mut self, parent: PathBuf, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.set_text("New Folder", cx);
+        });
+        self.current_dialog = DialogKind::NewFolder {
+            parent_path: parent,
+            error: None,
+        };
+        cx.notify();
+    }
+
+    /// Opens the Rename dialog for a given source entry.
+    pub fn open_rename(&mut self, source: PathBuf, cx: &mut Context<Self>) {
+        let current_name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let name_clone = current_name.clone();
+        self.input.update(cx, |input, cx| {
+            input.set_text(name_clone, cx);
+        });
+        self.current_dialog = DialogKind::Rename {
+            source_path: source,
+            current_name,
+            error: None,
+        };
+        cx.notify();
+    }
+
+    /// Submits the current active dialog (NewFolder or Rename).
+    pub fn submit(&mut self, cx: &mut Context<Self>) {
+        let input_text = self.input.read(cx).text().to_string();
+
+        match &self.current_dialog {
+            DialogKind::NewFolder { parent_path, .. } => {
+                let parent = parent_path.clone();
+                let mut error_opt = None;
+                self.app_state.update(cx, |state, _cx| {
+                    match execute_create_folder(state, &parent, &input_text) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            state.set_status(err.clone());
+                            error_opt = Some(err);
+                        }
+                    }
+                });
+
+                if let Some(err) = error_opt {
+                    self.current_dialog = DialogKind::NewFolder {
+                        parent_path: parent,
+                        error: Some(err),
+                    };
+                    cx.notify();
+                } else {
+                    self.close(cx);
+                }
+            }
+            DialogKind::Rename {
+                source_path,
+                current_name,
+                ..
+            } => {
+                let source = source_path.clone();
+                let original_name = current_name.clone();
+                let mut error_opt = None;
+
+                self.app_state.update(cx, |state, _cx| {
+                    match execute_rename(state, &source, &input_text) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            state.set_status(err.clone());
+                            error_opt = Some(err);
+                        }
+                    }
+                });
+
+                if let Some(err) = error_opt {
+                    self.current_dialog = DialogKind::Rename {
+                        source_path: source,
+                        current_name: original_name,
+                        error: Some(err),
+                    };
+                    cx.notify();
+                } else {
+                    self.close(cx);
+                }
+            }
+            DialogKind::ConfirmTrash { .. } | DialogKind::ConfirmDelete { .. } => {
+                self.close(cx);
+            }
+            DialogKind::None => {}
+        }
+    }
 }
 
 impl Render for DialogsView {
@@ -53,12 +162,18 @@ impl Render for DialogsView {
             return div();
         }
 
-        let title = match &self.current_dialog {
-            DialogKind::NewFolder => "Create New Folder",
-            DialogKind::Rename { .. } => "Rename Entry",
-            DialogKind::ConfirmTrash { count: _ } => "Move to Trash?",
-            DialogKind::ConfirmDelete { count: _ } => "Permanently Delete?",
-            DialogKind::None => "",
+        let (title, error_msg, is_input_dialog) = match &self.current_dialog {
+            DialogKind::NewFolder { error, .. } => ("Create New Folder", error.as_deref(), true),
+            DialogKind::Rename { error, .. } => ("Rename Entry", error.as_deref(), true),
+            DialogKind::ConfirmTrash { count } => {
+                let _ = count;
+                ("Move to Trash?", None, false)
+            }
+            DialogKind::ConfirmDelete { count } => {
+                let _ = count;
+                ("Permanently Delete?", None, false)
+            }
+            DialogKind::None => ("", None, false),
         };
 
         div()
@@ -85,6 +200,24 @@ impl Render for DialogsView {
                             .text_color(self.theme.text_primary)
                             .child(title),
                     )
+                    // Input element if rename or new folder
+                    .children(if is_input_dialog {
+                        Some(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(self.input.clone())
+                                .children(error_msg.map(|err| {
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(self.theme.text_error)
+                                        .child(err.to_string())
+                                })),
+                        )
+                    } else {
+                        None
+                    })
                     .child(
                         div()
                             .flex()
@@ -116,7 +249,7 @@ impl Render for DialogsView {
                                     .child("Confirm")
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.close(cx)),
+                                        cx.listener(|this, _, _, cx| this.submit(cx)),
                                     ),
                             ),
                     ),
