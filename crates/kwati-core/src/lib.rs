@@ -1,15 +1,19 @@
 mod bounded;
+mod connection;
 mod copy;
 mod delete;
 mod move_entry;
 mod profiles;
 mod search;
+mod secrets;
 mod settings;
+mod transfer;
 mod trash;
 mod volume;
 mod watcher;
 
 pub use bounded::{list_dir_bounded, list_dir_bounded_with, DEFAULT_MAX_ABANDONED};
+pub use connection::{is_dropped_connection, ConnectionState, ReconnectingBackend, RetryPolicy};
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
@@ -20,7 +24,9 @@ pub use profiles::{
     PendingSecret, Protocol,
 };
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
+pub use secrets::{KeyringSecrets, Secrets, SecretsError};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
+pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
 pub use watcher::DirWatcher;
@@ -309,6 +315,22 @@ impl Location {
             Location::Remote { path, .. } => path,
         }
     }
+
+    /// The last component of the path, if any.
+    pub fn file_name(&self) -> Option<&OsStr> {
+        self.path().file_name()
+    }
+
+    /// The same location kind (and profile) with `name` appended to the path.
+    pub fn join(&self, name: &OsStr) -> Location {
+        match self {
+            Location::Local(path) => Location::Local(path.join(name)),
+            Location::Remote { profile_id, path } => Location::Remote {
+                profile_id: profile_id.clone(),
+                path: path.join(name),
+            },
+        }
+    }
 }
 
 impl From<PathBuf> for Location {
@@ -398,32 +420,168 @@ impl BackendError {
     pub fn is_unsupported(&self) -> bool {
         matches!(self, BackendError::Unsupported)
     }
+
+    /// Whether the backend refused to trash because it has no trash for the location.
+    pub fn is_trash_unavailable(&self) -> bool {
+        matches!(self, BackendError::Io(err) if is_trash_unavailable(err))
+    }
 }
 
-/// Trait representing a storage backend capable of listing directory contents.
-pub trait Backend {
+/// What a backend reports about one entry, without following symlinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryMeta {
+    pub kind: EntryKind,
+    /// Size in bytes for files; 0 for the other kinds.
+    pub len: u64,
+}
+
+/// A storage backend. Only [`Backend::list`] is required; every other operation defaults to
+/// [`BackendError::Unsupported`], and [`Backend::trash`] to a trash-unavailable error, so a
+/// backend implements what its protocol supports.
+pub trait Backend: Send + Sync {
     fn list(&self, location: &Location) -> Result<Listing, BackendError>;
+
+    fn stat(&self, _location: &Location) -> Result<EntryMeta, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    fn open_read(&self, _location: &Location) -> Result<Box<dyn io::Read + Send>, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Creates the file, or truncates it if it exists.
+    fn open_write(&self, _location: &Location) -> Result<Box<dyn io::Write + Send>, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Renames within this backend, replacing `to` when it is an existing file.
+    fn rename(&self, _from: &Location, _to: &Location) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    fn create_dir(&self, _location: &Location) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Deletes a file, a symlink (never followed) or a folder with its contents.
+    fn delete_permanently(
+        &self,
+        _location: &Location,
+        _confirmed: Confirmed,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    fn trash(&self, location: &Location) -> Result<(), BackendError> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            TrashUnavailable {
+                path: location.path().to_path_buf(),
+            },
+        )
+        .into())
+    }
 }
 
 /// The local filesystem backend.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LocalBackend;
+///
+/// Folders on a network or unidentified volume are listed with [`list_dir_bounded`], so a
+/// share that stops answering fails with a timeout instead of hanging the caller.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalBackend {
+    list_timeout: std::time::Duration,
+}
+
+impl Default for LocalBackend {
+    fn default() -> Self {
+        Self::with_list_timeout(std::time::Duration::from_secs(u64::from(
+            settings::DEFAULT_LIST_TIMEOUT_SECS,
+        )))
+    }
+}
 
 impl LocalBackend {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Uses `timeout` for listings on network and unidentified volumes, typically
+    /// [`Settings::list_timeout_secs`].
+    pub fn with_list_timeout(list_timeout: std::time::Duration) -> Self {
+        Self { list_timeout }
+    }
+}
+
+fn local_path(location: &Location) -> Result<&Path, BackendError> {
+    match location {
+        Location::Local(path) => Ok(path),
+        Location::Remote { .. } => Err(BackendError::Unsupported),
     }
 }
 
 impl Backend for LocalBackend {
     fn list(&self, location: &Location) -> Result<Listing, BackendError> {
-        match location {
-            Location::Local(path) => {
-                let listing = list_dir(path)?;
-                Ok(listing)
-            }
-            Location::Remote { .. } => Err(BackendError::Unsupported),
-        }
+        let path = local_path(location)?;
+        let listing = match volume_kind(path) {
+            VolumeKind::Local => list_dir(path)?,
+            VolumeKind::Network | VolumeKind::Unknown => list_dir_bounded(path, self.list_timeout)?,
+        };
+        Ok(listing)
+    }
+
+    fn stat(&self, location: &Location) -> Result<EntryMeta, BackendError> {
+        let meta = fs::symlink_metadata(local_path(location)?)?;
+        let kind = if meta.is_dir() {
+            EntryKind::Dir
+        } else if meta.is_file() {
+            EntryKind::File
+        } else {
+            EntryKind::Symlink
+        };
+        let len = if kind == EntryKind::File {
+            meta.len()
+        } else {
+            0
+        };
+        Ok(EntryMeta { kind, len })
+    }
+
+    fn open_read(&self, location: &Location) -> Result<Box<dyn io::Read + Send>, BackendError> {
+        Ok(Box::new(fs::File::open(local_path(location)?)?))
+    }
+
+    fn open_write(&self, location: &Location) -> Result<Box<dyn io::Write + Send>, BackendError> {
+        Ok(Box::new(fs::File::create(local_path(location)?)?))
+    }
+
+    fn rename(&self, from: &Location, to: &Location) -> Result<(), BackendError> {
+        Ok(fs::rename(local_path(from)?, local_path(to)?)?)
+    }
+
+    fn create_dir(&self, location: &Location) -> Result<(), BackendError> {
+        Ok(create_dir(local_path(location)?)?)
+    }
+
+    fn delete_permanently(
+        &self,
+        location: &Location,
+        confirmed: Confirmed,
+    ) -> Result<(), BackendError> {
+        Ok(delete_permanently(
+            &[local_path(location)?.to_path_buf()],
+            confirmed,
+        )?)
+    }
+
+    fn trash(&self, location: &Location) -> Result<(), BackendError> {
+        Ok(trash(local_path(location)?)?)
     }
 }
 

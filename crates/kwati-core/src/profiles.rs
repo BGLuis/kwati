@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::secrets::{Secrets, SecretsError};
 use crate::settings::write_atomic;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +53,13 @@ impl fmt::Debug for PendingSecret {
             .field("profile_id", &self.profile_id)
             .field("secret", &"<redacted>")
             .finish()
+    }
+}
+
+impl PendingSecret {
+    /// Saves the secret in `secrets` under the profile id. Nothing else ever holds it.
+    pub fn store(&self, secrets: &dyn Secrets) -> Result<(), SecretsError> {
+        secrets.set(&self.profile_id, &self.secret)
     }
 }
 
@@ -104,5 +112,19 @@ impl ConnectionProfiles {
         }
         self.save_to(path)?;
         Ok(pending)
+    }
+
+    /// Deletes the secret of profile `id` from `secrets`, then removes the profile and saves the
+    /// list to `path`. If the secret cannot be deleted the profile is kept, so no secret is left
+    /// behind without a profile pointing at it.
+    pub fn remove_profile(
+        &mut self,
+        path: &Path,
+        id: &str,
+        secrets: &dyn Secrets,
+    ) -> io::Result<()> {
+        secrets.delete(id)?;
+        self.profiles.retain(|p| p.id != id);
+        self.save_to(path)
     }
 }
