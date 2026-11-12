@@ -137,7 +137,6 @@ impl ListView {
             } else {
                 // Double click on file opens with system default application
                 cx.open_with_system(entry.path());
-                let _ = crate::actions::navigation::open_with_system(entry.path());
             }
         } else if event.button == MouseButton::Left {
             // Single click: select entry
@@ -210,7 +209,6 @@ impl ListView {
                 });
             } else {
                 cx.open_with_system(entry.path());
-                let _ = crate::actions::navigation::open_with_system(entry.path());
             }
         }
         cx.notify();
