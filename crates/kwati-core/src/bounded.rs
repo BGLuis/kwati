@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::volume::mount_key;
-use crate::{list_dir, Listing};
+use crate::{list_dir_with_options, ListOptions, Listing};
 
 /// Timed-out listings that may still be running on one mount before new reads there are refused.
 pub const DEFAULT_MAX_ABANDONED: usize = 4;
@@ -53,12 +53,21 @@ fn abandoned_on(mount: &Path) -> usize {
 /// [`io::ErrorKind::ResourceBusy`] at once while [`DEFAULT_MAX_ABANDONED`] abandoned listings
 /// are still running on the same mount.
 pub fn list_dir_bounded(path: &Path, timeout: Duration) -> io::Result<Listing> {
+    list_dir_bounded_with_options(path, timeout, ListOptions::default())
+}
+
+/// [`list_dir_bounded`] with the hidden-file and sort choices of `options`.
+pub fn list_dir_bounded_with_options(
+    path: &Path,
+    timeout: Duration,
+    options: ListOptions,
+) -> io::Result<Listing> {
     list_dir_bounded_with(
         path,
         mount_key(path),
         timeout,
         DEFAULT_MAX_ABANDONED,
-        list_dir,
+        move |path| list_dir_with_options(path, &options),
     )
 }
 
