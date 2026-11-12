@@ -3,33 +3,51 @@ mod connection;
 mod copy;
 mod delete;
 mod move_entry;
+pub mod places;
 mod profiles;
+pub mod remote_poll;
 mod search;
 mod secrets;
 mod settings;
+mod sftp;
 mod transfer;
 mod trash;
-mod volume;
+pub mod volume;
+pub mod volumes;
 mod watcher;
 
-pub use bounded::{list_dir_bounded, list_dir_bounded_with, DEFAULT_MAX_ABANDONED};
+pub use bounded::{
+    list_dir_bounded, list_dir_bounded_with, list_dir_bounded_with_options, DEFAULT_MAX_ABANDONED,
+};
 pub use connection::{is_dropped_connection, ConnectionState, ReconnectingBackend, RetryPolicy};
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
 pub use delete::{delete_permanently, Confirmed};
 pub use move_entry::{move_entry, move_entry_with};
+pub use places::{
+    list_places, resolve_bookmarks, standard_places, standard_places_from, Bookmark, Place,
+    PlaceKind, ResolvedBookmark, SidebarPlaces,
+};
 pub use profiles::{
     default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
     PendingSecret, Protocol,
 };
+pub use remote_poll::{RemotePoller, MIN_POLL_INTERVAL};
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use secrets::{KeyringSecrets, Secrets, SecretsError};
-pub use settings::{default_path as settings_path, Settings, SettingsWarning};
+pub use settings::{
+    default_path as settings_path, Settings, SettingsWarning, DEFAULT_REFRESH_INTERVAL_SECS,
+    DEFAULT_REMOTE_POLL_INTERVAL_SECS, MIN_REMOTE_POLL_INTERVAL_SECS,
+};
+pub use sftp::{known_hosts_path, HostKeyChanged, HostKeyUnknown, KnownHosts, SftpBackend};
 pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
-pub use watcher::DirWatcher;
+pub use volumes::{
+    filter_volumes, is_pseudo_filesystem, list_volumes, mounted_volumes, Volume, VolumeManager,
+};
+pub use watcher::{DirWatcher, WatcherBackend};
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -727,12 +745,7 @@ impl Backend for LocalBackend {
         let listing = match volume_kind(path) {
             VolumeKind::Local => list_dir_with_options(path, options)?,
             VolumeKind::Network | VolumeKind::Unknown => {
-                let mut l = list_dir_bounded(path, self.list_timeout)?;
-                if !options.show_hidden {
-                    l.entries.retain(|e| !e.is_hidden);
-                }
-                sort_entries_by(&mut l.entries, options.sort_column, options.sort_direction);
-                l
+                list_dir_bounded_with_options(path, self.list_timeout, *options)?
             }
         };
         Ok(listing)
