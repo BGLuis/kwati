@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use kwati_core::{list_dir, Location};
-use kwati_gui::actions::operations::{execute_create_folder, execute_rename, validate_entry_name};
+use kwati_gui::actions::operations::{
+    execute_create_folder, execute_rename, execute_trash, validate_entry_name,
+};
 use kwati_gui::state::{AppState, UndoOperation};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -155,6 +157,81 @@ fn test_create_folder_refuses_existing() {
     assert!(res.unwrap_err().contains("already exists"));
 
     // Undo stack unchanged
+    assert!(state.undo_stack.is_empty());
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+// =========================================================================
+// Issue #19: Move to Trash operations
+// =========================================================================
+
+#[test]
+fn test_trash_success_removes_entry_and_records_undo() {
+    let test_dir = create_temp_test_dir("trash_success");
+    let file_path = test_dir.join("to_trash.txt");
+    fs::write(&file_path, "trash content").unwrap();
+
+    let mut state = AppState::new(Location::Local(test_dir.clone()));
+    let initial_listing = list_dir(&test_dir).unwrap();
+    state.set_entries(initial_listing.into_entries());
+    state
+        .selection
+        .select_only(Location::Local(file_path.clone()));
+
+    let res = execute_trash(&mut state, std::slice::from_ref(&file_path));
+    if let Ok(count) = res {
+        assert_eq!(count, 1);
+        assert!(!file_path.exists());
+        assert!(!state.entries.iter().any(|e| e.name == "to_trash.txt"));
+        assert!(!state
+            .selection
+            .contains(&Location::Local(file_path.clone())));
+        assert_eq!(state.undo_stack.len(), 1);
+        assert_eq!(
+            state.undo_stack.peek(),
+            Some(&UndoOperation::Trash {
+                original_paths: vec![file_path],
+            })
+        );
+    } else {
+        assert!(state.status_message.is_some());
+        assert!(state.status_message.unwrap().contains("trash"));
+    }
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+#[test]
+fn test_trash_nonexistent_fails_and_keeps_listed() {
+    let test_dir = create_temp_test_dir("trash_fail");
+    let non_existent = test_dir.join("ghost.txt");
+
+    let mut state = AppState::new(Location::Local(test_dir.clone()));
+    let res = execute_trash(&mut state, &[non_existent]);
+    assert!(res.is_err());
+    assert!(state.status_message.is_some());
+    assert!(state
+        .status_message
+        .unwrap()
+        .contains("Failed to move to trash"));
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+#[test]
+fn test_trash_cancel_leaves_file_in_place() {
+    let test_dir = create_temp_test_dir("trash_cancel");
+    let file_path = test_dir.join("keep_me.txt");
+    fs::write(&file_path, "important").unwrap();
+
+    let mut state = AppState::new(Location::Local(test_dir.clone()));
+    let initial_listing = list_dir(&test_dir).unwrap();
+    state.set_entries(initial_listing.into_entries());
+
+    // When prompt cancelled, execute_trash is not called: file remains untouched
+    assert!(file_path.exists());
+    assert!(state.entries.iter().any(|e| e.name == "keep_me.txt"));
     assert!(state.undo_stack.is_empty());
 
     let _ = fs::remove_dir_all(test_dir);

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use gpui::actions;
-use kwati_core::{create_dir, list_dir, rename_entry, Location};
+use kwati_core::{create_dir, list_dir, rename_entry, trash, Location};
 
 use crate::state::{AppState, UndoOperation};
 
@@ -108,4 +108,53 @@ pub fn execute_create_folder(
     state.set_status(format!("Created folder '{}'", valid_name));
 
     Ok(target)
+}
+
+/// Moves entries to the system trash, updates state listing, and records into undo stack.
+/// Refuses to offer permanent delete on failure.
+pub fn execute_trash(state: &mut AppState, paths: &[PathBuf]) -> Result<usize, String> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+
+    let mut trashed = Vec::new();
+    let mut last_err = None;
+
+    for path in paths {
+        match trash(path) {
+            Ok(()) => trashed.push(path.clone()),
+            Err(err) => {
+                last_err = Some(format!("{}", err));
+                break;
+            }
+        }
+    }
+
+    if !trashed.is_empty() {
+        // Record trashed paths in undo stack
+        state.undo_stack.push(UndoOperation::Trash {
+            original_paths: trashed.clone(),
+        });
+
+        // Deselect trashed locations
+        for p in &trashed {
+            state.selection.deselect(&Location::Local(p.clone()));
+        }
+
+        // Refresh listing
+        if let Location::Local(current_dir) = &state.current_location {
+            if let Ok(listing) = list_dir(current_dir) {
+                state.set_entries(listing.into_entries());
+            }
+        }
+    }
+
+    if let Some(err) = last_err {
+        let msg = format!("Failed to move to trash: {}", err);
+        state.set_status(msg.clone());
+        Err(msg)
+    } else {
+        state.set_status(format!("Moved {} item(s) to trash", trashed.len()));
+        Ok(trashed.len())
+    }
 }

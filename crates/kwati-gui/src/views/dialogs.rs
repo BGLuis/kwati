@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, MouseButton, Window};
 
-use crate::actions::operations::{execute_create_folder, execute_rename};
+use crate::actions::operations::{execute_create_folder, execute_rename, execute_trash};
 use crate::components::TextInput;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -25,7 +25,7 @@ pub enum DialogKind {
         error: Option<String>,
     },
     ConfirmTrash {
-        count: usize,
+        paths: Vec<PathBuf>,
     },
     ConfirmDelete {
         count: usize,
@@ -90,6 +90,12 @@ impl DialogsView {
         cx.notify();
     }
 
+    /// Opens the Move to Trash confirmation prompt.
+    pub fn open_confirm_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.current_dialog = DialogKind::ConfirmTrash { paths };
+        cx.notify();
+    }
+
     /// Submits the current active dialog (NewFolder or Rename).
     pub fn submit(&mut self, cx: &mut Context<Self>) {
         let input_text = self.input.read(cx).text().to_string();
@@ -148,7 +154,14 @@ impl DialogsView {
                     self.close(cx);
                 }
             }
-            DialogKind::ConfirmTrash { .. } | DialogKind::ConfirmDelete { .. } => {
+            DialogKind::ConfirmTrash { paths } => {
+                let targets = paths.clone();
+                self.app_state.update(cx, |state, _cx| {
+                    let _ = execute_trash(state, &targets);
+                });
+                self.close(cx);
+            }
+            DialogKind::ConfirmDelete { .. } => {
                 self.close(cx);
             }
             DialogKind::None => {}
@@ -162,18 +175,27 @@ impl Render for DialogsView {
             return div();
         }
 
-        let (title, error_msg, is_input_dialog) = match &self.current_dialog {
-            DialogKind::NewFolder { error, .. } => ("Create New Folder", error.as_deref(), true),
-            DialogKind::Rename { error, .. } => ("Rename Entry", error.as_deref(), true),
-            DialogKind::ConfirmTrash { count } => {
-                let _ = count;
-                ("Move to Trash?", None, false)
+        let (title, error_msg, is_input_dialog, prompt_text) = match &self.current_dialog {
+            DialogKind::NewFolder { error, .. } => {
+                ("Create New Folder", error.as_deref(), true, None)
+            }
+            DialogKind::Rename { error, .. } => ("Rename Entry", error.as_deref(), true, None),
+            DialogKind::ConfirmTrash { paths } => {
+                let msg = if paths.len() == 1 {
+                    format!(
+                        "Move '{}' to the system trash?",
+                        paths[0].file_name().unwrap_or_default().to_string_lossy()
+                    )
+                } else {
+                    format!("Move {} selected items to the system trash?", paths.len())
+                };
+                ("Move to Trash?", None, false, Some(msg))
             }
             DialogKind::ConfirmDelete { count } => {
                 let _ = count;
-                ("Permanently Delete?", None, false)
+                ("Permanently Delete?", None, false, None)
             }
-            DialogKind::None => ("", None, false),
+            DialogKind::None => ("", None, false, None),
         };
 
         div()
@@ -200,6 +222,12 @@ impl Render for DialogsView {
                             .text_color(self.theme.text_primary)
                             .child(title),
                     )
+                    .children(prompt_text.map(|prompt| {
+                        div()
+                            .text_size(px(12.))
+                            .text_color(self.theme.text_secondary)
+                            .child(prompt)
+                    }))
                     // Input element if rename or new folder
                     .children(if is_input_dialog {
                         Some(
