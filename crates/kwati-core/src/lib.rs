@@ -1,6 +1,7 @@
 mod copy;
 mod profiles;
 mod search;
+mod secrets;
 mod settings;
 mod trash;
 mod watcher;
@@ -13,6 +14,7 @@ pub use profiles::{
     PendingSecret, Protocol,
 };
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
+pub use secrets::{KeyringSecrets, Secrets, SecretsError};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use trash::trash;
 pub use watcher::DirWatcher;
