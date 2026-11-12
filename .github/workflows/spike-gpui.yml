@@ -1,0 +1,96 @@
+name: Spike GPUI Platforms
+
+on:
+  push:
+    branches:
+      - spike/gpui-platforms
+  pull_request:
+    paths:
+      - 'spikes/gpui-list/**'
+      - '.github/workflows/spike-gpui.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-gpui-matrix:
+    name: Build GPUI List (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read # Checkout code
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Print toolchain and runner versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libfontconfig1-dev \
+            libvulkan-dev
+
+      - name: Configure Windows DirectX shader compiler (fxc.exe)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fxcPath = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "fxc.exe" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1 -ExpandProperty FullName
+          if ($fxcPath) {
+            Write-Host "Discovered fxc.exe at: $fxcPath"
+            Add-Content -Path $env:GITHUB_ENV -Value "GPUI_FXC_PATH=$fxcPath"
+          } else {
+            Write-Host "fxc.exe not found in Windows Kits; relying on default SDK or PATH."
+          }
+
+      - name: Configure macOS Xcode developer tools
+        if: runner.os == 'macOS'
+        run: |
+          sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+          echo "Active developer directory: $(xcode-select -p)"
+          xcrun -sdk macosx -f metal || echo "metal compiler not found via xcrun"
+
+      - name: Build debug (cargo build --locked)
+        working-directory: spikes/gpui-list
+        run: cargo build --locked
+
+      - name: Build release (cargo build --release --locked)
+        working-directory: spikes/gpui-list
+        run: cargo build --release --locked
+
+      - name: Upload release binary (Linux / macOS)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gpui-list-${{ matrix.os }}
+          path: spikes/gpui-list/target/release/gpui-list
+          if-no-files-found: error
+
+      - name: Upload release binary (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gpui-list-${{ matrix.os }}
+          path: spikes/gpui-list/target/release/gpui-list.exe
+          if-no-files-found: error
