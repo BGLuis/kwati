@@ -457,3 +457,58 @@ pub fn execute_trash(state: &mut AppState, paths: &[PathBuf]) -> Result<usize, S
         Ok(trashed.len())
     }
 }
+
+/// Permanently deletes files or folders from disk. Irreversible; cannot be undone.
+/// Updates state listing and removes deleted items from selection.
+pub fn execute_permanent_delete(state: &mut AppState, paths: &[PathBuf]) -> Result<usize, String> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+
+    let mut deleted = Vec::new();
+    let mut last_err = None;
+
+    for path in paths {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                last_err = Some(format!("{}", e));
+                break;
+            }
+        };
+
+        let res = if meta.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+
+        match res {
+            Ok(()) => deleted.push(path.clone()),
+            Err(err) => {
+                last_err = Some(format!("{}", err));
+                break;
+            }
+        }
+    }
+
+    if !deleted.is_empty() {
+        for p in &deleted {
+            state.selection.deselect(&Location::Local(p.clone()));
+        }
+        if let Location::Local(current_path) = &state.current_location {
+            if let Ok(listing) = list_dir(current_path) {
+                state.set_entries(listing.into_entries());
+            }
+        }
+    }
+
+    if let Some(err) = last_err {
+        let msg = format!("Failed to delete permanently: {}", err);
+        state.set_status(msg.clone());
+        Err(msg)
+    } else {
+        state.set_status(format!("Permanently deleted {} item(s)", deleted.len()));
+        Ok(deleted.len())
+    }
+}

@@ -11,7 +11,8 @@ use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, MouseButton, Window}
 use kwati_core::ConflictPolicy;
 
 use crate::actions::operations::{
-    execute_copy, execute_create_folder, execute_move, execute_rename, execute_trash,
+    execute_copy, execute_create_folder, execute_move, execute_permanent_delete, execute_rename,
+    execute_trash,
 };
 use crate::components::TextInput;
 use crate::state::AppState;
@@ -33,7 +34,7 @@ pub enum DialogKind {
         paths: Vec<PathBuf>,
     },
     ConfirmDelete {
-        count: usize,
+        paths: Vec<PathBuf>,
     },
     ConflictResolution {
         sources: Vec<PathBuf>,
@@ -104,6 +105,12 @@ impl DialogsView {
     /// Opens the Move to Trash confirmation prompt.
     pub fn open_confirm_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.current_dialog = DialogKind::ConfirmTrash { paths };
+        cx.notify();
+    }
+
+    /// Opens the permanent deletion confirmation modal with irreversible warning.
+    pub fn open_confirm_delete(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.current_dialog = DialogKind::ConfirmDelete { paths };
         cx.notify();
     }
 
@@ -214,7 +221,14 @@ impl DialogsView {
                 });
                 self.close(cx);
             }
-            DialogKind::ConfirmDelete { .. } | DialogKind::ConflictResolution { .. } => {
+            DialogKind::ConfirmDelete { paths } => {
+                let targets = paths.clone();
+                self.app_state.update(cx, |state, _cx| {
+                    let _ = execute_permanent_delete(state, &targets);
+                });
+                self.close(cx);
+            }
+            DialogKind::ConflictResolution { .. } => {
                 self.close(cx);
             }
             DialogKind::None => {}
@@ -230,6 +244,7 @@ impl Render for DialogsView {
 
         let is_conflict_dialog =
             matches!(self.current_dialog, DialogKind::ConflictResolution { .. });
+        let is_delete_dialog = matches!(self.current_dialog, DialogKind::ConfirmDelete { .. });
 
         let (title, error_msg, is_input_dialog, prompt_text) = match &self.current_dialog {
             DialogKind::NewFolder { error, .. } => {
@@ -247,9 +262,19 @@ impl Render for DialogsView {
                 };
                 ("Move to Trash?", None, false, Some(msg))
             }
-            DialogKind::ConfirmDelete { count } => {
-                let _ = count;
-                ("Permanently Delete?", None, false, None)
+            DialogKind::ConfirmDelete { paths } => {
+                let msg = if paths.len() == 1 {
+                    format!(
+                        "Permanently delete '{}'? This action is irreversible and cannot be undone.",
+                        paths[0].file_name().unwrap_or_default().to_string_lossy()
+                    )
+                } else {
+                    format!(
+                        "Permanently delete {} selected items? This action is irreversible and cannot be undone.",
+                        paths.len()
+                    )
+                };
+                ("Permanently Delete?", None, false, Some(msg))
             }
             DialogKind::ConflictResolution { conflict_name, .. } => {
                 let msg = format!(
@@ -405,10 +430,18 @@ impl Render for DialogsView {
                                         .px_3()
                                         .py_1()
                                         .rounded_md()
-                                        .bg(self.theme.accent)
+                                        .bg(if is_delete_dialog {
+                                            rgba(0xf38ba8cc)
+                                        } else {
+                                            self.theme.accent
+                                        })
                                         .text_color(rgb(0x181825))
                                         .cursor_pointer()
-                                        .child("Confirm")
+                                        .child(if is_delete_dialog {
+                                            "Permanently Delete"
+                                        } else {
+                                            "Confirm"
+                                        })
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| this.submit(cx)),

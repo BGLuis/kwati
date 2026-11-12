@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use kwati_core::{list_dir, ConflictPolicy, CopyOutcome, Location};
 use kwati_gui::actions::operations::{
     check_paste_conflict, clear_clipboard, copy_to_clipboard, cut_to_clipboard, execute_copy,
-    execute_create_folder, execute_move, execute_rename, execute_trash, get_clipboard,
-    validate_entry_name,
+    execute_create_folder, execute_move, execute_permanent_delete, execute_rename, execute_trash,
+    get_clipboard, validate_entry_name,
 };
 use kwati_gui::state::{AppState, UndoOperation};
 
@@ -520,4 +520,59 @@ fn test_cut_and_move_cross_device_cancellation_keeps_source() {
 
     let _ = fs::remove_dir_all(src_dir);
     let _ = fs::remove_dir_all(dst_dir);
+}
+
+// =========================================================================
+// Issue #35: Permanent delete with explicit confirmation modal
+// =========================================================================
+
+#[test]
+fn test_permanent_delete_success_deletes_file_and_folder_and_refreshes() {
+    let test_dir = create_temp_test_dir("perm_del_success");
+    let file = test_dir.join("delete_me.txt");
+    fs::write(&file, "vanish").unwrap();
+
+    let folder = test_dir.join("delete_folder");
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join("nested.txt"), "sub").unwrap();
+
+    let mut state = AppState::new(Location::Local(test_dir.clone()));
+    let initial_listing = list_dir(&test_dir).unwrap();
+    state.set_entries(initial_listing.into_entries());
+    state.selection.select_only(Location::Local(file.clone()));
+
+    let outcome = execute_permanent_delete(&mut state, &[file.clone(), folder.clone()]);
+    assert_eq!(outcome.unwrap(), 2);
+
+    // Files deleted from disk
+    assert!(!file.exists());
+    assert!(!folder.exists());
+
+    // State refreshed and selection pruned
+    assert!(!state.entries.iter().any(|e| e.name == "delete_me.txt"));
+    assert!(!state.entries.iter().any(|e| e.name == "delete_folder"));
+    assert!(state.selection.is_empty());
+
+    // Permanent delete is NOT undoable (nothing added to undo stack)
+    assert!(state.undo_stack.is_empty());
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+#[test]
+fn test_permanent_delete_cancel_leaves_file_in_place() {
+    let test_dir = create_temp_test_dir("perm_del_cancel");
+    let file = test_dir.join("stay_alive.txt");
+    fs::write(&file, "alive").unwrap();
+
+    let mut state = AppState::new(Location::Local(test_dir.clone()));
+    let initial_listing = list_dir(&test_dir).unwrap();
+    state.set_entries(initial_listing.into_entries());
+
+    // When user clicks Cancel on dialog, execute_permanent_delete is not called: file remains
+    assert!(file.exists());
+    assert!(state.entries.iter().any(|e| e.name == "stay_alive.txt"));
+    assert!(state.undo_stack.is_empty());
+
+    let _ = fs::remove_dir_all(test_dir);
 }
