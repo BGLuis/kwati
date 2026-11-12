@@ -1,5 +1,6 @@
 mod copy;
 mod delete;
+mod move_entry;
 mod search;
 mod settings;
 mod trash;
@@ -10,6 +11,7 @@ pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
 pub use delete::{delete_permanently, Confirmed};
+pub use move_entry::{move_entry, move_entry_with};
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
