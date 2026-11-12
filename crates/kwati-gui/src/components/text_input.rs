@@ -376,8 +376,11 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // A single line cannot hold a line break, and shaping one panics. Enter reaches here
+        // as "\n" on some platforms, and pasted text can carry several lines.
+        let new_text = new_text.replace(['\n', '\r'], "");
         self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+            (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
