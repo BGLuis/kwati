@@ -2,4 +2,8 @@
 resolver = "2"
 members = [
     "crates/kwati-core",
+    "crates/kwati-gui",
 ]
+
+[patch.crates-io]
+xattr = { path = "patches/xattr-0.2.3" }
