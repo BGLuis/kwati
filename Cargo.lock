@@ -745,12 +745,14 @@ dependencies = [
  "dirs",
  "ignore",
  "keyring-core",
+ "libc",
  "notify",
  "nucleo-matcher",
  "serde",
  "toml",
  "trash",
  "windows-native-keyring-store",
+ "windows-sys",
  "zbus-secret-service-keyring-store",
 ]
 

@@ -1,14 +1,17 @@
 mod copy;
+mod move_entry;
 mod profiles;
 mod search;
 mod secrets;
 mod settings;
 mod trash;
+mod volume;
 mod watcher;
 
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
+pub use move_entry::{move_entry, move_entry_with};
 pub use profiles::{
     default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
     PendingSecret, Protocol,
@@ -17,6 +20,7 @@ pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use secrets::{KeyringSecrets, Secrets, SecretsError};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use trash::trash;
+pub use volume::{volume_kind, VolumeKind};
 pub use watcher::DirWatcher;
 
 use std::ffi::{OsStr, OsString};
