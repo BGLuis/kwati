@@ -1,0 +1,13 @@
+[package]
+name = "spike-sftp-ssh2"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+ssh2 = "=0.9.7"
+
+[features]
+vendored-openssl = ["ssh2/vendored-openssl"]
