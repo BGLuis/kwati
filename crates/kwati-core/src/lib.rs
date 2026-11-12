@@ -11,6 +11,7 @@ mod settings;
 mod transfer;
 mod trash;
 mod volume;
+pub mod volumes;
 mod watcher;
 
 pub use bounded::{list_dir_bounded, list_dir_bounded_with, DEFAULT_MAX_ABANDONED};
@@ -34,6 +35,9 @@ pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
+pub use volumes::{
+    filter_volumes, is_pseudo_filesystem, list_volumes, mounted_volumes, Volume, VolumeManager,
+};
 pub use watcher::DirWatcher;
 
 use std::ffi::{OsStr, OsString};
