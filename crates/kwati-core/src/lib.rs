@@ -5,6 +5,7 @@ mod delete;
 mod move_entry;
 mod profiles;
 mod search;
+mod secrets;
 mod settings;
 mod transfer;
 mod trash;
@@ -23,6 +24,7 @@ pub use profiles::{
     PendingSecret, Protocol,
 };
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
+pub use secrets::{KeyringSecrets, Secrets, SecretsError};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
