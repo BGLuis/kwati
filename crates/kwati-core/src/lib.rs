@@ -1,4 +1,5 @@
 mod bounded;
+mod connection;
 mod copy;
 mod delete;
 mod move_entry;
@@ -10,6 +11,7 @@ mod volume;
 mod watcher;
 
 pub use bounded::{list_dir_bounded, list_dir_bounded_with, DEFAULT_MAX_ABANDONED};
+pub use connection::{is_dropped_connection, ConnectionState, ReconnectingBackend, RetryPolicy};
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
