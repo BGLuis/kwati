@@ -175,6 +175,20 @@ impl AppState {
         self.selection.retain_existing(&self.entries);
     }
 
+    /// Returns the index of the first selected entry in the listed entries, if any.
+    pub fn selected_index(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|e| self.selection.contains(&e.location()))
+    }
+
+    /// Selects the entry at the given index.
+    pub fn select_index(&mut self, index: usize) {
+        if let Some(entry) = self.entries.get(index) {
+            self.selection.select_only(entry.location());
+        }
+    }
+
     /// Sets or clears the status message shown in the footer.
     pub fn set_status(&mut self, message: impl Into<String>) {
         self.status_message = Some(message.into());
