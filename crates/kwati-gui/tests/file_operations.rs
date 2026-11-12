@@ -1,13 +1,15 @@
 use std::fs;
 use std::path::PathBuf;
 
-use kwati_core::{list_dir, Location};
+use kwati_core::{list_dir, ConflictPolicy, CopyOutcome, Location};
 use kwati_gui::actions::operations::{
-    execute_create_folder, execute_rename, execute_trash, validate_entry_name,
+    check_paste_conflict, clear_clipboard, copy_to_clipboard, execute_copy, execute_create_folder,
+    execute_rename, execute_trash, get_clipboard, validate_entry_name,
 };
 use kwati_gui::state::{AppState, UndoOperation};
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -235,4 +237,170 @@ fn test_trash_cancel_leaves_file_in_place() {
     assert!(state.undo_stack.is_empty());
 
     let _ = fs::remove_dir_all(test_dir);
+}
+
+// =========================================================================
+// Issue #21: Copy & Paste with jobs panel, progress, cancel, and conflict resolution
+// =========================================================================
+
+#[test]
+fn test_clipboard_copy_and_paste_flow() {
+    clear_clipboard();
+    assert!(get_clipboard().is_none());
+
+    let src_dir = create_temp_test_dir("clip_src");
+    let file = src_dir.join("clip.txt");
+    fs::write(&file, "copy me").unwrap();
+
+    copy_to_clipboard(vec![file.clone()]);
+    let cb = get_clipboard().expect("clipboard must have data");
+    assert!(!cb.is_cut);
+    assert_eq!(cb.sources, vec![file.clone()]);
+
+    let dst_dir = create_temp_test_dir("clip_dst");
+    let mut state = AppState::new(Location::Local(dst_dir.clone()));
+
+    // Paste into destination
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let outcome = execute_copy(
+        &mut state,
+        &cb.sources,
+        &dst_dir,
+        ConflictPolicy::Replace,
+        cancel_flag,
+    );
+    assert_eq!(outcome.unwrap(), CopyOutcome::Completed);
+
+    let copied_file = dst_dir.join("clip.txt");
+    assert!(copied_file.exists());
+    assert_eq!(fs::read_to_string(&copied_file).unwrap(), "copy me");
+    assert!(file.exists()); // Source remains intact on copy
+
+    // Verify undo stack
+    assert_eq!(state.undo_stack.len(), 1);
+    assert_eq!(
+        state.undo_stack.peek(),
+        Some(&UndoOperation::Copy {
+            destinations: vec![copied_file],
+        })
+    );
+
+    let _ = fs::remove_dir_all(src_dir);
+    let _ = fs::remove_dir_all(dst_dir);
+}
+
+#[test]
+fn test_copy_progress_and_jobs_panel() {
+    let src_dir = create_temp_test_dir("copy_progress_src");
+    let file = src_dir.join("large.dat");
+    // Write 512KB
+    let data = vec![0x42u8; 512 * 1024];
+    fs::write(&file, &data).unwrap();
+
+    let dst_dir = create_temp_test_dir("copy_progress_dst");
+    let mut state = AppState::new(Location::Local(dst_dir.clone()));
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let outcome = execute_copy(
+        &mut state,
+        &[file],
+        &dst_dir,
+        ConflictPolicy::Replace,
+        cancel_flag,
+    );
+    assert_eq!(outcome.unwrap(), CopyOutcome::Completed);
+
+    // Job was created and finished, removing itself from active_jobs
+    assert!(state.active_jobs.is_empty());
+    assert!(dst_dir.join("large.dat").exists());
+
+    let _ = fs::remove_dir_all(src_dir);
+    let _ = fs::remove_dir_all(dst_dir);
+}
+
+#[test]
+fn test_copy_cancellation_cleans_partial_files() {
+    let src_dir = create_temp_test_dir("copy_cancel_src");
+    let file = src_dir.join("cancel_target.dat");
+    fs::write(&file, vec![0x55u8; 256 * 1024]).unwrap();
+
+    let dst_dir = create_temp_test_dir("copy_cancel_dst");
+    let mut state = AppState::new(Location::Local(dst_dir.clone()));
+
+    let cancel_flag = Arc::new(AtomicBool::new(true)); // Pre-cancelled
+    let outcome = execute_copy(
+        &mut state,
+        std::slice::from_ref(&file),
+        &dst_dir,
+        ConflictPolicy::Replace,
+        cancel_flag,
+    );
+    assert_eq!(outcome.unwrap(), CopyOutcome::Cancelled);
+
+    // Destination file was cleaned up / rolled back
+    assert!(!dst_dir.join("cancel_target.dat").exists());
+    assert!(file.exists()); // Source intact
+
+    // Active jobs cleaned up
+    assert!(state.active_jobs.is_empty());
+
+    let _ = fs::remove_dir_all(src_dir);
+    let _ = fs::remove_dir_all(dst_dir);
+}
+
+#[test]
+fn test_copy_conflict_policies_skip_keep_both_replace() {
+    let src_dir = create_temp_test_dir("copy_conflict_src");
+    let file = src_dir.join("doc.txt");
+    fs::write(&file, "new version").unwrap();
+
+    let dst_dir = create_temp_test_dir("copy_conflict_dst");
+    let existing = dst_dir.join("doc.txt");
+    fs::write(&existing, "old version").unwrap();
+
+    // 1. Conflict detection
+    let conflict = check_paste_conflict(std::slice::from_ref(&file), &dst_dir);
+    assert_eq!(conflict, Some("doc.txt".to_string()));
+
+    let mut state = AppState::new(Location::Local(dst_dir.clone()));
+
+    // 2. Policy: Skip
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let outcome = execute_copy(
+        &mut state,
+        std::slice::from_ref(&file),
+        &dst_dir,
+        ConflictPolicy::Skip,
+        cancel_flag.clone(),
+    );
+    assert_eq!(outcome.unwrap(), CopyOutcome::Completed);
+    assert_eq!(fs::read_to_string(&existing).unwrap(), "old version");
+
+    // 3. Policy: KeepBoth -> produces "doc (1).txt"
+    let outcome = execute_copy(
+        &mut state,
+        std::slice::from_ref(&file),
+        &dst_dir,
+        ConflictPolicy::KeepBoth,
+        cancel_flag.clone(),
+    );
+    assert_eq!(outcome.unwrap(), CopyOutcome::Completed);
+    let keep_both_path = dst_dir.join("doc (1).txt");
+    assert!(keep_both_path.exists());
+    assert_eq!(fs::read_to_string(&keep_both_path).unwrap(), "new version");
+    assert_eq!(fs::read_to_string(&existing).unwrap(), "old version");
+
+    // 4. Policy: Replace -> overwrites "doc.txt"
+    let outcome = execute_copy(
+        &mut state,
+        &[file],
+        &dst_dir,
+        ConflictPolicy::Replace,
+        cancel_flag,
+    );
+    assert_eq!(outcome.unwrap(), CopyOutcome::Completed);
+    assert_eq!(fs::read_to_string(&existing).unwrap(), "new version");
+
+    let _ = fs::remove_dir_all(src_dir);
+    let _ = fs::remove_dir_all(dst_dir);
 }
