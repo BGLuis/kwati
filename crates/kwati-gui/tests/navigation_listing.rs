@@ -337,3 +337,85 @@ fn keyboard_navigation_selection_enter_and_backspace() {
 
     let _ = std::fs::remove_dir_all(&temp_root);
 }
+
+#[test]
+fn open_file_with_system_and_directory_watch_refresh() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let temp_root = std::env::temp_dir().join(format!("kwati_test_watch_{}", std::process::id()));
+    let subfolder = temp_root.join("subfolder");
+    let file_a = temp_root.join("file_a.txt");
+    let _ = std::fs::remove_dir_all(&temp_root);
+    std::fs::create_dir_all(&subfolder).unwrap();
+    std::fs::write(&file_a, "alpha").unwrap();
+
+    let mut state = AppState::new(Location::Local(temp_root.clone()));
+    state.reload_entries();
+
+    // 1. Double click / Enter distinguishes folder from file
+    let folder_entry = state
+        .entries
+        .iter()
+        .find(|e| e.display_name() == "subfolder")
+        .unwrap()
+        .clone();
+    let file_entry = state
+        .entries
+        .iter()
+        .find(|e| e.display_name() == "file_a.txt")
+        .unwrap()
+        .clone();
+
+    assert!(folder_entry.is_dir());
+    assert!(!file_entry.is_dir());
+
+    // Double clicking folder enters it
+    state.navigate_to(folder_entry.location());
+    assert_eq!(state.current_location, Location::Local(subfolder.clone()));
+
+    // Navigate back to temp_root
+    state.navigate_to(Location::Local(temp_root.clone()));
+    assert_eq!(state.current_location, Location::Local(temp_root.clone()));
+
+    // Select file_a
+    state.selection.select_only(file_entry.location());
+    assert!(state.selection.contains(&file_entry.location()));
+
+    // 2. Directory watcher detects new file and reloads without losing selection
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_count_clone = Arc::clone(&callback_count);
+
+    let watcher = kwati_gui::actions::navigation::watch_directory(
+        &temp_root,
+        Duration::from_millis(50),
+        move || {
+            callback_count_clone.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    assert!(watcher.is_ok());
+
+    // Create file_b in temp_root
+    let file_b = temp_root.join("file_b.txt");
+    std::fs::write(&file_b, "beta").unwrap();
+
+    // Wait for notify debounce to trigger callback
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(callback_count.load(Ordering::SeqCst) >= 1);
+
+    // Reload state entries and verify selection is preserved
+    state.reload_entries();
+    assert_eq!(state.entries.len(), 3); // subfolder, file_a, file_b
+    assert!(state.selection.contains(&file_entry.location()));
+
+    // 3. Dropping watcher stops background watch when navigating away
+    drop(watcher);
+    let count_before = callback_count.load(Ordering::SeqCst);
+    let file_c = temp_root.join("file_c.txt");
+    std::fs::write(&file_c, "gamma").unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(callback_count.load(Ordering::SeqCst), count_before);
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}

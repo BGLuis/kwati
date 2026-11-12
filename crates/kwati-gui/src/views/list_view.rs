@@ -129,11 +129,15 @@ impl ListView {
         cx: &mut Context<Self>,
     ) {
         if event.button == MouseButton::Left && event.click_count == 2 {
-            // Double click: open folder
             if entry.is_dir() {
+                // Double click on folder enters it and launches no application
                 self.app_state.update(cx, |state, _cx| {
                     state.navigate_to(entry.location());
                 });
+            } else {
+                // Double click on file opens with system default application
+                cx.open_with_system(entry.path());
+                let _ = crate::actions::navigation::open_with_system(entry.path());
             }
         } else if event.button == MouseButton::Left {
             // Single click: select entry
@@ -198,8 +202,17 @@ impl ListView {
     }
 
     pub fn open_selected(&mut self, cx: &mut Context<Self>) {
-        self.app_state
-            .update(cx, |state, _cx| state.open_selected_entry());
+        let entry_opt = self.app_state.read(cx).selected_entry().cloned();
+        if let Some(entry) = entry_opt {
+            if entry.is_dir() {
+                self.app_state.update(cx, |state, _cx| {
+                    state.navigate_to(entry.location());
+                });
+            } else {
+                cx.open_with_system(entry.path());
+                let _ = crate::actions::navigation::open_with_system(entry.path());
+            }
+        }
         cx.notify();
     }
 

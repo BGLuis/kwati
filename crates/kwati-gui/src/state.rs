@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kwati_core::{
-    list_dir_with_options, sort_entries_by, Entry, History, ListOptions, Location, Selection,
-    Settings, SortColumn, SortDirection,
+    list_dir_with_options, sort_entries_by, DirWatcher, Entry, History, ListOptions, Location,
+    Selection, Settings, SortColumn, SortDirection,
 };
 
 /// Classification of background file operations.
@@ -148,6 +148,7 @@ pub struct AppState {
     pub sort_column: SortColumn,
     pub sort_direction: SortDirection,
     pub show_hidden: bool,
+    pub dir_watcher: Option<DirWatcher>,
 }
 
 impl AppState {
@@ -167,6 +168,24 @@ impl AppState {
             sort_column: SortColumn::Name,
             sort_direction: SortDirection::Ascending,
             show_hidden: false,
+            dir_watcher: None,
+        }
+    }
+
+    /// Returns a reference to the first currently selected entry, if any.
+    pub fn selected_entry(&self) -> Option<&Entry> {
+        let ix = self.selected_index()?;
+        self.entries.get(ix)
+    }
+
+    /// Starts watching the current directory for filesystem changes.
+    pub fn watch_current_directory(&mut self, on_change: impl FnMut() + Send + 'static) {
+        if let Location::Local(path) = &self.current_location {
+            if let Ok(watcher) =
+                DirWatcher::new(path, std::time::Duration::from_millis(50), on_change)
+            {
+                self.dir_watcher = Some(watcher);
+            }
         }
     }
 
@@ -189,6 +208,7 @@ impl AppState {
 
     /// Sets the current browsing location and adds it to history.
     pub fn navigate_to(&mut self, location: Location) {
+        self.dir_watcher = None;
         self.history.visit(location.clone());
         self.current_location = location;
         self.selection.clear();
