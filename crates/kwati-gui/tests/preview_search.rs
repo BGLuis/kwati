@@ -188,6 +188,7 @@ fn preview_replacement_and_navigation() {
 
     // Navigating to new location clears preview
     let other_dir = temp_dir.join("sub");
+    fs::create_dir_all(&other_dir).unwrap();
     state.navigate_to(Location::Local(other_dir));
     assert!(state.preview_state.is_none());
 
