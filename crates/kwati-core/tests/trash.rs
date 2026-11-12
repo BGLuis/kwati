@@ -1,4 +1,4 @@
-use kwati_core::trash;
+use kwati_core::{is_trash_unavailable, trash, trash_with, VolumeKind};
 use std::path::PathBuf;
 
 struct TestDir {
@@ -39,8 +39,33 @@ fn trash_missing_path() {
 
     let err = trash(&missing).unwrap_err();
 
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     assert!(
         err.to_string().contains(&missing.display().to_string()),
         "error should name the path, got: {err}"
     );
+}
+
+#[test]
+fn trash_refuses_network() {
+    let dir = TestDir::new("trash_refuses_network");
+    let file = dir.path.join("on-share.txt");
+    std::fs::write(&file, b"x").unwrap();
+
+    let err = trash_with(&file, |_| VolumeKind::Network).unwrap_err();
+
+    assert!(is_trash_unavailable(&err), "got: {err}");
+    assert!(file.exists());
+}
+
+#[test]
+fn trash_refuses_unknown() {
+    let dir = TestDir::new("trash_refuses_unknown");
+    let file = dir.path.join("somewhere.txt");
+    std::fs::write(&file, b"x").unwrap();
+
+    let err = trash_with(&file, |_| VolumeKind::Unknown).unwrap_err();
+
+    assert!(is_trash_unavailable(&err), "got: {err}");
+    assert!(file.exists());
 }

@@ -1,5 +1,6 @@
 mod bounded;
 mod copy;
+mod delete;
 mod move_entry;
 mod profiles;
 mod search;
@@ -12,6 +13,7 @@ pub use bounded::{list_dir_bounded, list_dir_bounded_with, DEFAULT_MAX_ABANDONED
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
+pub use delete::{delete_permanently, Confirmed};
 pub use move_entry::{move_entry, move_entry_with};
 pub use profiles::{
     default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
@@ -19,7 +21,7 @@ pub use profiles::{
 };
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
-pub use trash::trash;
+pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
 pub use watcher::DirWatcher;
 
