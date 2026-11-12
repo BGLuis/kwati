@@ -1,6 +1,10 @@
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures::channel::mpsc;
+use futures::StreamExt;
+use gpui::{AsyncApp, Context, Task, WeakEntity};
 use kwati_core::{
     list_dir_with_options, sort_entries_by, DirWatcher, Entry, History, ListOptions, Location,
     Selection, Settings, SortColumn, SortDirection,
@@ -132,6 +136,20 @@ pub enum NetworkMountStatus {
     MountBusy,
 }
 
+/// How a finished directory load updates the browsing position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arrival {
+    Visit,
+    Back,
+    Forward,
+    Reload,
+}
+
+struct Foreground {
+    cx: AsyncApp,
+    this: WeakEntity<AppState>,
+}
+
 /// Root application state shared across views and background tasks.
 pub struct AppState {
     pub current_location: Location,
@@ -149,6 +167,11 @@ pub struct AppState {
     pub sort_direction: SortDirection,
     pub show_hidden: bool,
     pub dir_watcher: Option<DirWatcher>,
+    foreground: Option<Foreground>,
+    pending_navigation: Option<(Location, Arrival)>,
+    // Replacing either task drops, and so cancels, the one it supersedes.
+    load_task: Option<Task<()>>,
+    watch_task: Option<Task<()>>,
 }
 
 impl AppState {
@@ -169,7 +192,21 @@ impl AppState {
             sort_direction: SortDirection::Ascending,
             show_hidden: false,
             dir_watcher: None,
+            foreground: None,
+            pending_navigation: None,
+            load_task: None,
+            watch_task: None,
         }
+    }
+
+    /// Moves directory reads to the background executor and refreshes the listing when the
+    /// current directory changes on disk. Without this call every read runs inline, which is
+    /// what headless tests rely on.
+    pub fn attach(&mut self, cx: &mut Context<Self>) {
+        self.foreground = Some(Foreground {
+            cx: cx.to_async(),
+            this: cx.weak_entity(),
+        });
     }
 
     /// Returns a reference to the first currently selected entry, if any.
@@ -191,55 +228,137 @@ impl AppState {
 
     /// Reloads the entries of the current local directory using current sort and hidden options.
     pub fn reload_entries(&mut self) {
-        if let Location::Local(path) = &self.current_location {
-            if path.is_dir() {
-                let options = ListOptions {
-                    show_hidden: self.show_hidden,
-                    sort_column: self.sort_column,
-                    sort_direction: self.sort_direction,
-                };
-                if let Ok(listing) = list_dir_with_options(path, &options) {
-                    self.set_entries(listing.into_entries());
-                    self.clear_status();
-                }
+        self.begin_load(self.current_location.clone(), Arrival::Reload);
+    }
+
+    /// Lists `location` and, once the read succeeds, makes it the current location and adds it
+    /// to history. A failed read reports in the status bar and leaves the listing as it was.
+    pub fn navigate_to(&mut self, location: Location) {
+        self.begin_load(location, Arrival::Visit);
+    }
+
+    /// Navigates back in history, returning true if there was a previous location.
+    pub fn go_back(&mut self) -> bool {
+        let Some(index) = self.history.index().checked_sub(1) else {
+            return false;
+        };
+        let Some(prev) = self.history.entries().get(index).cloned() else {
+            return false;
+        };
+        self.begin_load(prev, Arrival::Back);
+        true
+    }
+
+    /// Navigates forward in history, returning true if there was a next location.
+    pub fn go_forward(&mut self) -> bool {
+        let Some(next) = self
+            .history
+            .entries()
+            .get(self.history.index() + 1)
+            .cloned()
+        else {
+            return false;
+        };
+        self.begin_load(next, Arrival::Forward);
+        true
+    }
+
+    fn begin_load(&mut self, target: Location, arrival: Arrival) {
+        // A reload must not cancel a navigation still being read; restart that navigation
+        // instead so it picks up the current listing options.
+        let (target, arrival) = match (arrival, self.pending_navigation.take()) {
+            (Arrival::Reload, Some(pending)) => pending,
+            _ => (target, arrival),
+        };
+        let Location::Local(path) = &target else {
+            self.arrive(target, arrival);
+            return;
+        };
+        let path = path.clone();
+        let options = ListOptions {
+            show_hidden: self.show_hidden,
+            sort_column: self.sort_column,
+            sort_direction: self.sort_direction,
+        };
+        let read = move || list_dir_with_options(&path, &options).map(|l| l.into_entries());
+
+        let Some(foreground) = &self.foreground else {
+            self.finish_load(target, arrival, read());
+            return;
+        };
+        let this = foreground.this.clone();
+        let background = foreground.cx.background_executor().clone();
+        if arrival != Arrival::Reload {
+            self.pending_navigation = Some((target.clone(), arrival));
+        }
+        self.load_task = Some(foreground.cx.spawn(async move |cx| {
+            let result = background.spawn(async move { read() }).await;
+            this.update(cx, |state, cx| {
+                state.finish_load(target, arrival, result);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn finish_load(&mut self, target: Location, arrival: Arrival, result: io::Result<Vec<Entry>>) {
+        self.pending_navigation = None;
+        match result {
+            Ok(entries) => {
+                self.arrive(target, arrival);
+                self.set_entries(entries);
+                self.clear_status();
+            }
+            Err(err) => {
+                self.set_status(format!("Cannot open {}: {err}", target.path().display()));
             }
         }
     }
 
-    /// Sets the current browsing location and adds it to history.
-    pub fn navigate_to(&mut self, location: Location) {
-        self.dir_watcher = None;
-        self.history.visit(location.clone());
-        self.current_location = location;
+    fn arrive(&mut self, target: Location, arrival: Arrival) {
+        match arrival {
+            Arrival::Reload => {
+                if self.dir_watcher.is_none() {
+                    self.watch_for_changes();
+                }
+                return;
+            }
+            Arrival::Visit => self.history.visit(target.clone()),
+            Arrival::Back => {
+                self.history.back();
+            }
+            Arrival::Forward => {
+                self.history.forward();
+            }
+        }
+        self.current_location = target;
         self.selection.clear();
         self.preview_state = None;
-        self.reload_entries();
+        self.watch_for_changes();
     }
 
-    /// Navigates back in history, returning true if history moved.
-    pub fn go_back(&mut self) -> bool {
-        if let Some(prev) = self.history.back().cloned() {
-            self.current_location = prev;
-            self.selection.clear();
-            self.preview_state = None;
-            self.reload_entries();
-            true
-        } else {
-            false
+    fn watch_for_changes(&mut self) {
+        self.dir_watcher = None;
+        self.watch_task = None;
+        let Some(foreground) = &self.foreground else {
+            return;
+        };
+        let this = foreground.this.clone();
+        let cx = foreground.cx.clone();
+        let (changed, mut changes) = mpsc::unbounded();
+        self.watch_current_directory(move || {
+            let _ = changed.unbounded_send(());
+        });
+        if self.dir_watcher.is_none() {
+            return;
         }
-    }
-
-    /// Navigates forward in history, returning true if history moved.
-    pub fn go_forward(&mut self) -> bool {
-        if let Some(next) = self.history.forward().cloned() {
-            self.current_location = next;
-            self.selection.clear();
-            self.preview_state = None;
-            self.reload_entries();
-            true
-        } else {
-            false
-        }
+        self.watch_task = Some(cx.spawn(async move |cx| {
+            while changes.next().await.is_some() {
+                if this.update(cx, |state, _| state.reload_entries()).is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Toggles sorting on the given column.
