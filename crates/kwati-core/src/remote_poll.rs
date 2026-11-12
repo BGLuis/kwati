@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::{Backend, Location, Settings, MIN_REMOTE_POLL_INTERVAL_SECS};
 
-/// State of a remote connection as defined in issue #44.
+/// The shortest interval a remote folder may be polled at.
 pub const MIN_POLL_INTERVAL: Duration = Duration::from_secs(MIN_REMOTE_POLL_INTERVAL_SECS as u64);
 
 /// Background poller for remote directories.
