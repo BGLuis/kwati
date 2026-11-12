@@ -1,0 +1,22 @@
+[package]
+name = "smb-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = ["sync"]
+# Blocking mode of the `smb` crate: std threads, no Tokio.
+sync = ["smb/multi_threaded", "maybe-async/is_sync", "smb/sign", "smb/encrypt", "smb/compress"]
+# Default mode of the `smb` crate: Tokio.
+tokio = ["smb/default", "dep:tokio", "dep:futures-util"]
+
+[dependencies]
+smb = { version = "0.12.1", default-features = false }
+smb-fscc = "=0.12.1"
+smb-msg = "=0.12.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+futures-util = { version = "0.3", optional = true }
+maybe-async = "0.2"
