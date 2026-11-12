@@ -6,6 +6,7 @@ use gpui::{
     div, prelude::*, px, relative, rgba, Context, Entity, MouseButton, MouseDownEvent, Window,
 };
 
+use crate::actions::operations::cancel_active_job;
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -29,11 +30,13 @@ impl JobsView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cancel_active_job(job_id);
         self.app_state.update(cx, |state, _cx| {
             if let Some(job) = state.active_jobs.iter_mut().find(|j| j.id == job_id) {
                 job.is_cancelled = true;
             }
             state.remove_job(job_id);
+            state.set_status(format!("Cancelled job #{}", job_id));
         });
     }
 }
