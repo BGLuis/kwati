@@ -1,5 +1,6 @@
 mod copy;
 mod move_entry;
+mod profiles;
 mod search;
 mod settings;
 mod trash;
@@ -10,6 +11,10 @@ pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
 pub use move_entry::{move_entry, move_entry_with};
+pub use profiles::{
+    default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
+    PendingSecret, Protocol,
+};
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use trash::trash;
