@@ -1,4 +1,7 @@
-use kwati_core::{list_dir, Backend, BackendError, Entry, Listing, LocalBackend, Location};
+use kwati_core::{
+    is_hidden_entry, list_dir, list_dir_with_options, sort_entries, sort_entries_by, Backend,
+    BackendError, Entry, ListOptions, Listing, LocalBackend, Location, SortColumn, SortDirection,
+};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -211,5 +214,293 @@ fn remote_location_unsupported() {
     match result {
         Err(BackendError::Unsupported) => {}
         other => panic!("expected Err(BackendError::Unsupported), got {:?}", other),
+    }
+}
+
+#[test]
+fn sort_by_size() {
+    let test_dir = TestDir::new("sort_by_size");
+    let base = test_dir.path();
+
+    std::fs::create_dir(base.join("dir_b")).unwrap();
+    std::fs::create_dir(base.join("dir_a")).unwrap();
+    std::fs::write(base.join("small.txt"), b"123").unwrap(); // 3 bytes
+    std::fs::write(base.join("medium.txt"), b"123456").unwrap(); // 6 bytes
+    std::fs::write(base.join("large.txt"), b"1234567890").unwrap(); // 10 bytes
+
+    // 1. Ascending sort by size: directories first, then files smallest to largest
+    let asc_options = ListOptions::default().sort(SortColumn::Size, SortDirection::Ascending);
+    let listing_asc = list_dir_with_options(base, &asc_options).unwrap();
+    assert_eq!(listing_asc.len(), 5);
+
+    // Verify directories come first
+    assert!(listing_asc[0].is_dir);
+    assert!(listing_asc[1].is_dir);
+    assert!(!listing_asc[2].is_dir);
+    assert!(!listing_asc[3].is_dir);
+    assert!(!listing_asc[4].is_dir);
+
+    let names_asc: Vec<&str> = listing_asc
+        .iter()
+        .map(|e| e.name.to_str().unwrap())
+        .collect();
+    assert_eq!(
+        names_asc,
+        vec!["dir_a", "dir_b", "small.txt", "medium.txt", "large.txt"]
+    );
+    assert_eq!(listing_asc[2].size, Some(3));
+    assert_eq!(listing_asc[3].size, Some(6));
+    assert_eq!(listing_asc[4].size, Some(10));
+
+    // 2. Descending sort by size: directories STILL first, then files largest to smallest
+    let desc_options = ListOptions::default().sort(SortColumn::Size, SortDirection::Descending);
+    let listing_desc = list_dir_with_options(base, &desc_options).unwrap();
+    assert_eq!(listing_desc.len(), 5);
+
+    // Directories must remain first even when descending
+    assert!(listing_desc[0].is_dir);
+    assert!(listing_desc[1].is_dir);
+    assert!(!listing_desc[2].is_dir);
+    assert!(!listing_desc[3].is_dir);
+    assert!(!listing_desc[4].is_dir);
+
+    let names_desc: Vec<&str> = listing_desc
+        .iter()
+        .map(|e| e.name.to_str().unwrap())
+        .collect();
+    assert_eq!(
+        names_desc,
+        vec!["dir_a", "dir_b", "large.txt", "medium.txt", "small.txt"]
+    );
+    assert_eq!(listing_desc[2].size, Some(10));
+    assert_eq!(listing_desc[3].size, Some(6));
+    assert_eq!(listing_desc[4].size, Some(3));
+
+    // 3. In-memory sorting test with explicit entries
+    let mut entries = vec![
+        Entry::new(OsString::from("f_small"), PathBuf::from("f_small"), false).with_size(10),
+        Entry::new(OsString::from("d_two"), PathBuf::from("d_two"), true),
+        Entry::new(OsString::from("f_large"), PathBuf::from("f_large"), false).with_size(100),
+        Entry::new(OsString::from("d_one"), PathBuf::from("d_one"), true),
+    ];
+
+    sort_entries_by(&mut entries, SortColumn::Size, SortDirection::Ascending);
+    let names: Vec<&str> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+    assert_eq!(names, vec!["d_one", "d_two", "f_small", "f_large"]);
+
+    sort_entries_by(&mut entries, SortColumn::Size, SortDirection::Descending);
+    let names: Vec<&str> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+    assert_eq!(names, vec!["d_one", "d_two", "f_large", "f_small"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn hidden_entries() {
+    let test_dir = TestDir::new("hidden_entries");
+    let base = test_dir.path();
+
+    std::fs::write(base.join(".hidden_file"), b"secret").unwrap();
+    std::fs::create_dir(base.join(".hidden_dir")).unwrap();
+    std::fs::write(base.join("visible_file.txt"), b"visible").unwrap();
+    std::fs::create_dir(base.join("visible_dir")).unwrap();
+
+    // Excluded by default:
+    let listing = list_dir(base).unwrap();
+    let names: Vec<&str> = listing.iter().map(|e| e.name.to_str().unwrap()).collect();
+    assert_eq!(names, vec!["visible_dir", "visible_file.txt"]);
+    assert_eq!(listing.len(), 2);
+    for entry in listing.iter() {
+        assert!(!entry.is_hidden);
+    }
+
+    // Included when requested:
+    let options = ListOptions::default().show_hidden(true);
+    let listing_with_hidden = list_dir_with_options(base, &options).unwrap();
+    assert_eq!(listing_with_hidden.len(), 4);
+
+    let all_names: Vec<&str> = listing_with_hidden
+        .iter()
+        .map(|e| e.name.to_str().unwrap())
+        .collect();
+    assert!(all_names.contains(&".hidden_file"));
+    assert!(all_names.contains(&".hidden_dir"));
+    assert!(all_names.contains(&"visible_file.txt"));
+    assert!(all_names.contains(&"visible_dir"));
+
+    let hidden_file_entry = listing_with_hidden
+        .iter()
+        .find(|e| e.name == ".hidden_file")
+        .unwrap();
+    assert!(hidden_file_entry.is_hidden);
+    assert!(!hidden_file_entry.is_dir);
+
+    let hidden_dir_entry = listing_with_hidden
+        .iter()
+        .find(|e| e.name == ".hidden_dir")
+        .unwrap();
+    assert!(hidden_dir_entry.is_hidden);
+    assert!(hidden_dir_entry.is_dir);
+
+    let visible_file_entry = listing_with_hidden
+        .iter()
+        .find(|e| e.name == "visible_file.txt")
+        .unwrap();
+    assert!(!visible_file_entry.is_hidden);
+
+    let visible_dir_entry = listing_with_hidden
+        .iter()
+        .find(|e| e.name == "visible_dir")
+        .unwrap();
+    assert!(!visible_dir_entry.is_hidden);
+}
+
+#[cfg(windows)]
+#[test]
+fn hidden_attribute() {
+    let test_dir = TestDir::new("hidden_attribute");
+    let base = test_dir.path();
+
+    let secret_file = base.join("secret.txt");
+    let normal_file = base.join("normal.txt");
+    std::fs::write(&secret_file, b"secret").unwrap();
+    std::fs::write(&normal_file, b"normal").unwrap();
+
+    // Mark secret.txt as hidden using attrib.exe
+    let status = std::process::Command::new("attrib")
+        .args(["+h", secret_file.to_str().unwrap()])
+        .status()
+        .expect("attrib command failed");
+    assert!(status.success(), "attrib +h must succeed");
+
+    // Hidden by default:
+    let listing = list_dir(base).unwrap();
+    let names: Vec<&str> = listing.iter().map(|e| e.name.to_str().unwrap()).collect();
+    assert_eq!(names, vec!["normal.txt"]);
+
+    // Included when requested:
+    let options = ListOptions::default().show_hidden(true);
+    let listing_with_hidden = list_dir_with_options(base, &options).unwrap();
+    let names_with_hidden: Vec<&str> = listing_with_hidden
+        .iter()
+        .map(|e| e.name.to_str().unwrap())
+        .collect();
+    assert!(names_with_hidden.contains(&"secret.txt"));
+    assert!(names_with_hidden.contains(&"normal.txt"));
+
+    let secret_entry = listing_with_hidden
+        .iter()
+        .find(|e| e.name == "secret.txt")
+        .unwrap();
+    assert!(secret_entry.is_hidden);
+}
+
+#[test]
+fn sort_by_name_directions() {
+    let test_dir = TestDir::new("sort_by_name_directions");
+    let base = test_dir.path();
+
+    std::fs::create_dir(base.join("dir_z")).unwrap();
+    std::fs::create_dir(base.join("dir_a")).unwrap();
+    std::fs::write(base.join("file_z.txt"), b"").unwrap();
+    std::fs::write(base.join("file_a.txt"), b"").unwrap();
+
+    let asc_options = ListOptions::default().sort(SortColumn::Name, SortDirection::Ascending);
+    let listing_asc = list_dir_with_options(base, &asc_options).unwrap();
+    let names_asc: Vec<&str> = listing_asc
+        .iter()
+        .map(|e| e.name.to_str().unwrap())
+        .collect();
+    assert_eq!(
+        names_asc,
+        vec!["dir_a", "dir_z", "file_a.txt", "file_z.txt"]
+    );
+
+    let desc_options = ListOptions::default().sort(SortColumn::Name, SortDirection::Descending);
+    let listing_desc = list_dir_with_options(base, &desc_options).unwrap();
+    let names_desc: Vec<&str> = listing_desc
+        .iter()
+        .map(|e| e.name.to_str().unwrap())
+        .collect();
+    // Directories must still come first!
+    assert_eq!(
+        names_desc,
+        vec!["dir_z", "dir_a", "file_z.txt", "file_a.txt"]
+    );
+}
+
+#[test]
+fn sort_by_date() {
+    let t_base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    let t_old = t_base + std::time::Duration::from_secs(10);
+    let t_mid = t_base + std::time::Duration::from_secs(20);
+    let t_new = t_base + std::time::Duration::from_secs(30);
+
+    let mut entries = vec![
+        Entry::new(OsString::from("f_new"), PathBuf::from("f_new"), false).with_modified(t_new),
+        Entry::new(OsString::from("d_old"), PathBuf::from("d_old"), true).with_modified(t_old),
+        Entry::new(OsString::from("f_old"), PathBuf::from("f_old"), false).with_modified(t_old),
+        Entry::new(OsString::from("d_new"), PathBuf::from("d_new"), true).with_modified(t_new),
+        Entry::new(OsString::from("f_mid"), PathBuf::from("f_mid"), false).with_modified(t_mid),
+    ];
+
+    // Ascending by date: directories first (old to new), then files (old to new)
+    sort_entries_by(&mut entries, SortColumn::Date, SortDirection::Ascending);
+    let names_asc: Vec<&str> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+    assert_eq!(names_asc, vec!["d_old", "d_new", "f_old", "f_mid", "f_new"]);
+
+    // Descending by date: directories still first (new to old), then files (new to old)
+    sort_entries_by(&mut entries, SortColumn::Date, SortDirection::Descending);
+    let names_desc: Vec<&str> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+    assert_eq!(
+        names_desc,
+        vec!["d_new", "d_old", "f_new", "f_mid", "f_old"]
+    );
+}
+
+#[test]
+fn entry_metadata_retrieval() {
+    let test_dir = TestDir::new("entry_metadata_retrieval");
+    let base = test_dir.path();
+
+    let file_path = base.join("sample.txt");
+    std::fs::write(&file_path, b"hello world").unwrap(); // 11 bytes
+    let dir_path = base.join("subdir");
+    std::fs::create_dir(&dir_path).unwrap();
+
+    let listing = list_dir(base).unwrap();
+    let file_entry = listing.iter().find(|e| e.name == "sample.txt").unwrap();
+    assert_eq!(file_entry.size, Some(11));
+    assert_eq!(file_entry.size(), Some(11));
+    assert!(file_entry.modified.is_some());
+    assert!(file_entry.modified().is_some());
+    assert!(!file_entry.is_hidden);
+    assert!(!file_entry.is_hidden());
+
+    let dir_entry = listing.iter().find(|e| e.name == "subdir").unwrap();
+    assert_eq!(dir_entry.size, None);
+    assert_eq!(dir_entry.size(), None);
+    assert!(dir_entry.modified.is_some());
+    assert!(!dir_entry.is_hidden);
+}
+
+#[test]
+fn default_sort_entries_helper() {
+    let mut entries = vec![
+        Entry::new(OsString::from("file_b"), PathBuf::from("file_b"), false),
+        Entry::new(OsString::from("dir_b"), PathBuf::from("dir_b"), true),
+        Entry::new(OsString::from("file_a"), PathBuf::from("file_a"), false),
+        Entry::new(OsString::from("dir_a"), PathBuf::from("dir_a"), true),
+    ];
+    sort_entries(&mut entries);
+    let names: Vec<&str> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+    assert_eq!(names, vec!["dir_a", "dir_b", "file_a", "file_b"]);
+}
+
+#[test]
+fn is_hidden_entry_direct() {
+    #[cfg(unix)]
+    {
+        assert!(is_hidden_entry(std::ffi::OsStr::new(".hidden"), None));
+        assert!(!is_hidden_entry(std::ffi::OsStr::new("visible"), None));
     }
 }
