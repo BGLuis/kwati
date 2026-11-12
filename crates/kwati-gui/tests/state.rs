@@ -8,17 +8,24 @@ use std::path::PathBuf;
 
 #[test]
 fn app_state_navigation_and_history() {
-    let initial = Location::Local(PathBuf::from("/home/user"));
+    let root = std::env::temp_dir().join(format!("kwati_test_state_nav_{}", std::process::id()));
+    let docs = root.join("docs");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&docs).unwrap();
+
+    let initial = Location::Local(root.clone());
     let mut state = AppState::new(initial.clone());
 
     assert_eq!(state.current_location, initial);
     assert!(state.selection.is_empty());
 
-    let next = Location::Local(PathBuf::from("/home/user/docs"));
+    let next = Location::Local(docs);
     state.navigate_to(next.clone());
 
     assert_eq!(state.current_location, next);
     assert!(state.history.can_go_back());
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
