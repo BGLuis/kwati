@@ -2,6 +2,7 @@ mod bounded;
 mod connection;
 mod copy;
 mod delete;
+mod ftp;
 mod move_entry;
 pub mod places;
 mod profiles;
@@ -24,6 +25,7 @@ pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
 pub use delete::{delete_permanently, Confirmed};
+pub use ftp::{CertificateInvalid, FtpBackend, TlsUnavailable};
 pub use move_entry::{move_entry, move_entry_with};
 pub use places::{
     list_places, resolve_bookmarks, standard_places, standard_places_from, Bookmark, Place,
