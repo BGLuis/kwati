@@ -2,6 +2,7 @@ mod copy;
 mod search;
 mod settings;
 mod trash;
+mod volume;
 mod watcher;
 
 pub use copy::{
@@ -10,6 +11,7 @@ pub use copy::{
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use settings::{default_path as settings_path, Settings, SettingsWarning};
 pub use trash::trash;
+pub use volume::{volume_kind, VolumeKind};
 pub use watcher::DirWatcher;
 
 use std::ffi::{OsStr, OsString};

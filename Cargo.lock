@@ -289,10 +289,12 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "ignore",
+ "libc",
  "notify",
  "nucleo-matcher",
  "toml",
  "trash",
+ "windows-sys",
 ]
 
 [[package]]
