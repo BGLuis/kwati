@@ -4,18 +4,18 @@
 //! and permanent delete warnings.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
-use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, MouseButton, Window};
+use gpui::{
+    div, prelude::*, px, rgb, rgba, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Window,
+};
 use kwati_core::ConflictPolicy;
 
 use crate::actions::open_with::{
     applications_for, launch_application, launch_custom_command, AppInfo,
 };
 use crate::actions::operations::{
-    execute_copy, execute_create_folder, execute_move, execute_permanent_delete, execute_rename,
-    execute_trash,
+    execute_create_folder, execute_permanent_delete, execute_rename, execute_trash, start_transfer,
+    Transfer,
 };
 use crate::components::TextInput;
 use crate::state::AppState;
@@ -58,6 +58,7 @@ pub struct DialogsView {
     pub input: Entity<TextInput>,
     pub current_dialog: DialogKind,
     pub theme: Theme,
+    focus_handle: FocusHandle,
 }
 
 impl DialogsView {
@@ -68,6 +69,41 @@ impl DialogsView {
             input,
             current_dialog: DialogKind::None,
             theme: Theme::dark(),
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    /// Gives the open dialog the keyboard: its text field when it has one, so the name can
+    /// be typed at once, otherwise the dialog itself, so Enter and Escape reach it.
+    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.current_dialog {
+            DialogKind::None => {}
+            DialogKind::NewFolder { .. } | DialogKind::Rename { .. } => {
+                self.input.read(cx).focus_handle.focus(window)
+            }
+            _ => self.focus_handle.focus(window),
+        }
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if key == "enter" || key == "escape" {
+            // Otherwise Enter goes on to the text field as a line break.
+            cx.stop_propagation();
+        }
+        match key {
+            "escape" => self.close(cx),
+            // Enter never confirms a permanent deletion, and a name conflict has no default
+            // policy: both need a deliberate click.
+            "enter"
+                if !matches!(
+                    self.current_dialog,
+                    DialogKind::ConfirmDelete { .. } | DialogKind::ConflictResolution { .. }
+                ) =>
+            {
+                self.submit(cx)
+            }
+            _ => {}
         }
     }
 
@@ -150,17 +186,13 @@ impl DialogsView {
             ..
         } = &self.current_dialog
         {
-            let srcs = sources.clone();
-            let dst = dest_dir.clone();
-            let cut = *is_cut;
-            let cancel_flag = Arc::new(AtomicBool::new(false));
-            self.app_state.update(cx, |state, _cx| {
-                if cut {
-                    let _ = execute_move(state, &srcs, &dst, policy, cancel_flag, false);
-                } else {
-                    let _ = execute_copy(state, &srcs, &dst, policy, cancel_flag);
-                }
-            });
+            let transfer = if *is_cut {
+                Transfer::moving(sources.clone(), dest_dir.clone(), policy)
+            } else {
+                Transfer::copy(sources.clone(), dest_dir.clone(), policy)
+            };
+            self.app_state
+                .update(cx, |state, _cx| start_transfer(state, transfer));
         }
         self.close(cx);
     }
@@ -381,6 +413,9 @@ impl Render for DialogsView {
             .items_center()
             .justify_center()
             .bg(rgba(0x00000080))
+            .occlude()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
             .child(
                 div()
                     .w(px(420.))

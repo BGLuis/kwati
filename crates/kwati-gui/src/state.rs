@@ -1,6 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::channel::mpsc;
 use futures::StreamExt;
@@ -136,6 +137,8 @@ pub enum NetworkMountStatus {
     MountBusy,
 }
 
+const JOB_TICK: Duration = Duration::from_millis(100);
+
 /// How a finished directory load updates the browsing position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrival {
@@ -169,6 +172,9 @@ pub struct AppState {
     pub dir_watcher: Option<DirWatcher>,
     foreground: Option<Foreground>,
     pending_navigation: Option<(Location, Arrival)>,
+    // Set while the status bar shows a failed read, so the next successful read clears that
+    // message and no other.
+    read_failure_shown: bool,
     // Replacing either task drops, and so cancels, the one it supersedes.
     load_task: Option<Task<()>>,
     watch_task: Option<Task<()>>,
@@ -194,6 +200,7 @@ impl AppState {
             dir_watcher: None,
             foreground: None,
             pending_navigation: None,
+            read_failure_shown: false,
             load_task: None,
             watch_task: None,
         }
@@ -307,9 +314,12 @@ impl AppState {
             Ok(entries) => {
                 self.arrive(target, arrival);
                 self.set_entries(entries);
-                self.clear_status();
+                if std::mem::take(&mut self.read_failure_shown) {
+                    self.clear_status();
+                }
             }
             Err(err) => {
+                self.read_failure_shown = true;
                 self.set_status(format!("Cannot open {}: {err}", target.path().display()));
             }
         }
@@ -335,6 +345,50 @@ impl AppState {
         self.selection.clear();
         self.preview_state = None;
         self.watch_for_changes();
+    }
+
+    /// Runs blocking `work` and hands its result to `done`. Attached state runs it on the
+    /// background executor and calls `tick` on the main thread while it runs, so progress can
+    /// be shown; otherwise everything runs inline.
+    pub(crate) fn spawn_job<T: Send + 'static>(
+        &mut self,
+        work: impl FnOnce() -> T + Send + 'static,
+        tick: impl Fn(&mut AppState) + 'static,
+        done: impl FnOnce(&mut AppState, T) + 'static,
+    ) {
+        let Some(foreground) = &self.foreground else {
+            let result = work();
+            done(self, result);
+            return;
+        };
+        let this = foreground.this.clone();
+        let background = foreground.cx.background_executor().clone();
+        foreground
+            .cx
+            .spawn(async move |cx| {
+                let ticker = {
+                    let this = this.clone();
+                    let timer = background.clone();
+                    cx.spawn(async move |cx| loop {
+                        timer.timer(JOB_TICK).await;
+                        let ticked = this.update(cx, |state, cx| {
+                            tick(state);
+                            cx.notify();
+                        });
+                        if ticked.is_err() {
+                            break;
+                        }
+                    })
+                };
+                let result = background.spawn(async move { work() }).await;
+                drop(ticker);
+                this.update(cx, |state, cx| {
+                    done(state, result);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
     }
 
     fn watch_for_changes(&mut self) {
