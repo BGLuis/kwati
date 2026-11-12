@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::*, px, Context, CursorStyle, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
+    div, prelude::*, Context, CursorStyle, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
     SharedString, Window,
 };
 
@@ -14,6 +14,7 @@ use kwati_core::Location;
 use crate::components::TextInput;
 use crate::state::AppState;
 use crate::theme::Theme;
+use crate::tokens::{radius, size, space, Fonts, TextRole};
 
 pub struct HeaderView {
     pub app_state: Entity<AppState>,
@@ -139,6 +140,7 @@ impl HeaderView {
 impl Render for HeaderView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
+        let fonts = Fonts::get(cx);
         let state = self.app_state.read(cx);
         let can_go_back = state.history.can_go_back();
         let can_go_forward = state.history.can_go_forward();
@@ -152,21 +154,21 @@ impl Render for HeaderView {
         div()
             .flex()
             .flex_row()
-            .h(px(40.))
+            .h(size::TOOLBAR)
             .w_full()
-            .px_3()
-            .py_1()
+            .pl(space::S12)
+            .pr(space::S8)
             .items_center()
-            .gap_2()
+            .gap(space::S12)
             .bg(theme.bg)
             .border_b_1()
             .border_color(theme.border)
             // Back button
             .child(
                 div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .px(space::S4)
+                    .py(space::S2)
+                    .rounded(radius::CONTROL)
                     .cursor(if can_go_back {
                         CursorStyle::PointingHand
                     } else {
@@ -175,7 +177,7 @@ impl Render for HeaderView {
                     .text_color(if can_go_back {
                         theme.text
                     } else {
-                        theme.text_muted
+                        theme.border_strong
                     })
                     .when(can_go_back, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_back, |s| {
@@ -186,9 +188,9 @@ impl Render for HeaderView {
             // Forward button
             .child(
                 div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .px(space::S4)
+                    .py(space::S2)
+                    .rounded(radius::CONTROL)
                     .cursor(if can_go_forward {
                         CursorStyle::PointingHand
                     } else {
@@ -197,7 +199,7 @@ impl Render for HeaderView {
                     .text_color(if can_go_forward {
                         theme.text
                     } else {
-                        theme.text_muted
+                        theme.border_strong
                     })
                     .when(can_go_forward, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_forward, |s| {
@@ -208,9 +210,9 @@ impl Render for HeaderView {
             // Up button
             .child(
                 div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .px(space::S4)
+                    .py(space::S2)
+                    .rounded(radius::CONTROL)
                     .cursor(if can_go_up {
                         CursorStyle::PointingHand
                     } else {
@@ -219,7 +221,7 @@ impl Render for HeaderView {
                     .text_color(if can_go_up {
                         theme.text
                     } else {
-                        theme.text_muted
+                        theme.border_strong
                     })
                     .when(can_go_up, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_up, |s| {
@@ -231,6 +233,7 @@ impl Render for HeaderView {
             .child(
                 div()
                     .flex_1()
+                    .text_data(&fonts)
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                         if event.keystroke.key == "enter" {
                             this.commit_address(window, cx);

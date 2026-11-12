@@ -17,6 +17,7 @@ use crate::actions::navigation::{
 use crate::components::ScrollbarState;
 use crate::state::AppState;
 use crate::theme::Theme;
+use crate::tokens::{radius, size, space, Fonts, TextRole};
 
 /// Formats a file size in human-readable units (B, KB, MB, GB, TB).
 pub fn format_size(bytes: Option<u64>, is_dir: bool) -> String {
@@ -308,9 +309,15 @@ impl ListView {
     }
 }
 
+const SIZE_COLUMN: Pixels = px(72.);
+const DATE_COLUMN: Pixels = px(128.);
+const HIDDEN_TOGGLE_COLUMN: Pixels = px(80.);
+const SCROLLBAR_WIDTH: Pixels = px(10.);
+
 impl Render for ListView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
+        let fonts = Fonts::get(cx);
         let state = self.app_state.read(cx);
         let entries = state.entries.clone();
         let selection = state.selection.clone();
@@ -337,6 +344,7 @@ impl Render for ListView {
             theme.text,
             theme.text_muted,
         );
+        let row_fonts = fonts.clone();
 
         let sort_indicator = |col: SortColumn| -> &'static str {
             if sort_column == col {
@@ -406,14 +414,16 @@ impl Render for ListView {
                 div()
                     .flex()
                     .flex_row()
-                    .h(px(28.))
-                    .px_3()
+                    .h(size::ROW)
+                    .pl(space::S8)
+                    .pr(space::S8 + SCROLLBAR_WIDTH)
+                    .gap(space::S8)
                     .items_center()
                     .border_b_1()
                     .border_color(theme.border)
                     .bg(theme.surface_raised)
                     .text_color(theme.text_muted)
-                    .text_size(px(12.))
+                    .text_label()
                     // Name column header
                     .child(
                         div()
@@ -433,8 +443,9 @@ impl Render for ListView {
                     // Size column header
                     .child(
                         div()
-                            .w(px(100.))
+                            .w(SIZE_COLUMN)
                             .flex()
+                            .justify_end()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
                             .hover(|s| s.text_color(theme.text))
@@ -449,7 +460,7 @@ impl Render for ListView {
                     // Modified column header
                     .child(
                         div()
-                            .w(px(150.))
+                            .w(DATE_COLUMN)
                             .flex()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
@@ -465,9 +476,10 @@ impl Render for ListView {
                     // Hidden toggle button
                     .child(
                         div()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_sm()
+                            .w(HIDDEN_TOGGLE_COLUMN)
+                            .flex()
+                            .justify_center()
+                            .rounded(radius::CONTROL)
                             .cursor(CursorStyle::PointingHand)
                             .bg(if show_hidden {
                                 theme.selection
@@ -522,15 +534,18 @@ impl Render for ListView {
                                                 .id(ix)
                                                 .flex()
                                                 .flex_row()
-                                                .h(px(26.))
-                                                .px_3()
+                                                .w_full()
+                                                .h(size::ROW)
+                                                .px(space::S8)
+                                                .gap(space::S8)
+                                                .rounded(radius::CONTROL)
                                                 .items_center()
                                                 .cursor_pointer()
                                                 .when(is_selected, |s| s.bg(row_selected))
                                                 .when(!is_selected, |s| {
                                                     s.hover(|s| s.bg(row_hover))
                                                 })
-                                                .text_size(px(13.))
+                                                .text_body()
                                                 .text_color(if is_hidden && !is_selected {
                                                     row_muted
                                                 } else {
@@ -555,24 +570,33 @@ impl Render for ListView {
                                                 .child(
                                                     div()
                                                         .flex_1()
+                                                        .min_w_0()
+                                                        .overflow_hidden()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
                                                         .flex()
                                                         .items_center()
-                                                        .gap_2()
+                                                        .gap(space::S8)
                                                         .child(if is_dir { "📁" } else { "📄" })
                                                         .child(name),
                                                 )
                                                 .child(
                                                     div()
-                                                        .w(px(100.))
+                                                        .w(SIZE_COLUMN)
+                                                        .flex()
+                                                        .justify_end()
+                                                        .text_data(&row_fonts)
                                                         .text_color(if is_selected { row_text } else { row_muted })
                                                         .child(size_str),
                                                 )
                                                 .child(
                                                     div()
-                                                        .w(px(150.))
+                                                        .w(DATE_COLUMN)
+                                                        .text_data(&row_fonts)
                                                         .text_color(if is_selected { row_text } else { row_muted })
                                                         .child(date_str),
                                                 )
+                                                .child(div().w(HIDDEN_TOGGLE_COLUMN))
                                                 .into_any_element(),
                                         );
                                     }
@@ -587,7 +611,7 @@ impl Render for ListView {
                     .child(
                         // Scrollbar track & thumb
                         div()
-                            .w(px(10.))
+                            .w(SCROLLBAR_WIDTH)
                             .h_full()
                             .border_l_1()
                             .border_color(theme.border)

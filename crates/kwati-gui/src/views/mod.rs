@@ -20,7 +20,7 @@ pub use sidebar_view::SidebarView;
 
 use std::path::PathBuf;
 
-use gpui::{div, prelude::*, px, App, Context, Entity, Window};
+use gpui::{div, prelude::*, App, Context, Entity, Window};
 use kwati_core::{volume_kind, ConflictPolicy, Location, VolumeKind};
 
 use crate::actions::operations::{
@@ -30,6 +30,7 @@ use crate::actions::operations::{
 
 use crate::state::AppState;
 use crate::theme::Theme;
+use crate::tokens::{size, space, Fonts, TextRole};
 
 /// The root shell view of kwati-gui.
 pub struct MainView {
@@ -272,6 +273,7 @@ impl MainView {
 impl Render for MainView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
+        let fonts = Fonts::get(cx);
         let state = self.app_state.read(cx);
         let entry_count = state.entries.len();
         let selected_count = state.selection.len();
@@ -282,6 +284,9 @@ impl Render for MainView {
             .flex_col()
             .size_full()
             .bg(theme.bg)
+            .font_family(fonts.sans.clone())
+            .text_body()
+            .text_color(theme.text)
             .relative()
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_cut))
@@ -324,12 +329,12 @@ impl Render for MainView {
                     .flex_row()
                     .justify_between()
                     .items_center()
-                    .h(px(24.))
-                    .px_3()
+                    .h(size::STATUS_BAR)
+                    .px(space::S8)
                     .bg(theme.bg)
                     .border_t_1()
                     .border_color(theme.border)
-                    .text_size(px(11.))
+                    .text_data(&fonts)
                     .text_color(theme.text_muted)
                     .child(
                         div()

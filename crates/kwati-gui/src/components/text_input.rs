@@ -20,6 +20,7 @@ use gpui::{
 use unicode_segmentation::*;
 
 use crate::theme::Theme;
+use crate::tokens::{radius, size, space};
 
 actions!(
     text_input,
@@ -660,10 +661,10 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
-            .h(px(28.))
-            .px_2()
-            .py(px(4.))
-            .rounded_md()
+            .h(size::CONTROL)
+            .px(space::S8)
+            .items_center()
+            .rounded(radius::CONTROL)
             .bg(theme.surface)
             .border_1()
             .border_color(theme.border_strong)

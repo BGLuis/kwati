@@ -7,6 +7,7 @@ use kwati_gui::actions::register_keybindings;
 use kwati_gui::components::register_text_input_keybindings;
 use kwati_gui::state::AppState;
 use kwati_gui::theme::Theme;
+use kwati_gui::tokens::Fonts;
 use kwati_gui::views::MainView;
 
 actions!(app, [Quit]);
@@ -23,6 +24,7 @@ fn main() {
         register_keybindings(cx);
         register_text_input_keybindings(cx);
         Theme::apply_appearance(cx.window_appearance(), cx);
+        cx.set_global(Fonts::system());
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(720.0)), cx);
 

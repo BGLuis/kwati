@@ -16,6 +16,7 @@ use kwati_core::{Location, SearchHandle, SearchHit, SearchOptions, Searcher};
 use crate::components::TextInput;
 use crate::state::AppState;
 use crate::theme::Theme;
+use crate::tokens::{size, space};
 
 actions!(
     search,
@@ -368,8 +369,8 @@ impl Render for SearchView {
                     .flex_row()
                     .justify_between()
                     .items_center()
-                    .h(px(26.))
-                    .px_3()
+                    .h(size::ROW)
+                    .px(space::S8)
                     .cursor_pointer()
                     .bg(if is_selected {
                         theme.selection
