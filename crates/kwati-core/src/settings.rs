@@ -6,6 +6,7 @@ use toml::{Table, Value};
 
 pub const CURRENT_VERSION: u32 = 1;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 5;
+pub const DEFAULT_LIST_TIMEOUT_SECS: u32 = 10;
 
 /// A value in the settings file that was ignored in favour of its default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +20,8 @@ pub struct SettingsWarning {
 pub struct Settings {
     pub version: u32,
     pub refresh_interval_secs: u32,
+    /// Seconds a directory listing may take before it is abandoned (see `list_dir_bounded`).
+    pub list_timeout_secs: u32,
     /// Keys this version does not know, kept so a newer version's file survives a save.
     unknown: Table,
 }
@@ -28,6 +31,7 @@ impl Default for Settings {
         Self {
             version: CURRENT_VERSION,
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
+            list_timeout_secs: DEFAULT_LIST_TIMEOUT_SECS,
             unknown: Table::new(),
         }
     }
@@ -110,9 +114,16 @@ impl Settings {
             defaults.refresh_interval_secs,
             &mut warnings,
         );
+        let list_timeout_secs = take_u32_or_default(
+            &mut table,
+            "list_timeout_secs",
+            defaults.list_timeout_secs,
+            &mut warnings,
+        );
         let settings = Self {
             version,
             refresh_interval_secs,
+            list_timeout_secs,
             unknown: table,
         };
         Ok((settings, warnings))
@@ -136,6 +147,10 @@ impl Settings {
         table.insert(
             "refresh_interval_secs".into(),
             Value::Integer(self.refresh_interval_secs.into()),
+        );
+        table.insert(
+            "list_timeout_secs".into(),
+            Value::Integer(self.list_timeout_secs.into()),
         );
         let text = toml::to_string(&table)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -197,6 +212,28 @@ mod tests {
         assert_eq!(settings.version, 7);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].key, "refresh_interval_secs");
+    }
+
+    #[test]
+    fn settings_list_timeout() {
+        let dir = TestDir::new("settings_list_timeout");
+        let path = dir.path.join("settings.toml");
+        assert_eq!(Settings::default().list_timeout_secs, 10);
+
+        fs::write(&path, "list_timeout_secs = 3\n").unwrap();
+        let (mut settings, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(settings.list_timeout_secs, 3);
+
+        settings.list_timeout_secs = 20;
+        settings.save_to(&path).unwrap();
+        let (saved, _) = Settings::load_from(&path).unwrap();
+        assert_eq!(saved.list_timeout_secs, 20);
+
+        fs::write(&path, "list_timeout_secs = -1\n").unwrap();
+        let (settings, warnings) = Settings::load_from(&path).unwrap();
+        assert_eq!(settings.list_timeout_secs, DEFAULT_LIST_TIMEOUT_SECS);
+        assert_eq!(warnings[0].key, "list_timeout_secs");
     }
 
     #[test]
