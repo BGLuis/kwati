@@ -21,7 +21,6 @@ pub struct HeaderView {
     // The address field is rewritten only when this changes, so a refresh of the same
     // directory does not erase a path being typed.
     shown_location: Location,
-    pub theme: Theme,
 }
 
 impl HeaderView {
@@ -50,7 +49,6 @@ impl HeaderView {
             app_state,
             address_input,
             shown_location,
-            theme: Theme::dark(),
         }
     }
 
@@ -140,6 +138,7 @@ impl HeaderView {
 
 impl Render for HeaderView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
         let state = self.app_state.read(cx);
         let can_go_back = state.history.can_go_back();
         let can_go_forward = state.history.can_go_forward();
@@ -159,9 +158,9 @@ impl Render for HeaderView {
             .py_1()
             .items_center()
             .gap_2()
-            .bg(self.theme.bg)
+            .bg(theme.bg)
             .border_b_1()
-            .border_color(self.theme.border)
+            .border_color(theme.border)
             // Back button
             .child(
                 div()
@@ -174,13 +173,11 @@ impl Render for HeaderView {
                         CursorStyle::Arrow
                     })
                     .text_color(if can_go_back {
-                        self.theme.text
+                        theme.text
                     } else {
-                        self.theme.text_muted
+                        theme.text_muted
                     })
-                    .when(can_go_back, |s| {
-                        s.hover(|h| h.bg(self.theme.surface_raised))
-                    })
+                    .when(can_go_back, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_back, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_back_click))
                     })
@@ -198,13 +195,11 @@ impl Render for HeaderView {
                         CursorStyle::Arrow
                     })
                     .text_color(if can_go_forward {
-                        self.theme.text
+                        theme.text
                     } else {
-                        self.theme.text_muted
+                        theme.text_muted
                     })
-                    .when(can_go_forward, |s| {
-                        s.hover(|h| h.bg(self.theme.surface_raised))
-                    })
+                    .when(can_go_forward, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_forward, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_forward_click))
                     })
@@ -222,11 +217,11 @@ impl Render for HeaderView {
                         CursorStyle::Arrow
                     })
                     .text_color(if can_go_up {
-                        self.theme.text
+                        theme.text
                     } else {
-                        self.theme.text_muted
+                        theme.text_muted
                     })
-                    .when(can_go_up, |s| s.hover(|h| h.bg(self.theme.surface_raised)))
+                    .when(can_go_up, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_up, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_up_click))
                     })

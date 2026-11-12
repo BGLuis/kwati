@@ -76,7 +76,6 @@ pub fn format_modified(time: Option<std::time::SystemTime>) -> String {
 /// View rendering directory entries in a windowed list with a draggable scrollbar.
 pub struct ListView {
     pub app_state: Entity<AppState>,
-    pub theme: Theme,
     pub focus_handle: FocusHandle,
     pub scroll_handle: UniformListScrollHandle,
     pub scrollbar_state: ScrollbarState,
@@ -93,7 +92,6 @@ impl ListView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self {
             app_state,
-            theme: Theme::dark(),
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             scrollbar_state: ScrollbarState::default(),
@@ -312,6 +310,7 @@ impl ListView {
 
 impl Render for ListView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
         let state = self.app_state.read(cx);
         let entries = state.entries.clone();
         let selection = state.selection.clone();
@@ -333,10 +332,10 @@ impl Render for ListView {
 
         let entries_clone = entries.clone();
         let (row_selected, row_hover, row_text, row_muted) = (
-            self.theme.selection,
-            self.theme.surface_raised,
-            self.theme.text,
-            self.theme.text_muted,
+            theme.selection,
+            theme.surface_raised,
+            theme.text,
+            theme.text_muted,
         );
 
         let sort_indicator = |col: SortColumn| -> &'static str {
@@ -354,7 +353,7 @@ impl Render for ListView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(self.theme.surface)
+            .bg(theme.surface)
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(|this, _: &SelectNext, _window, cx| this.select_next(cx)))
             .on_action(
@@ -411,9 +410,9 @@ impl Render for ListView {
                     .px_3()
                     .items_center()
                     .border_b_1()
-                    .border_color(self.theme.border)
-                    .bg(self.theme.surface_raised)
-                    .text_color(self.theme.text_muted)
+                    .border_color(theme.border)
+                    .bg(theme.surface_raised)
+                    .text_color(theme.text_muted)
                     .text_size(px(12.))
                     // Name column header
                     .child(
@@ -422,7 +421,7 @@ impl Render for ListView {
                             .flex()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.text_color(self.theme.text))
+                            .hover(|s| s.text_color(theme.text))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -438,7 +437,7 @@ impl Render for ListView {
                             .flex()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.text_color(self.theme.text))
+                            .hover(|s| s.text_color(theme.text))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -454,7 +453,7 @@ impl Render for ListView {
                             .flex()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.text_color(self.theme.text))
+                            .hover(|s| s.text_color(theme.text))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -471,16 +470,16 @@ impl Render for ListView {
                             .rounded_sm()
                             .cursor(CursorStyle::PointingHand)
                             .bg(if show_hidden {
-                                self.theme.selection
+                                theme.selection
                             } else {
                                 transparent_black().into()
                             })
                             .text_color(if show_hidden {
-                                self.theme.text
+                                theme.text
                             } else {
-                                self.theme.text_muted
+                                theme.text_muted
                             })
-                            .hover(|s| s.bg(self.theme.surface_raised))
+                            .hover(|s| s.bg(theme.surface_raised))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.on_toggle_hidden_click(cx)),
@@ -591,7 +590,7 @@ impl Render for ListView {
                             .w(px(10.))
                             .h_full()
                             .border_l_1()
-                            .border_color(self.theme.border)
+                            .border_color(theme.border)
                             .relative()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -616,11 +615,11 @@ impl Render for ListView {
                                     ))
                                     .rounded_sm()
                                     .bg(if self.scrollbar_state.is_dragging {
-                                        self.theme.text_muted
+                                        theme.text_muted
                                     } else {
-                                        self.theme.border_strong
+                                        theme.border_strong
                                     })
-                                    .hover(|s| s.bg(self.theme.text_muted))
+                                    .hover(|s| s.bg(theme.text_muted))
                                     .cursor(CursorStyle::Arrow),
                             ),
                     ),

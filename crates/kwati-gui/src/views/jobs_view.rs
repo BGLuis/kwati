@@ -10,15 +10,11 @@ use crate::theme::Theme;
 
 pub struct JobsView {
     pub app_state: Entity<AppState>,
-    pub theme: Theme,
 }
 
 impl JobsView {
     pub fn new(app_state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
-        Self {
-            app_state,
-            theme: Theme::dark(),
-        }
+        Self { app_state }
     }
 
     fn cancel_job(
@@ -42,6 +38,7 @@ impl JobsView {
 
 impl Render for JobsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
         let state = self.app_state.read(cx);
         let jobs = state.active_jobs.clone();
 
@@ -55,9 +52,9 @@ impl Render for JobsView {
             .w_full()
             .p_2()
             .gap_2()
-            .bg(self.theme.surface)
+            .bg(theme.surface)
             .border_t_1()
-            .border_color(self.theme.border)
+            .border_color(theme.border)
             .children(jobs.into_iter().map(|job| {
                 let job_id = job.id;
                 let progress = job.progress_pct as f32 / 100.0;
@@ -67,7 +64,7 @@ impl Render for JobsView {
                     .flex_col()
                     .p_2()
                     .rounded_md()
-                    .bg(self.theme.surface_raised)
+                    .bg(theme.surface_raised)
                     .gap_1()
                     .child(
                         div()
@@ -76,7 +73,7 @@ impl Render for JobsView {
                             .justify_between()
                             .items_center()
                             .text_size(px(12.))
-                            .text_color(self.theme.text)
+                            .text_color(theme.text)
                             .child(job.title)
                             .child(
                                 div()
@@ -89,8 +86,8 @@ impl Render for JobsView {
                                             .px_2()
                                             .py(px(2.))
                                             .rounded_sm()
-                                            .hover(|s| s.bg(self.theme.surface_raised))
-                                            .text_color(self.theme.danger)
+                                            .hover(|s| s.bg(theme.surface_raised))
+                                            .text_color(theme.danger)
                                             .cursor_pointer()
                                             .child("Cancel")
                                             .on_mouse_down(
@@ -108,13 +105,13 @@ impl Render for JobsView {
                             .w_full()
                             .h(px(4.))
                             .rounded_sm()
-                            .bg(self.theme.border)
+                            .bg(theme.border)
                             .child(
                                 div()
                                     .h_full()
                                     .w(relative(progress))
                                     .rounded_sm()
-                                    .bg(self.theme.accent),
+                                    .bg(theme.accent),
                             ),
                     )
             }))

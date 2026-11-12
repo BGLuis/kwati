@@ -45,7 +45,6 @@ pub struct SearchView {
     pub app_state: Entity<AppState>,
     pub search_input: Entity<TextInput>,
     pub is_active: bool,
-    pub theme: Theme,
     pub results: Vec<SearchHit>,
     pub selected_index: Option<usize>,
     pub respect_ignore: bool,
@@ -79,7 +78,6 @@ impl SearchView {
             app_state,
             search_input,
             is_active: false,
-            theme: Theme::dark(),
             results: Vec::new(),
             selected_index: None,
             respect_ignore: true,
@@ -325,6 +323,7 @@ impl SearchView {
 
 impl Render for SearchView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
         if !self.is_active {
             return div();
         }
@@ -373,11 +372,11 @@ impl Render for SearchView {
                     .px_3()
                     .cursor_pointer()
                     .bg(if is_selected {
-                        self.theme.selection
+                        theme.selection
                     } else {
                         transparent_black().into()
                     })
-                    .hover(|s| s.bg(self.theme.surface_raised))
+                    .hover(|s| s.bg(theme.surface_raised))
                     .text_size(px(12.))
                     .child(
                         div()
@@ -387,7 +386,7 @@ impl Render for SearchView {
                             .child("📄")
                             .child(
                                 div()
-                                    .text_color(self.theme.text)
+                                    .text_color(theme.text)
                                     .font_weight(if is_selected {
                                         FontWeight::SEMIBOLD
                                     } else {
@@ -398,14 +397,14 @@ impl Render for SearchView {
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(self.theme.text_muted)
+                                    .text_color(theme.text_muted)
                                     .child(format!("({})", rel_path)),
                             ),
                     )
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(self.theme.text_muted)
+                            .text_color(theme.text_muted)
                             .child(format!("score {}", hit.score)),
                     )
                     .on_mouse_down(
@@ -421,9 +420,9 @@ impl Render for SearchView {
             .w_full()
             .flex()
             .flex_col()
-            .bg(self.theme.bg)
+            .bg(theme.bg)
             .border_b_1()
-            .border_color(self.theme.border)
+            .border_color(theme.border)
             .on_action(cx.listener(|this, _: &ToggleSearch, _, cx| this.toggle(cx)))
             .on_action(cx.listener(|this, _: &CloseSearch, _, cx| this.close(cx)))
             .on_action(cx.listener(|this, _: &NextSearchResult, _, cx| this.select_next(cx)))
@@ -447,7 +446,7 @@ impl Render for SearchView {
                     .child(
                         div()
                             .text_size(px(14.))
-                            .text_color(self.theme.text_muted)
+                            .text_color(theme.text_muted)
                             .child("🔍"),
                     )
                     .child(div().flex_1().child(self.search_input.clone()))
@@ -458,14 +457,14 @@ impl Render for SearchView {
                             .py_1()
                             .rounded_md()
                             .bg(if self.respect_ignore {
-                                self.theme.surface
+                                theme.surface
                             } else {
-                                self.theme.accent
+                                theme.accent
                             })
                             .text_color(if self.respect_ignore {
-                                self.theme.text_muted
+                                theme.text_muted
                             } else {
-                                self.theme.on_accent
+                                theme.on_accent
                             })
                             .text_size(px(11.))
                             .cursor_pointer()
@@ -488,8 +487,8 @@ impl Render for SearchView {
                             .py_1()
                             .rounded_md()
                             .text_size(px(13.))
-                            .text_color(self.theme.text_muted)
-                            .hover(|s| s.text_color(self.theme.text))
+                            .text_color(theme.text_muted)
+                            .hover(|s| s.text_color(theme.text))
                             .cursor_pointer()
                             .child("✕")
                             .on_mouse_down(
@@ -506,9 +505,9 @@ impl Render for SearchView {
                     .px_3()
                     .py_1()
                     .text_size(px(11.))
-                    .text_color(self.theme.text_muted)
+                    .text_color(theme.text_muted)
                     .border_t_1()
-                    .border_color(self.theme.border)
+                    .border_color(theme.border)
                     .child(status_text),
             )
             .child(if !results_elements.is_empty() {
@@ -518,7 +517,7 @@ impl Render for SearchView {
                     .max_h(px(220.))
                     .overflow_hidden()
                     .border_t_1()
-                    .border_color(self.theme.border)
+                    .border_color(theme.border)
                     .children(results_elements)
             } else {
                 div()

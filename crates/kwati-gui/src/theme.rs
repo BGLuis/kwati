@@ -1,6 +1,7 @@
-use gpui::{rgb, rgba, Rgba};
+use gpui::{rgb, rgba, App, Global, Rgba, WindowAppearance};
 
 /// Colour tokens from the Kwatí design standard (`DESIGN.md`, "Colour").
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
     pub bg: Rgba,
     pub surface: Rgba,
@@ -26,7 +27,29 @@ impl Default for Theme {
     }
 }
 
+impl Global for Theme {}
+
 impl Theme {
+    pub fn for_appearance(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::light(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::dark(),
+        }
+    }
+
+    /// The active theme. Views built without a running app (as in tests) get the default.
+    pub fn get(cx: &App) -> Self {
+        cx.try_global::<Self>().copied().unwrap_or_default()
+    }
+
+    /// Switches to the theme for the system's light or dark setting.
+    pub fn apply_appearance(appearance: WindowAppearance, cx: &mut App) {
+        let theme = Self::for_appearance(appearance);
+        if cx.try_global::<Self>() != Some(&theme) {
+            cx.set_global(theme);
+            cx.refresh_windows();
+        }
+    }
     pub fn light() -> Self {
         Self {
             bg: rgb(0xF4EEE4),

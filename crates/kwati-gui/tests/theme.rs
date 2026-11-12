@@ -1,7 +1,7 @@
 //! Contrast rules from DESIGN.md ("Colour"). A palette change that breaks
 //! legibility in either theme must fail here, not in a screenshot review.
 
-use gpui::Rgba;
+use gpui::{Rgba, TestAppContext, WindowAppearance};
 use kwati_gui::theme::Theme;
 
 fn luminance(c: Rgba) -> f32 {
@@ -77,4 +77,32 @@ fn border_strong_reaches_3_on_every_surface() {
             );
         }
     }
+}
+
+#[test]
+fn each_system_appearance_maps_to_its_theme() {
+    assert_eq!(
+        Theme::for_appearance(WindowAppearance::Light),
+        Theme::light()
+    );
+    assert_eq!(
+        Theme::for_appearance(WindowAppearance::VibrantLight),
+        Theme::light()
+    );
+    assert_eq!(Theme::for_appearance(WindowAppearance::Dark), Theme::dark());
+    assert_eq!(
+        Theme::for_appearance(WindowAppearance::VibrantDark),
+        Theme::dark()
+    );
+}
+
+// The test platform reports a light system, while the fallback theme is dark: views must
+// pick up the system theme, not the fallback.
+#[gpui::test]
+fn views_read_the_theme_of_the_system(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        assert_eq!(Theme::get(cx), Theme::default());
+        Theme::apply_appearance(cx.window_appearance(), cx);
+        assert_eq!(Theme::get(cx), Theme::light());
+    });
 }

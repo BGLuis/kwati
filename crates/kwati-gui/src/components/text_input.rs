@@ -514,7 +514,7 @@ impl Element for TextElement {
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
-        let theme = Theme::default();
+        let theme = Theme::get(cx);
 
         let (display_text, text_color) = if content.is_empty() {
             (input.placeholder.clone(), theme.text_muted.into())
@@ -636,7 +636,7 @@ impl Element for TextElement {
 
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::default();
+        let theme = Theme::get(cx);
         div()
             .flex()
             .key_context("TextInput")

@@ -183,7 +183,6 @@ pub fn generate_preview_for(path: &Path) -> (PreviewData, MetadataSummary) {
 
 pub struct PreviewView {
     pub app_state: Entity<AppState>,
-    pub theme: Theme,
     pub current_path: Option<PathBuf>,
     pub metadata: Option<MetadataSummary>,
     _subscription: Subscription,
@@ -197,7 +196,6 @@ impl PreviewView {
 
         Self {
             app_state,
-            theme: Theme::dark(),
             current_path: None,
             metadata: None,
             _subscription: subscription,
@@ -251,6 +249,7 @@ impl PreviewView {
 
 impl Render for PreviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
         let state = self.app_state.read(cx);
         let preview = state.preview_state.clone();
 
@@ -259,9 +258,9 @@ impl Render for PreviewView {
                 .w(px(280.))
                 .h_full()
                 .p_4()
-                .bg(self.theme.surface)
+                .bg(theme.surface)
                 .border_l_1()
-                .border_color(self.theme.border)
+                .border_color(theme.border)
                 .flex()
                 .flex_col()
                 .items_center()
@@ -270,12 +269,12 @@ impl Render for PreviewView {
                 .child(
                     div()
                         .text_size(px(24.))
-                        .text_color(self.theme.text_muted)
+                        .text_color(theme.text_muted)
                         .child("🔍"),
                 )
                 .child(
                     div()
-                        .text_color(self.theme.text_muted)
+                        .text_color(theme.text_muted)
                         .text_size(px(13.))
                         .child("No file selected"),
                 );
@@ -301,9 +300,9 @@ impl Render for PreviewView {
             .w(px(280.))
             .h_full()
             .p_3()
-            .bg(self.theme.surface)
+            .bg(theme.surface)
             .border_l_1()
-            .border_color(self.theme.border)
+            .border_color(theme.border)
             .flex()
             .flex_col()
             .gap_3()
@@ -316,12 +315,12 @@ impl Render for PreviewView {
                     .gap_1()
                     .pb_2()
                     .border_b_1()
-                    .border_color(self.theme.border)
+                    .border_color(theme.border)
                     .child(
                         div()
                             .text_size(px(14.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(self.theme.text)
+                            .text_color(theme.text)
                             .overflow_hidden()
                             .child(file_name),
                     )
@@ -332,7 +331,7 @@ impl Render for PreviewView {
                             .justify_between()
                             .items_center()
                             .text_size(px(11.))
-                            .text_color(self.theme.text_muted)
+                            .text_color(theme.text_muted)
                             .child(div().child(kind_str))
                             .child(div().child(size_str)),
                     ),
@@ -343,8 +342,8 @@ impl Render for PreviewView {
                     .flex_1()
                     .p_2()
                     .rounded_md()
-                    .bg(self.theme.surface)
-                    .text_color(self.theme.text_muted)
+                    .bg(theme.surface)
+                    .text_color(theme.text_muted)
                     .text_size(px(11.))
                     .overflow_hidden()
                     .child(text),
@@ -354,7 +353,7 @@ impl Render for PreviewView {
                     .items_center()
                     .justify_center()
                     .p_2()
-                    .bg(self.theme.surface)
+                    .bg(theme.surface)
                     .rounded_md()
                     .child(img(path).max_w_full().max_h_full()),
                 PreviewKind::Binary { name, size } => div()
@@ -366,30 +365,30 @@ impl Render for PreviewView {
                     .gap_2()
                     .p_4()
                     .rounded_md()
-                    .bg(self.theme.surface)
+                    .bg(theme.surface)
                     .child(
                         div()
                             .text_size(px(28.))
-                            .text_color(self.theme.text_muted)
+                            .text_color(theme.text_muted)
                             .child("📦"),
                     )
                     .child(
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(self.theme.text)
+                            .text_color(theme.text)
                             .child(name),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(self.theme.text_muted)
+                            .text_color(theme.text_muted)
                             .child(format!("Size: {}", format_file_size(size))),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(self.theme.text_muted)
+                            .text_color(theme.text_muted)
                             .child("Binary file — preview not available"),
                     ),
                 PreviewKind::Loading => div()
@@ -397,7 +396,7 @@ impl Render for PreviewView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(self.theme.text_muted)
+                    .text_color(theme.text_muted)
                     .text_size(px(12.))
                     .child("Loading preview..."),
             })
