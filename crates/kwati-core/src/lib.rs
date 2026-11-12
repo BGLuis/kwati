@@ -3,6 +3,7 @@ mod connection;
 mod copy;
 mod delete;
 mod move_entry;
+pub mod places;
 mod profiles;
 mod search;
 mod secrets;
@@ -19,6 +20,10 @@ pub use copy::{
 };
 pub use delete::{delete_permanently, Confirmed};
 pub use move_entry::{move_entry, move_entry_with};
+pub use places::{
+    list_places, resolve_bookmarks, standard_places, standard_places_from, Bookmark, Place,
+    PlaceKind, ResolvedBookmark, SidebarPlaces,
+};
 pub use profiles::{
     default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
     PendingSecret, Protocol,
