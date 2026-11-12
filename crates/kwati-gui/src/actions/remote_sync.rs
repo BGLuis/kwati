@@ -170,3 +170,162 @@ impl RemoteSyncController {
         selection.retain_existing(new_entries);
     }
 }
+
+pub const DEFAULT_REMOTE_SEARCH_DEPTH: usize = 3;
+pub const DEFAULT_PARALLEL_REQUESTS: usize = 4;
+
+/// A search hit found in a remote filesystem hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSearchMatch {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub depth: usize,
+    pub is_dir: bool,
+}
+
+/// Configuration options for remote searches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSearchOptions {
+    pub depth_limit: usize,
+    pub parallel_requests: usize,
+}
+
+impl Default for RemoteSearchOptions {
+    fn default() -> Self {
+        Self {
+            depth_limit: DEFAULT_REMOTE_SEARCH_DEPTH,
+            parallel_requests: DEFAULT_PARALLEL_REQUESTS,
+        }
+    }
+}
+
+/// Controller managing in-flight remote searches, depth limits, and streaming cancellation.
+pub struct RemoteSearchController {
+    pub options: RemoteSearchOptions,
+    pub is_searching: bool,
+    pub results: Vec<RemoteSearchMatch>,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+impl Default for RemoteSearchController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RemoteSearchController {
+    pub fn new() -> Self {
+        Self {
+            options: RemoteSearchOptions::default(),
+            is_searching: false,
+            results: Vec::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn with_options(options: RemoteSearchOptions) -> Self {
+        Self {
+            options,
+            is_searching: false,
+            results: Vec::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Sets the maximum recursive depth limit for remote searching.
+    pub fn set_depth_limit(&mut self, depth: usize) {
+        self.options.depth_limit = depth;
+    }
+
+    /// Sets the number of parallel requests allowed for remote operations.
+    pub fn set_parallel_requests(&mut self, parallel: usize) {
+        self.options.parallel_requests = parallel.max(1);
+    }
+
+    /// Cancels any currently running remote search operation.
+    pub fn cancel(&mut self) {
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        self.is_searching = false;
+    }
+
+    /// Returns whether the search cancellation flag was raised.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_flag.load(Ordering::SeqCst)
+    }
+
+    /// Returns a clone of the cancellation flag for background tasks.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel_flag)
+    }
+
+    /// Starts a new search session, resetting previous matches and clearing cancellation flag.
+    pub fn start_search(&mut self) {
+        self.cancel_flag.store(false, Ordering::SeqCst);
+        self.results.clear();
+        self.is_searching = true;
+    }
+
+    /// Adds a discovered match to the result list if its depth does not exceed `depth_limit`.
+    /// Returns true if the match was accepted, or false if it was excluded by the depth limit.
+    pub fn add_match(&mut self, item: RemoteSearchMatch) -> bool {
+        if item.depth <= self.options.depth_limit {
+            self.results.push(item);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Streams search matches through a callback while respecting depth limits and cancellation.
+    /// Halts immediately when `cancel()` is triggered.
+    pub fn stream_search_items<F>(
+        &mut self,
+        items: &[(std::path::PathBuf, String, usize, bool)],
+        query: &str,
+        mut on_stream_hit: F,
+    ) where
+        F: FnMut(RemoteSearchMatch),
+    {
+        self.start_search();
+        let query_lower = query.to_lowercase();
+
+        for (path, name, depth, is_dir) in items {
+            // Check cancellation before processing next item
+            if self.is_cancelled() {
+                self.is_searching = false;
+                break;
+            }
+
+            // Exclude items deeper than configured depth limit
+            if *depth > self.options.depth_limit {
+                continue;
+            }
+
+            // Match query
+            if name.to_lowercase().contains(&query_lower) {
+                let match_item = RemoteSearchMatch {
+                    name: name.clone(),
+                    path: path.clone(),
+                    depth: *depth,
+                    is_dir: *is_dir,
+                };
+                self.results.push(match_item.clone());
+                on_stream_hit(match_item);
+            }
+        }
+
+        self.is_searching = false;
+    }
+
+    /// Filters a collection of remote matches by depth limit.
+    pub fn filter_by_depth(
+        matches: &[RemoteSearchMatch],
+        depth_limit: usize,
+    ) -> Vec<RemoteSearchMatch> {
+        matches
+            .iter()
+            .filter(|m| m.depth <= depth_limit)
+            .cloned()
+            .collect()
+    }
+}

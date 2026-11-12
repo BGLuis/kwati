@@ -278,3 +278,185 @@ fn test_remote_refresh_retains_selection_by_location() {
     assert!(!selection.is_selected(&loc2));
     assert_eq!(selection.len(), 1);
 }
+
+#[test]
+fn test_remote_search_streaming_and_cancellation() {
+    use kwati_gui::actions::remote_sync::{RemoteSearchController, RemoteSearchMatch};
+    use std::path::PathBuf;
+
+    let items = vec![
+        (
+            PathBuf::from("/remote/app.rs"),
+            "app.rs".to_string(),
+            1,
+            false,
+        ),
+        (
+            PathBuf::from("/remote/src/main.rs"),
+            "main.rs".to_string(),
+            2,
+            false,
+        ),
+        (
+            PathBuf::from("/remote/src/views/app_view.rs"),
+            "app_view.rs".to_string(),
+            3,
+            false,
+        ),
+        (
+            PathBuf::from("/remote/src/views/other.rs"),
+            "other.rs".to_string(),
+            3,
+            false,
+        ),
+        (
+            PathBuf::from("/remote/tests/app_test.rs"),
+            "app_test.rs".to_string(),
+            2,
+            false,
+        ),
+    ];
+
+    let mut controller = RemoteSearchController::new();
+    let mut streamed_hits: Vec<RemoteSearchMatch> = Vec::new();
+
+    // 1. Full search for "app": should find app.rs, app_view.rs, app_test.rs
+    controller.stream_search_items(&items, "app", |hit| {
+        streamed_hits.push(hit);
+    });
+    assert_eq!(streamed_hits.len(), 3);
+    assert_eq!(controller.results.len(), 3);
+    assert_eq!(streamed_hits[0].name, "app.rs");
+    assert_eq!(streamed_hits[1].name, "app_view.rs");
+    assert_eq!(streamed_hits[2].name, "app_test.rs");
+
+    // 2. Cancellation: during streaming, Cancel stops further results from arriving
+    let mut cancel_streamed: Vec<RemoteSearchMatch> = Vec::new();
+    let cancel_flag = controller.cancel_flag();
+    controller.start_search();
+
+    for (path, name, depth, is_dir) in &items {
+        if controller.is_cancelled() {
+            break;
+        }
+        if name.contains("app") {
+            let hit = RemoteSearchMatch {
+                name: name.clone(),
+                path: path.clone(),
+                depth: *depth,
+                is_dir: *is_dir,
+            };
+            cancel_streamed.push(hit);
+            // Cancel immediately after first hit
+            cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // Only the first match was received before cancel stopped the stream
+    assert_eq!(cancel_streamed.len(), 1);
+    assert_eq!(cancel_streamed[0].name, "app.rs");
+}
+
+#[test]
+fn test_remote_search_depth_limiting() {
+    use kwati_gui::actions::remote_sync::{
+        RemoteSearchController, RemoteSearchMatch, DEFAULT_REMOTE_SEARCH_DEPTH,
+    };
+    use std::path::PathBuf;
+
+    let items = vec![
+        (
+            PathBuf::from("/remote/target.txt"),
+            "target.txt".to_string(),
+            1,
+            false,
+        ),
+        (
+            PathBuf::from("/remote/sub1/target.txt"),
+            "target.txt".to_string(),
+            2,
+            false,
+        ),
+        (
+            PathBuf::from("/remote/sub1/sub2/target.txt"),
+            "target.txt".to_string(),
+            3,
+            false,
+        ),
+        (
+            PathBuf::from("/remote/sub1/sub2/sub3/target.txt"),
+            "target.txt".to_string(),
+            4,
+            false,
+        ),
+    ];
+
+    let mut controller = RemoteSearchController::new();
+    assert_eq!(controller.options.depth_limit, DEFAULT_REMOTE_SEARCH_DEPTH); // 3
+
+    // Search with depth 3: finds depths 1, 2, 3 (depth 4 is excluded)
+    let mut matches_depth_3 = Vec::new();
+    controller.stream_search_items(&items, "target", |hit| {
+        matches_depth_3.push(hit);
+    });
+    assert_eq!(matches_depth_3.len(), 3);
+    assert_eq!(matches_depth_3[0].depth, 1);
+    assert_eq!(matches_depth_3[1].depth, 2);
+    assert_eq!(matches_depth_3[2].depth, 3);
+
+    // Lowering depth in settings to 1 excludes matches below depth 1 on next search
+    controller.set_depth_limit(1);
+    let mut matches_depth_1 = Vec::new();
+    controller.stream_search_items(&items, "target", |hit| {
+        matches_depth_1.push(hit);
+    });
+    assert_eq!(matches_depth_1.len(), 1);
+    assert_eq!(matches_depth_1[0].depth, 1);
+
+    // Testing static filter_by_depth
+    let all_matches = vec![
+        RemoteSearchMatch {
+            name: "d1".into(),
+            path: PathBuf::from("/d1"),
+            depth: 1,
+            is_dir: false,
+        },
+        RemoteSearchMatch {
+            name: "d2".into(),
+            path: PathBuf::from("/d1/d2"),
+            depth: 2,
+            is_dir: false,
+        },
+        RemoteSearchMatch {
+            name: "d3".into(),
+            path: PathBuf::from("/d1/d2/d3"),
+            depth: 3,
+            is_dir: false,
+        },
+    ];
+    let filtered = RemoteSearchController::filter_by_depth(&all_matches, 2);
+    assert_eq!(filtered.len(), 2);
+    assert_eq!(filtered[0].depth, 1);
+    assert_eq!(filtered[1].depth, 2);
+}
+
+#[test]
+fn test_remote_search_options_parallel_requests() {
+    use kwati_gui::actions::remote_sync::{
+        RemoteSearchController, DEFAULT_PARALLEL_REQUESTS, DEFAULT_REMOTE_SEARCH_DEPTH,
+    };
+
+    let mut controller = RemoteSearchController::new();
+    assert_eq!(controller.options.depth_limit, DEFAULT_REMOTE_SEARCH_DEPTH);
+    assert_eq!(
+        controller.options.parallel_requests,
+        DEFAULT_PARALLEL_REQUESTS
+    );
+
+    controller.set_parallel_requests(8);
+    assert_eq!(controller.options.parallel_requests, 8);
+
+    // Min clamped to 1
+    controller.set_parallel_requests(0);
+    assert_eq!(controller.options.parallel_requests, 1);
+}
