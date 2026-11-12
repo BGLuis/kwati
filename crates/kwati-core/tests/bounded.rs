@@ -1,4 +1,7 @@
-use kwati_core::{list_dir, list_dir_bounded, list_dir_bounded_with, Listing};
+use kwati_core::{
+    list_dir, list_dir_bounded, list_dir_bounded_with, list_dir_bounded_with_options, ListOptions,
+    Listing,
+};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -123,4 +126,20 @@ fn bounded_list_matches() {
     let bounded = list_dir_bounded(&dir.path, Duration::from_secs(5)).unwrap();
     assert_eq!(bounded, list_dir(&dir.path).unwrap());
     assert_eq!(bounded.len(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_list_shows_hidden_entries_when_asked() {
+    let dir = TestDir::new("bounded_hidden");
+    std::fs::write(dir.path.join(".hidden"), b"").unwrap();
+    std::fs::write(dir.path.join("visible"), b"").unwrap();
+    let timeout = Duration::from_secs(5);
+
+    let default = list_dir_bounded(&dir.path, timeout).unwrap();
+    assert_eq!(default.len(), 1);
+
+    let options = ListOptions::default().show_hidden(true);
+    let with_hidden = list_dir_bounded_with_options(&dir.path, timeout, options).unwrap();
+    assert_eq!(with_hidden.len(), 2);
 }
