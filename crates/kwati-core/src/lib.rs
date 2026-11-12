@@ -14,7 +14,9 @@ mod volume;
 pub mod volumes;
 mod watcher;
 
-pub use bounded::{list_dir_bounded, list_dir_bounded_with, DEFAULT_MAX_ABANDONED};
+pub use bounded::{
+    list_dir_bounded, list_dir_bounded_with, list_dir_bounded_with_options, DEFAULT_MAX_ABANDONED,
+};
 pub use connection::{is_dropped_connection, ConnectionState, ReconnectingBackend, RetryPolicy};
 pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
@@ -55,11 +57,37 @@ pub struct Entry {
     pub name: OsString,
     pub path: PathBuf,
     pub is_dir: bool,
+    pub size: Option<u64>,
+    pub modified: Option<std::time::SystemTime>,
+    pub is_hidden: bool,
 }
 
 impl Entry {
     pub fn new(name: OsString, path: PathBuf, is_dir: bool) -> Self {
-        Self { name, path, is_dir }
+        let is_hidden = is_hidden_entry(&name, None);
+        Self {
+            name,
+            path,
+            is_dir,
+            size: None,
+            modified: None,
+            is_hidden,
+        }
+    }
+
+    pub fn with_size(mut self, size: u64) -> Self {
+        self.size = Some(size);
+        self
+    }
+
+    pub fn with_modified(mut self, modified: std::time::SystemTime) -> Self {
+        self.modified = Some(modified);
+        self
+    }
+
+    pub fn with_hidden(mut self, is_hidden: bool) -> Self {
+        self.is_hidden = is_hidden;
+        self
     }
 
     pub fn name(&self) -> &OsStr {
@@ -72,6 +100,18 @@ impl Entry {
 
     pub fn is_dir(&self) -> bool {
         self.is_dir
+    }
+
+    pub fn size(&self) -> Option<u64> {
+        self.size
+    }
+
+    pub fn modified(&self) -> Option<std::time::SystemTime> {
+        self.modified
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.is_hidden
     }
 
     /// Returns the [`Location`] corresponding to this entry.
@@ -90,15 +130,113 @@ impl Entry {
     }
 }
 
-/// Sorts a slice of entries: directories first, then case-insensitive by name.
+/// Determines whether an entry is hidden based on platform conventions.
+pub fn is_hidden_entry(name: &OsStr, _metadata: Option<&fs::Metadata>) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x00000002;
+        if let Some(meta) = _metadata {
+            if (meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN) != 0 {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        name.as_bytes().starts_with(b".")
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        name.to_string_lossy().starts_with('.')
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortColumn {
+    #[default]
+    Name,
+    Size,
+    Date,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SortOrder {
+    pub column: SortColumn,
+    pub direction: SortDirection,
+}
+
+impl SortOrder {
+    pub fn new(column: SortColumn, direction: SortDirection) -> Self {
+        Self { column, direction }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListOptions {
+    pub show_hidden: bool,
+    pub sort_column: SortColumn,
+    pub sort_direction: SortDirection,
+}
+
+impl Default for ListOptions {
+    fn default() -> Self {
+        Self {
+            show_hidden: false,
+            sort_column: SortColumn::Name,
+            sort_direction: SortDirection::Ascending,
+        }
+    }
+}
+
+impl ListOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn show_hidden(mut self, show: bool) -> Self {
+        self.show_hidden = show;
+        self
+    }
+
+    pub fn sort(mut self, column: SortColumn, direction: SortDirection) -> Self {
+        self.sort_column = column;
+        self.sort_direction = direction;
+        self
+    }
+}
+
 pub fn sort_entries(entries: &mut [Entry]) {
+    sort_entries_by(entries, SortColumn::Name, SortDirection::Ascending);
+}
+
+pub fn sort_entries_by(entries: &mut [Entry], column: SortColumn, direction: SortDirection) {
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
             .then_with(|| {
-                let a_lower = a.name.to_string_lossy().to_lowercase();
-                let b_lower = b.name.to_string_lossy().to_lowercase();
-                a_lower.cmp(&b_lower)
+                let ord = match column {
+                    SortColumn::Name => {
+                        let a_lower = a.name.to_string_lossy().to_lowercase();
+                        let b_lower = b.name.to_string_lossy().to_lowercase();
+                        a_lower.cmp(&b_lower)
+                    }
+                    SortColumn::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
+                    SortColumn::Date => a.modified.cmp(&b.modified),
+                };
+                match direction {
+                    SortDirection::Ascending => ord,
+                    SortDirection::Descending => ord.reverse(),
+                }
             })
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.path.cmp(&b.path))
@@ -127,6 +265,10 @@ impl Listing {
 
     pub fn sort(&mut self) {
         sort_entries(&mut self.entries);
+    }
+
+    pub fn sort_by(&mut self, column: SortColumn, direction: SortDirection) {
+        sort_entries_by(&mut self.entries, column, direction);
     }
 }
 
@@ -167,6 +309,10 @@ impl From<Vec<Entry>> for Listing {
 /// Follows symlinks to determine if an entry is a directory. Dangling symlinks are listed
 /// as non-directories without failing the listing. Unreadable entries are skipped.
 pub fn list_dir(path: &Path) -> io::Result<Listing> {
+    list_dir_with_options(path, &ListOptions::default())
+}
+
+pub fn list_dir_with_options(path: &Path, options: &ListOptions) -> io::Result<Listing> {
     let read_dir = fs::read_dir(path)?;
     let mut entries = Vec::new();
 
@@ -177,14 +323,34 @@ pub fn list_dir(path: &Path) -> io::Result<Listing> {
         };
         let name = entry.file_name();
         let entry_path = path.join(&name);
-        let is_dir = fs::metadata(&entry_path)
-            .map(|meta| meta.is_dir())
-            .unwrap_or(false);
+        let metadata = fs::metadata(&entry_path).ok();
 
-        entries.push(Entry::new(name, entry_path, is_dir));
+        let is_hidden = is_hidden_entry(&name, metadata.as_ref());
+        if !options.show_hidden && is_hidden {
+            continue;
+        }
+
+        let is_dir = metadata.as_ref().map(|meta| meta.is_dir()).unwrap_or(false);
+        let size = if is_dir {
+            None
+        } else {
+            metadata.as_ref().map(|meta| meta.len())
+        };
+        let modified = metadata.as_ref().and_then(|meta| meta.modified().ok());
+
+        entries.push(Entry {
+            name,
+            path: entry_path,
+            is_dir,
+            size,
+            modified,
+            is_hidden,
+        });
     }
 
-    Ok(Listing::new(entries))
+    let mut listing = Listing { entries };
+    listing.sort_by(options.sort_column, options.sort_direction);
+    Ok(listing)
 }
 
 fn contains_path_separator(path: &Path) -> bool {
@@ -457,6 +623,17 @@ pub struct EntryMeta {
 pub trait Backend: Send + Sync {
     fn list(&self, location: &Location) -> Result<Listing, BackendError>;
 
+    fn list_with_options(
+        &self,
+        location: &Location,
+        options: &ListOptions,
+    ) -> Result<Listing, BackendError> {
+        match location {
+            Location::Local(path) => Ok(list_dir_with_options(path, options)?),
+            Location::Remote { .. } => Err(BackendError::Unsupported),
+        }
+    }
+
     fn stat(&self, _location: &Location) -> Result<EntryMeta, BackendError> {
         Err(BackendError::Unsupported)
     }
@@ -503,16 +680,20 @@ pub trait Backend: Send + Sync {
 ///
 /// Folders on a network or unidentified volume are listed with [`list_dir_bounded`], so a
 /// share that stops answering fails with a timeout instead of hanging the caller.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalBackend {
     list_timeout: std::time::Duration,
+    options: ListOptions,
 }
 
 impl Default for LocalBackend {
     fn default() -> Self {
-        Self::with_list_timeout(std::time::Duration::from_secs(u64::from(
-            settings::DEFAULT_LIST_TIMEOUT_SECS,
-        )))
+        Self {
+            list_timeout: std::time::Duration::from_secs(u64::from(
+                settings::DEFAULT_LIST_TIMEOUT_SECS,
+            )),
+            options: ListOptions::default(),
+        }
     }
 }
 
@@ -521,10 +702,18 @@ impl LocalBackend {
         Self::default()
     }
 
-    /// Uses `timeout` for listings on network and unidentified volumes, typically
-    /// [`Settings::list_timeout_secs`].
     pub fn with_list_timeout(list_timeout: std::time::Duration) -> Self {
-        Self { list_timeout }
+        Self {
+            list_timeout,
+            options: ListOptions::default(),
+        }
+    }
+
+    pub fn with_options(options: ListOptions) -> Self {
+        Self {
+            options,
+            ..Self::default()
+        }
     }
 }
 
@@ -537,10 +726,20 @@ fn local_path(location: &Location) -> Result<&Path, BackendError> {
 
 impl Backend for LocalBackend {
     fn list(&self, location: &Location) -> Result<Listing, BackendError> {
+        self.list_with_options(location, &self.options)
+    }
+
+    fn list_with_options(
+        &self,
+        location: &Location,
+        options: &ListOptions,
+    ) -> Result<Listing, BackendError> {
         let path = local_path(location)?;
         let listing = match volume_kind(path) {
-            VolumeKind::Local => list_dir(path)?,
-            VolumeKind::Network | VolumeKind::Unknown => list_dir_bounded(path, self.list_timeout)?,
+            VolumeKind::Local => list_dir_with_options(path, options)?,
+            VolumeKind::Network | VolumeKind::Unknown => {
+                list_dir_bounded_with_options(path, self.list_timeout, *options)?
+            }
         };
         Ok(listing)
     }
