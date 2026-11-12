@@ -6,7 +6,8 @@
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Window,
+    div, prelude::*, px, transparent_black, Context, Entity, FocusHandle, KeyDownEvent,
+    MouseButton, Window,
 };
 use kwati_core::ConflictPolicy;
 
@@ -57,7 +58,6 @@ pub struct DialogsView {
     pub app_state: Entity<AppState>,
     pub input: Entity<TextInput>,
     pub current_dialog: DialogKind,
-    pub theme: Theme,
     focus_handle: FocusHandle,
 }
 
@@ -68,7 +68,6 @@ impl DialogsView {
             app_state,
             input,
             current_dialog: DialogKind::None,
-            theme: Theme::dark(),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -349,6 +348,7 @@ impl DialogsView {
 
 impl Render for DialogsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
         if self.current_dialog == DialogKind::None {
             return div();
         }
@@ -412,7 +412,7 @@ impl Render for DialogsView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(0x00000080))
+            .bg(theme.scrim)
             .occlude()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
@@ -421,22 +421,17 @@ impl Render for DialogsView {
                     .w(px(420.))
                     .p_4()
                     .rounded_lg()
-                    .bg(self.theme.bg_panel)
+                    .bg(theme.surface)
                     .border_1()
-                    .border_color(self.theme.border)
+                    .border_color(theme.border)
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .text_color(self.theme.text_primary)
-                            .child(title),
-                    )
+                    .child(div().text_size(px(14.)).text_color(theme.text).child(title))
                     .children(prompt_text.map(|prompt| {
                         div()
                             .text_size(px(12.))
-                            .text_color(self.theme.text_secondary)
+                            .text_color(theme.text_muted)
                             .child(prompt)
                     }))
                     // Input element if rename or new folder
@@ -450,7 +445,7 @@ impl Render for DialogsView {
                                 .children(error_msg.map(|err| {
                                     div()
                                         .text_size(px(11.))
-                                        .text_color(self.theme.text_error)
+                                        .text_color(theme.danger)
                                         .child(err.to_string())
                                 })),
                         )
@@ -482,11 +477,11 @@ impl Render for DialogsView {
                                         .rounded_md()
                                         .cursor_pointer()
                                         .bg(if is_sel {
-                                            rgba(0x89b4fa26)
+                                            theme.selection
                                         } else {
-                                            rgba(0x00000000)
+                                            transparent_black().into()
                                         })
-                                        .hover(|s| s.bg(rgba(0xffffff0d)))
+                                        .hover(|s| s.bg(theme.surface_raised))
                                         .text_size(px(12.))
                                         .child(
                                             div()
@@ -497,9 +492,9 @@ impl Render for DialogsView {
                                                 .child(
                                                     div()
                                                         .text_color(if is_sel {
-                                                            self.theme.accent
+                                                            theme.accent
                                                         } else {
-                                                            self.theme.text_primary
+                                                            theme.text
                                                         })
                                                         .child(app_name),
                                                 ),
@@ -511,8 +506,8 @@ impl Render for DialogsView {
                                                     .px_2()
                                                     .py_0p5()
                                                     .rounded_sm()
-                                                    .bg(self.theme.bg_content)
-                                                    .text_color(self.theme.text_muted)
+                                                    .bg(theme.surface)
+                                                    .text_color(theme.text_muted)
                                                     .child("Default"),
                                             )
                                         } else {
@@ -544,14 +539,14 @@ impl Render for DialogsView {
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(self.theme.text_muted)
+                                            .text_color(theme.text_muted)
                                             .child("Or specify custom command / executable:"),
                                     )
                                     .child(self.input.clone())
                                     .children(error.as_ref().map(|err| {
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(self.theme.text_error)
+                                            .text_color(theme.danger)
                                             .child(err.clone())
                                     })),
                             )
@@ -571,8 +566,8 @@ impl Render for DialogsView {
                                         .px_3()
                                         .py_1()
                                         .rounded_md()
-                                        .bg(self.theme.bg_header)
-                                        .text_color(self.theme.text_secondary)
+                                        .bg(theme.surface_raised)
+                                        .text_color(theme.text_muted)
                                         .cursor_pointer()
                                         .child("Cancel")
                                         .on_mouse_down(
@@ -585,8 +580,8 @@ impl Render for DialogsView {
                                         .px_3()
                                         .py_1()
                                         .rounded_md()
-                                        .bg(self.theme.bg_header)
-                                        .text_color(self.theme.text_primary)
+                                        .bg(theme.surface_raised)
+                                        .text_color(theme.text)
                                         .cursor_pointer()
                                         .child("Skip")
                                         .on_mouse_down(
@@ -601,8 +596,8 @@ impl Render for DialogsView {
                                         .px_3()
                                         .py_1()
                                         .rounded_md()
-                                        .bg(self.theme.bg_header)
-                                        .text_color(self.theme.text_primary)
+                                        .bg(theme.surface_raised)
+                                        .text_color(theme.text)
                                         .cursor_pointer()
                                         .child("Keep Both")
                                         .on_mouse_down(
@@ -617,8 +612,8 @@ impl Render for DialogsView {
                                         .px_3()
                                         .py_1()
                                         .rounded_md()
-                                        .bg(self.theme.accent)
-                                        .text_color(rgb(0x181825))
+                                        .bg(theme.accent)
+                                        .text_color(theme.on_accent)
                                         .cursor_pointer()
                                         .child("Replace")
                                         .on_mouse_down(
@@ -641,8 +636,8 @@ impl Render for DialogsView {
                                         .px_3()
                                         .py_1()
                                         .rounded_md()
-                                        .bg(self.theme.bg_header)
-                                        .text_color(self.theme.text_secondary)
+                                        .bg(theme.surface_raised)
+                                        .text_color(theme.text_muted)
                                         .cursor_pointer()
                                         .child("Cancel")
                                         .on_mouse_down(
@@ -656,11 +651,11 @@ impl Render for DialogsView {
                                         .py_1()
                                         .rounded_md()
                                         .bg(if is_delete_dialog {
-                                            rgba(0xf38ba8cc)
+                                            theme.danger
                                         } else {
-                                            self.theme.accent
+                                            theme.accent
                                         })
-                                        .text_color(rgb(0x181825))
+                                        .text_color(theme.on_accent)
                                         .cursor_pointer()
                                         .child(if is_delete_dialog {
                                             "Permanently Delete"

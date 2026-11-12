@@ -8,14 +8,16 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
 use gpui::{
-    actions, div, prelude::*, px, rgb, rgba, App, Context, Entity, FontWeight, KeyBinding,
+    actions, div, prelude::*, px, transparent_black, App, Context, Entity, FontWeight, KeyBinding,
     MouseButton, Subscription, Window,
 };
 use kwati_core::{Location, SearchHandle, SearchHit, SearchOptions, Searcher};
 
 use crate::components::TextInput;
+use crate::components::{icon, IconName};
 use crate::state::AppState;
 use crate::theme::Theme;
+use crate::tokens::{size, space};
 
 actions!(
     search,
@@ -45,7 +47,6 @@ pub struct SearchView {
     pub app_state: Entity<AppState>,
     pub search_input: Entity<TextInput>,
     pub is_active: bool,
-    pub theme: Theme,
     pub results: Vec<SearchHit>,
     pub selected_index: Option<usize>,
     pub respect_ignore: bool,
@@ -79,7 +80,6 @@ impl SearchView {
             app_state,
             search_input,
             is_active: false,
-            theme: Theme::dark(),
             results: Vec::new(),
             selected_index: None,
             respect_ignore: true,
@@ -325,6 +325,7 @@ impl SearchView {
 
 impl Render for SearchView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
         if !self.is_active {
             return div();
         }
@@ -369,29 +370,25 @@ impl Render for SearchView {
                     .flex_row()
                     .justify_between()
                     .items_center()
-                    .h(px(26.))
-                    .px_3()
+                    .h(size::ROW)
+                    .px(space::S8)
                     .cursor_pointer()
                     .bg(if is_selected {
-                        rgba(0x89b4fa26)
+                        theme.selection
                     } else {
-                        rgba(0x00000000)
+                        transparent_black().into()
                     })
-                    .hover(|s| s.bg(rgba(0xffffff0d)))
+                    .hover(|s| s.bg(theme.surface_raised))
                     .text_size(px(12.))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child("📄")
+                            .child(icon(IconName::File).text_color(theme.text))
                             .child(
                                 div()
-                                    .text_color(if is_selected {
-                                        self.theme.accent
-                                    } else {
-                                        self.theme.text_primary
-                                    })
+                                    .text_color(theme.text)
                                     .font_weight(if is_selected {
                                         FontWeight::SEMIBOLD
                                     } else {
@@ -402,14 +399,14 @@ impl Render for SearchView {
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(self.theme.text_muted)
+                                    .text_color(theme.text_muted)
                                     .child(format!("({})", rel_path)),
                             ),
                     )
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(self.theme.text_muted)
+                            .text_color(theme.text_muted)
                             .child(format!("score {}", hit.score)),
                     )
                     .on_mouse_down(
@@ -425,9 +422,9 @@ impl Render for SearchView {
             .w_full()
             .flex()
             .flex_col()
-            .bg(self.theme.bg_header)
+            .bg(theme.bg)
             .border_b_1()
-            .border_color(self.theme.border)
+            .border_color(theme.border)
             .on_action(cx.listener(|this, _: &ToggleSearch, _, cx| this.toggle(cx)))
             .on_action(cx.listener(|this, _: &CloseSearch, _, cx| this.close(cx)))
             .on_action(cx.listener(|this, _: &NextSearchResult, _, cx| this.select_next(cx)))
@@ -448,12 +445,7 @@ impl Render for SearchView {
                     .items_center()
                     .gap_2()
                     .p_2()
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .text_color(self.theme.text_muted)
-                            .child("🔍"),
-                    )
+                    .child(icon(IconName::Search).text_color(theme.text_muted))
                     .child(div().flex_1().child(self.search_input.clone()))
                     .child(
                         // Respect .gitignore toggle
@@ -462,14 +454,14 @@ impl Render for SearchView {
                             .py_1()
                             .rounded_md()
                             .bg(if self.respect_ignore {
-                                self.theme.bg_content
+                                theme.surface
                             } else {
-                                self.theme.accent
+                                theme.accent
                             })
                             .text_color(if self.respect_ignore {
-                                self.theme.text_secondary
+                                theme.text_muted
                             } else {
-                                rgb(0x181825)
+                                theme.on_accent
                             })
                             .text_size(px(11.))
                             .cursor_pointer()
@@ -491,11 +483,9 @@ impl Render for SearchView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .text_size(px(13.))
-                            .text_color(self.theme.text_muted)
-                            .hover(|s| s.text_color(self.theme.text_primary))
+                            .hover(|s| s.bg(theme.surface_raised))
                             .cursor_pointer()
-                            .child("✕")
+                            .child(icon(IconName::Close).text_color(theme.text_muted))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -510,9 +500,9 @@ impl Render for SearchView {
                     .px_3()
                     .py_1()
                     .text_size(px(11.))
-                    .text_color(self.theme.text_muted)
+                    .text_color(theme.text_muted)
                     .border_t_1()
-                    .border_color(self.theme.border)
+                    .border_color(theme.border)
                     .child(status_text),
             )
             .child(if !results_elements.is_empty() {
@@ -522,7 +512,7 @@ impl Render for SearchView {
                     .max_h(px(220.))
                     .overflow_hidden()
                     .border_t_1()
-                    .border_color(self.theme.border)
+                    .border_color(theme.border)
                     .children(results_elements)
             } else {
                 div()

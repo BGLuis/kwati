@@ -5,15 +5,17 @@
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::*, px, rgba, Context, CursorStyle, Entity, KeyDownEvent, MouseButton,
-    MouseDownEvent, SharedString, Window,
+    div, prelude::*, Context, CursorStyle, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
+    SharedString, Window,
 };
 
 use kwati_core::Location;
 
 use crate::components::TextInput;
+use crate::components::{icon, IconName};
 use crate::state::AppState;
 use crate::theme::Theme;
+use crate::tokens::{radius, size, space, Fonts, TextRole};
 
 pub struct HeaderView {
     pub app_state: Entity<AppState>,
@@ -21,7 +23,6 @@ pub struct HeaderView {
     // The address field is rewritten only when this changes, so a refresh of the same
     // directory does not erase a path being typed.
     shown_location: Location,
-    pub theme: Theme,
 }
 
 impl HeaderView {
@@ -50,7 +51,6 @@ impl HeaderView {
             app_state,
             address_input,
             shown_location,
-            theme: Theme::dark(),
         }
     }
 
@@ -140,6 +140,8 @@ impl HeaderView {
 
 impl Render for HeaderView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
+        let fonts = Fonts::get(cx);
         let state = self.app_state.read(cx);
         let can_go_back = state.history.can_go_back();
         let can_go_forward = state.history.can_go_forward();
@@ -153,88 +155,83 @@ impl Render for HeaderView {
         div()
             .flex()
             .flex_row()
-            .h(px(40.))
+            .h(size::TOOLBAR)
             .w_full()
-            .px_3()
-            .py_1()
+            .pl(space::S12)
+            .pr(space::S8)
             .items_center()
-            .gap_2()
-            .bg(self.theme.bg_header)
+            .gap(space::S12)
+            .bg(theme.bg)
             .border_b_1()
-            .border_color(self.theme.border)
+            .border_color(theme.border)
             // Back button
             .child(
                 div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .px(space::S4)
+                    .py(space::S2)
+                    .rounded(radius::CONTROL)
                     .cursor(if can_go_back {
                         CursorStyle::PointingHand
                     } else {
                         CursorStyle::Arrow
                     })
-                    .text_color(if can_go_back {
-                        self.theme.text_primary
-                    } else {
-                        self.theme.text_muted
-                    })
-                    .bg(rgba(0x00000000))
-                    .when(can_go_back, |s| s.hover(|h| h.bg(rgba(0xffffff14))))
+                    .when(can_go_back, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_back, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_back_click))
                     })
-                    .child("◀"),
+                    .child(icon(IconName::ArrowLeft).text_color(if can_go_back {
+                        theme.text
+                    } else {
+                        theme.border_strong
+                    })),
             )
             // Forward button
             .child(
                 div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .px(space::S4)
+                    .py(space::S2)
+                    .rounded(radius::CONTROL)
                     .cursor(if can_go_forward {
                         CursorStyle::PointingHand
                     } else {
                         CursorStyle::Arrow
                     })
-                    .text_color(if can_go_forward {
-                        self.theme.text_primary
-                    } else {
-                        self.theme.text_muted
-                    })
-                    .bg(rgba(0x00000000))
-                    .when(can_go_forward, |s| s.hover(|h| h.bg(rgba(0xffffff14))))
+                    .when(can_go_forward, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_forward, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_forward_click))
                     })
-                    .child("▶"),
+                    .child(icon(IconName::ArrowRight).text_color(if can_go_forward {
+                        theme.text
+                    } else {
+                        theme.border_strong
+                    })),
             )
             // Up button
             .child(
                 div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .px(space::S4)
+                    .py(space::S2)
+                    .rounded(radius::CONTROL)
                     .cursor(if can_go_up {
                         CursorStyle::PointingHand
                     } else {
                         CursorStyle::Arrow
                     })
-                    .text_color(if can_go_up {
-                        self.theme.text_primary
-                    } else {
-                        self.theme.text_muted
-                    })
-                    .bg(rgba(0x00000000))
-                    .when(can_go_up, |s| s.hover(|h| h.bg(rgba(0xffffff14))))
+                    .when(can_go_up, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_up, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_up_click))
                     })
-                    .child("▲ Up"),
+                    .child(icon(IconName::ArrowUp).text_color(if can_go_up {
+                        theme.text
+                    } else {
+                        theme.border_strong
+                    })),
             )
             // Address bar with Enter and Escape key listeners
             .child(
                 div()
                     .flex_1()
+                    .text_data(&fonts)
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                         if event.keystroke.key == "enter" {
                             this.commit_address(window, cx);

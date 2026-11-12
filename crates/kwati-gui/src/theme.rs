@@ -1,33 +1,24 @@
-use gpui::{rgb, rgba, Rgba};
+use gpui::{rgb, rgba, App, Global, Rgba, WindowAppearance};
 
-/// Colors and styling tokens for kwati-gui.
+/// Colour tokens from the Kwatí design standard (`DESIGN.md`, "Colour").
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
-    // Backgrounds
-    pub bg_app: Rgba,
-    pub bg_header: Rgba,
-    pub bg_sidebar: Rgba,
-    pub bg_content: Rgba,
-    pub bg_panel: Rgba,
-    pub bg_status: Rgba,
-    pub bg_input: Rgba,
-    pub bg_hover: Rgba,
-    pub bg_selected: Rgba,
-
-    // Borders
+    pub bg: Rgba,
+    pub surface: Rgba,
+    pub surface_raised: Rgba,
     pub border: Rgba,
-    pub border_focus: Rgba,
-
-    // Foregrounds / Text
-    pub text_primary: Rgba,
-    pub text_secondary: Rgba,
+    pub border_strong: Rgba,
+    pub text: Rgba,
     pub text_muted: Rgba,
-    pub text_accent: Rgba,
-    pub text_error: Rgba,
-    pub text_warning: Rgba,
-    pub text_success: Rgba,
-
-    // Accent
     pub accent: Rgba,
+    pub on_accent: Rgba,
+    pub selection: Rgba,
+    pub secondary: Rgba,
+    pub danger: Rgba,
+    pub warning: Rgba,
+    /// Dims the window behind a dialog. Not a palette colour: it is `text` (light)
+    /// or black (dark) at partial opacity, so the window stays recognisable.
+    pub scrim: Rgba,
 }
 
 impl Default for Theme {
@@ -36,60 +27,64 @@ impl Default for Theme {
     }
 }
 
+impl Global for Theme {}
+
 impl Theme {
-    /// Modern dark theme palette (neutral slate / modern editor aesthetic).
-    pub fn dark() -> Self {
-        Self {
-            bg_app: rgb(0x181825),
-            bg_header: rgb(0x1e1e2e),
-            bg_sidebar: rgb(0x181825),
-            bg_content: rgb(0x1e1e2e),
-            bg_panel: rgb(0x181825),
-            bg_status: rgb(0x11111b),
-            bg_input: rgb(0x313244),
-            bg_hover: rgba(0x45475a80),
-            bg_selected: rgba(0x585b7080),
-
-            border: rgb(0x313244),
-            border_focus: rgb(0x89b4fa),
-
-            text_primary: rgb(0xcdd6f4),
-            text_secondary: rgb(0xa6adc8),
-            text_muted: rgb(0x6c7086),
-            text_accent: rgb(0x89b4fa),
-            text_error: rgb(0xf38ba8),
-            text_warning: rgb(0xf9e2af),
-            text_success: rgb(0xa6e3a1),
-
-            accent: rgb(0x89b4fa),
+    pub fn for_appearance(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::light(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::dark(),
         }
     }
 
-    /// Clean light theme palette.
+    /// The active theme. Views built without a running app (as in tests) get the default.
+    pub fn get(cx: &App) -> Self {
+        cx.try_global::<Self>().copied().unwrap_or_default()
+    }
+
+    /// Switches to the theme for the system's light or dark setting.
+    pub fn apply_appearance(appearance: WindowAppearance, cx: &mut App) {
+        let theme = Self::for_appearance(appearance);
+        if cx.try_global::<Self>() != Some(&theme) {
+            cx.set_global(theme);
+            cx.refresh_windows();
+        }
+    }
     pub fn light() -> Self {
         Self {
-            bg_app: rgb(0xf8f9fa),
-            bg_header: rgb(0xffffff),
-            bg_sidebar: rgb(0xf1f3f5),
-            bg_content: rgb(0xffffff),
-            bg_panel: rgb(0xf8f9fa),
-            bg_status: rgb(0xe9ecef),
-            bg_input: rgb(0xf1f3f5),
-            bg_hover: rgba(0xe9ecef80),
-            bg_selected: rgba(0xdbe4ff80),
+            bg: rgb(0xF4EEE4),
+            surface: rgb(0xFBF7F0),
+            surface_raised: rgb(0xECE3D5),
+            border: rgb(0xD9CCB8),
+            border_strong: rgb(0x8C7B69),
+            text: rgb(0x2B211A),
+            text_muted: rgb(0x6B5B4D),
+            accent: rgb(0xA8481F),
+            on_accent: rgb(0xFFF8F0),
+            selection: rgb(0xEBCDB6),
+            secondary: rgb(0x3F6B4A),
+            danger: rgb(0xB3261E),
+            warning: rgb(0x8A5A00),
+            scrim: rgba(0x2B211A66),
+        }
+    }
 
-            border: rgb(0xdee2e6),
-            border_focus: rgb(0x339af0),
-
-            text_primary: rgb(0x212529),
-            text_secondary: rgb(0x495057),
-            text_muted: rgb(0x868e96),
-            text_accent: rgb(0x1c7ed6),
-            text_error: rgb(0xe03131),
-            text_warning: rgb(0xf08c00),
-            text_success: rgb(0x2f9e44),
-
-            accent: rgb(0x339af0),
+    pub fn dark() -> Self {
+        Self {
+            bg: rgb(0x1C1714),
+            surface: rgb(0x231D19),
+            surface_raised: rgb(0x2C2420),
+            border: rgb(0x3D332C),
+            border_strong: rgb(0x8A7A6B),
+            text: rgb(0xEDE4D8),
+            text_muted: rgb(0xA8998A),
+            accent: rgb(0xE0824F),
+            on_accent: rgb(0x1C1714),
+            selection: rgb(0x4A2E20),
+            secondary: rgb(0x7FB08A),
+            danger: rgb(0xF2857C),
+            warning: rgb(0xE0B050),
+            scrim: rgba(0x00000099),
         }
     }
 }

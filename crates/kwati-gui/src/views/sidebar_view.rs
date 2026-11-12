@@ -5,11 +5,15 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, FontWeight, MouseButton, Window};
+use gpui::{
+    div, prelude::*, px, transparent_black, Context, Entity, FontWeight, MouseButton, Window,
+};
 use kwati_core::Location;
 
+use crate::components::{icon, IconName};
 use crate::state::AppState;
 use crate::theme::Theme;
+use crate::tokens::{radius, size, space, TextRole};
 
 /// Formats byte quantities into human-readable strings (B, KB, MB, GB, TB).
 pub fn format_bytes(bytes: u64) -> String {
@@ -36,11 +40,11 @@ pub fn format_bytes(bytes: u64) -> String {
 pub struct SidebarPlace {
     pub name: String,
     pub path: PathBuf,
-    pub icon: &'static str,
+    pub icon: IconName,
 }
 
 impl SidebarPlace {
-    pub fn new(name: impl Into<String>, path: PathBuf, icon: &'static str) -> Self {
+    pub fn new(name: impl Into<String>, path: PathBuf, icon: IconName) -> Self {
         Self {
             name: name.into(),
             path,
@@ -66,41 +70,45 @@ pub fn standard_places() -> Vec<SidebarPlace> {
     let mut places = Vec::new();
 
     if let Some(home) = system_home_dir() {
-        places.push(SidebarPlace::new("Home", home.clone(), "🏠"));
+        places.push(SidebarPlace::new("Home", home.clone(), IconName::Home));
 
         let desktop = home.join("Desktop");
         if desktop.exists() {
-            places.push(SidebarPlace::new("Desktop", desktop, "🖥️"));
+            places.push(SidebarPlace::new("Desktop", desktop, IconName::Folder));
         }
 
         let documents = home.join("Documents");
         if documents.exists() {
-            places.push(SidebarPlace::new("Documents", documents, "📁"));
+            places.push(SidebarPlace::new("Documents", documents, IconName::Folder));
         }
 
         let downloads = home.join("Downloads");
         if downloads.exists() {
-            places.push(SidebarPlace::new("Downloads", downloads, "📥"));
+            places.push(SidebarPlace::new("Downloads", downloads, IconName::Folder));
         }
 
         let pictures = home.join("Pictures");
         if pictures.exists() {
-            places.push(SidebarPlace::new("Pictures", pictures, "🖼️"));
+            places.push(SidebarPlace::new("Pictures", pictures, IconName::Image));
         }
 
         let music = home.join("Music");
         if music.exists() {
-            places.push(SidebarPlace::new("Music", music, "🎵"));
+            places.push(SidebarPlace::new("Music", music, IconName::Folder));
         }
 
         let videos = home.join("Videos");
         if videos.exists() {
-            places.push(SidebarPlace::new("Videos", videos, "🎬"));
+            places.push(SidebarPlace::new("Videos", videos, IconName::Folder));
         }
     }
 
     if places.is_empty() {
-        places.push(SidebarPlace::new("Root", PathBuf::from("/"), "💾"));
+        places.push(SidebarPlace::new(
+            "Root",
+            PathBuf::from("/"),
+            IconName::Drive,
+        ));
     }
 
     places
@@ -210,7 +218,6 @@ pub enum MountResult {
 
 pub struct SidebarView {
     pub app_state: Entity<AppState>,
-    pub theme: Theme,
     pub places: Vec<SidebarPlace>,
     pub bookmarks: Vec<UserBookmark>,
     pub volumes: Vec<SidebarVolume>,
@@ -220,7 +227,6 @@ impl SidebarView {
     pub fn new(app_state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
         Self {
             app_state,
-            theme: Theme::dark(),
             places: standard_places(),
             bookmarks: Vec::new(),
             volumes: Vec::new(),
@@ -324,18 +330,19 @@ impl SidebarView {
 
 impl Render for SidebarView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
         let places = self.places.clone();
         let bookmarks = self.bookmarks.clone();
         let volumes = self.volumes.clone();
         let current_loc = self.app_state.read(cx).current_location.clone();
 
         div()
-            .w(px(220.))
+            .w(px(200.))
             .h_full()
-            .p_3()
-            .bg(self.theme.bg_sidebar)
+            .p(space::S8)
+            .bg(theme.surface_raised)
             .border_r_1()
-            .border_color(self.theme.border)
+            .border_color(theme.border)
             .flex()
             .flex_col()
             .gap_4()
@@ -348,36 +355,33 @@ impl Render for SidebarView {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(self.theme.text_muted)
-                            .child("PLACES"),
+                            .px(space::S8)
+                            .py(space::S4)
+                            .text_label()
+                            .text_color(theme.text_muted)
+                            .child("Places"),
                     )
                     .children(places.into_iter().map(|place| {
                         let is_active = current_loc.path() == place.path;
                         let p_clone = place.path.clone();
 
                         div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
+                            .h(size::SIDEBAR_ROW)
+                            .px(space::S8)
+                            .rounded(radius::CONTROL)
                             .cursor_pointer()
-                            .bg(if is_active {
-                                rgba(0x89b4fa20)
-                            } else {
-                                rgba(0x00000000)
-                            })
-                            .hover(|s| s.bg(rgba(0xffffff0d)))
-                            .text_size(px(13.))
-                            .text_color(if is_active {
-                                self.theme.accent
-                            } else {
-                                self.theme.text_primary
-                            })
+                            .when(is_active, |s| s.bg(theme.selection))
+                            .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
+                            .text_body()
+                            .text_color(theme.text)
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .child(place.icon)
+                            .gap(space::S8)
+                            .child(icon(place.icon).text_color(if place.icon == IconName::Folder {
+                                theme.accent
+                            } else {
+                                theme.text
+                            }))
                             .child(place.name)
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -396,10 +400,11 @@ impl Render for SidebarView {
                         .gap_1()
                         .child(
                             div()
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(self.theme.text_muted)
-                                .child("BOOKMARKS"),
+                                .px(space::S8)
+                                .py(space::S4)
+                                .text_label()
+                                .text_color(theme.text_muted)
+                                .child("Bookmarks"),
                         )
                         .children(bookmarks.into_iter().enumerate().map(|(idx, bm)| {
                             let is_missing = bm.is_missing();
@@ -407,17 +412,13 @@ impl Render for SidebarView {
                             let p_clone = bm.path.clone();
 
                             div()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
+                                .h(size::SIDEBAR_ROW)
+                                .px(space::S8)
+                                .rounded(radius::CONTROL)
                                 .cursor_pointer()
-                                .bg(if is_active {
-                                    rgba(0x89b4fa20)
-                                } else {
-                                    rgba(0x00000000)
-                                })
-                                .hover(|s| s.bg(rgba(0xffffff0d)))
-                                .text_size(px(13.))
+                                .when(is_active, |s| s.bg(theme.selection))
+                                .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
+                                .text_body()
                                 .flex()
                                 .items_center()
                                 .justify_between()
@@ -425,27 +426,27 @@ impl Render for SidebarView {
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap_2()
-                                        .child(if is_missing { "⚠️" } else { "🔖" })
+                                        .gap(space::S8)
+                                        .child(if is_missing {
+                                            icon(IconName::Alert).text_color(theme.danger)
+                                        } else {
+                                            icon(IconName::Folder).text_color(theme.accent)
+                                        })
                                         .child(
                                             div()
                                                 .text_color(if is_missing {
-                                                    self.theme.text_error
-                                                } else if is_active {
-                                                    self.theme.accent
+                                                    theme.danger
                                                 } else {
-                                                    self.theme.text_primary
+                                                    theme.text
                                                 })
                                                 .child(bm.name),
                                         ),
                                 )
                                 .child(
                                     div()
-                                        .px_1()
-                                        .text_size(px(11.))
-                                        .text_color(self.theme.text_muted)
-                                        .hover(|s| s.text_color(self.theme.text_error))
-                                        .child("✕")
+                                        .rounded(radius::CONTROL)
+                                        .hover(|s| s.bg(theme.surface_raised))
+                                        .child(icon(IconName::Close).text_color(theme.text_muted))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -472,10 +473,11 @@ impl Render for SidebarView {
                         .gap_2()
                         .child(
                             div()
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(self.theme.text_muted)
-                                .child("DRIVES & STORAGE"),
+                                .px(space::S8)
+                                .py(space::S4)
+                                .text_label()
+                                .text_color(theme.text_muted)
+                                .child("Drives"),
                         )
                         .children(volumes.into_iter().map(|vol| {
                             let vol_id = vol.id.clone();
@@ -492,15 +494,15 @@ impl Render for SidebarView {
                                 .p_2()
                                 .rounded_md()
                                 .bg(if is_active {
-                                    rgba(0x89b4fa15)
+                                    theme.selection
                                 } else {
-                                    rgba(0xffffff05)
+                                    transparent_black().into()
                                 })
                                 .border_1()
                                 .border_color(if is_active {
-                                    self.theme.accent
+                                    theme.accent
                                 } else {
-                                    self.theme.border
+                                    theme.border
                                 })
                                 .flex()
                                 .flex_col()
@@ -522,12 +524,12 @@ impl Render for SidebarView {
                                                         this.navigate_to_path(&p_nav, cx);
                                                     }),
                                                 )
-                                                .child(if is_removable { "🔌" } else { "💾" })
+                                                .child(icon(IconName::Drive).text_color(theme.text))
                                                 .child(
                                                     div()
                                                         .text_size(px(13.))
                                                         .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(self.theme.text_primary)
+                                                        .text_color(theme.text)
                                                         .child(vol.name),
                                                 ),
                                         )
@@ -538,12 +540,19 @@ impl Render for SidebarView {
                                                     .px_2()
                                                     .py(px(1.))
                                                     .rounded_sm()
-                                                    .bg(self.theme.bg_header)
-                                                    .hover(|s| s.bg(rgba(0xf38ba830)))
+                                                    .bg(theme.surface)
+                                                    .hover(|s| s.bg(theme.selection))
                                                     .text_size(px(11.))
-                                                    .text_color(self.theme.text_secondary)
+                                                    .text_color(theme.text_muted)
                                                     .cursor_pointer()
-                                                    .child("⏏ Eject")
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(space::S4)
+                                                    .child(
+                                                        icon(IconName::Eject)
+                                                            .text_color(theme.text_muted),
+                                                    )
+                                                    .child("Eject")
                                                     .on_mouse_down(
                                                         MouseButton::Left,
                                                         cx.listener(move |this, _, _, cx| {
@@ -600,8 +609,8 @@ impl Render for SidebarView {
                                                     .px_2()
                                                     .py(px(1.))
                                                     .rounded_sm()
-                                                    .bg(self.theme.accent)
-                                                    .text_color(rgb(0x181825))
+                                                    .bg(theme.accent)
+                                                    .text_color(theme.on_accent)
                                                     .text_size(px(11.))
                                                     .cursor_pointer()
                                                     .child("Mount")
@@ -637,7 +646,7 @@ impl Render for SidebarView {
                                 .child(
                                     div()
                                         .text_size(px(11.))
-                                        .text_color(self.theme.text_muted)
+                                        .text_color(theme.text_muted)
                                         .child(capacity_text),
                                 )
                                 // Usage progress bar
@@ -646,7 +655,7 @@ impl Render for SidebarView {
                                         .w_full()
                                         .h(px(4.))
                                         .rounded_sm()
-                                        .bg(self.theme.border)
+                                        .bg(theme.border)
                                         .child(
                                             div()
                                                 .w(gpui::DefiniteLength::Fraction(
@@ -655,18 +664,22 @@ impl Render for SidebarView {
                                                 .h_full()
                                                 .rounded_sm()
                                                 .bg(if used_pct > 90 {
-                                                    self.theme.text_error
+                                                    theme.danger
                                                 } else {
-                                                    self.theme.accent
+                                                    theme.accent
                                                 }),
                                         ),
                                 )
                                 .when(is_busy, |p| {
                                     p.child(
                                         div()
-                                            .text_size(px(10.))
-                                            .text_color(self.theme.text_warning)
-                                            .child("⚠️ In use by open files"),
+                                            .flex()
+                                            .items_center()
+                                            .gap(space::S4)
+                                            .text_size(px(11.))
+                                            .text_color(theme.warning)
+                                            .child(icon(IconName::Alert).text_color(theme.warning))
+                                            .child("In use by open files"),
                                     )
                                 })
                         })),
