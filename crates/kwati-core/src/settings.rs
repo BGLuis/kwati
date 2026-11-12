@@ -4,9 +4,13 @@ use std::path::{Path, PathBuf};
 
 use toml::{Table, Value};
 
+use crate::places::Bookmark;
+
 pub const CURRENT_VERSION: u32 = 1;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 5;
 pub const DEFAULT_LIST_TIMEOUT_SECS: u32 = 10;
+pub const DEFAULT_REMOTE_POLL_INTERVAL_SECS: u32 = 30;
+pub const MIN_REMOTE_POLL_INTERVAL_SECS: u32 = 10;
 
 /// A value in the settings file that was ignored in favour of its default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +26,9 @@ pub struct Settings {
     pub refresh_interval_secs: u32,
     /// Seconds a directory listing may take before it is abandoned (see `list_dir_bounded`).
     pub list_timeout_secs: u32,
+    pub remote_poll_enabled: bool,
+    pub remote_poll_interval_secs: u32,
+    pub bookmarks: Vec<Bookmark>,
     /// Keys this version does not know, kept so a newer version's file survives a save.
     unknown: Table,
 }
@@ -32,6 +39,9 @@ impl Default for Settings {
             version: CURRENT_VERSION,
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
             list_timeout_secs: DEFAULT_LIST_TIMEOUT_SECS,
+            remote_poll_enabled: false,
+            remote_poll_interval_secs: DEFAULT_REMOTE_POLL_INTERVAL_SECS,
+            bookmarks: Vec::new(),
             unknown: Table::new(),
         }
     }
@@ -48,6 +58,27 @@ fn take_u32_or_default(
     default: u32,
     warnings: &mut Vec<SettingsWarning>,
 ) -> u32 {
+    let Some(value) = table.remove(key) else {
+        return default;
+    };
+    match value.try_into() {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warnings.push(SettingsWarning {
+                key,
+                message: err.to_string(),
+            });
+            default
+        }
+    }
+}
+
+fn take_bool_or_default(
+    table: &mut Table,
+    key: &'static str,
+    default: bool,
+    warnings: &mut Vec<SettingsWarning>,
+) -> bool {
     let Some(value) = table.remove(key) else {
         return default;
     };
@@ -90,6 +121,16 @@ pub(crate) fn write_atomic(
 }
 
 impl Settings {
+    /// Sets the remote polling interval in seconds. Rejects values below [`MIN_REMOTE_POLL_INTERVAL_SECS`].
+    pub fn set_remote_poll_interval_secs(&mut self, secs: u32) -> Result<(), &'static str> {
+        if secs < MIN_REMOTE_POLL_INTERVAL_SECS {
+            Err("remote poll interval cannot be below minimum of 10 seconds")
+        } else {
+            self.remote_poll_interval_secs = secs;
+            Ok(())
+        }
+    }
+
     /// Reads settings from `path`. A missing file yields the defaults; an invalid value falls
     /// back to its default and is reported. A file that is not valid TOML is an error, so the
     /// caller never overwrites it by accident.
@@ -120,10 +161,80 @@ impl Settings {
             defaults.list_timeout_secs,
             &mut warnings,
         );
+        let remote_poll_enabled = take_bool_or_default(
+            &mut table,
+            "remote_poll_enabled",
+            defaults.remote_poll_enabled,
+            &mut warnings,
+        );
+        let raw_remote_poll_interval = take_u32_or_default(
+            &mut table,
+            "remote_poll_interval_secs",
+            defaults.remote_poll_interval_secs,
+            &mut warnings,
+        );
+        let remote_poll_interval_secs = if raw_remote_poll_interval < MIN_REMOTE_POLL_INTERVAL_SECS
+        {
+            warnings.push(SettingsWarning {
+                key: "remote_poll_interval_secs",
+                message: format!(
+                    "remote poll interval ({raw_remote_poll_interval}s) is below minimum of {MIN_REMOTE_POLL_INTERVAL_SECS}s"
+                ),
+            });
+            defaults.remote_poll_interval_secs
+        } else {
+            raw_remote_poll_interval
+        };
+
+        let mut bookmarks = Vec::new();
+        if let Some(val) = table.remove("bookmarks") {
+            match val {
+                Value::Array(items) => {
+                    for (idx, item) in items.into_iter().enumerate() {
+                        if let Value::Table(mut t) = item {
+                            let name = t.remove("name").and_then(|v| match v {
+                                Value::String(s) => Some(s),
+                                _ => None,
+                            });
+                            let path = t.remove("path").and_then(|v| match v {
+                                Value::String(s) => Some(PathBuf::from(s)),
+                                _ => None,
+                            });
+                            match (name, path) {
+                                (Some(name), Some(path)) => {
+                                    bookmarks.push(Bookmark::new(name, path));
+                                }
+                                _ => {
+                                    warnings.push(SettingsWarning {
+                                        key: "bookmarks",
+                                        message: format!("invalid bookmark entry at index {}", idx),
+                                    });
+                                }
+                            }
+                        } else {
+                            warnings.push(SettingsWarning {
+                                key: "bookmarks",
+                                message: format!("bookmark entry at index {} is not a table", idx),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    warnings.push(SettingsWarning {
+                        key: "bookmarks",
+                        message: "bookmarks must be an array of tables".into(),
+                    });
+                }
+            }
+        }
+
         let settings = Self {
             version,
             refresh_interval_secs,
             list_timeout_secs,
+            remote_poll_enabled,
+            remote_poll_interval_secs,
+            bookmarks,
             unknown: table,
         };
         Ok((settings, warnings))
@@ -133,6 +244,57 @@ impl Settings {
     /// renames it over the target.
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
         self.save_with_hook(path, || Ok(()))
+    }
+
+    /// Appends a bookmark.
+    pub fn add_bookmark(&mut self, bookmark: impl Into<Bookmark>) {
+        self.bookmarks.push(bookmark.into());
+    }
+
+    /// Renames the bookmark at `index` to `new_name`. Returns `true` if index was valid.
+    pub fn rename_bookmark(&mut self, index: usize, new_name: impl Into<String>) -> bool {
+        if let Some(b) = self.bookmarks.get_mut(index) {
+            b.name = new_name.into();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Renames the first bookmark with matching `path` to `new_name`. Returns `true` if found.
+    pub fn rename_bookmark_by_path(&mut self, path: &Path, new_name: impl Into<String>) -> bool {
+        if let Some(b) = self.bookmarks.iter_mut().find(|b| b.path == path) {
+            b.name = new_name.into();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Removes the bookmark at `index`. Returns the removed bookmark if index was valid.
+    pub fn remove_bookmark(&mut self, index: usize) -> Option<Bookmark> {
+        if index < self.bookmarks.len() {
+            Some(self.bookmarks.remove(index))
+        } else {
+            None
+        }
+    }
+
+    /// Removes all bookmarks matching `path`. Returns `true` if any was removed.
+    pub fn remove_bookmark_by_path(&mut self, path: &Path) -> bool {
+        let before = self.bookmarks.len();
+        self.bookmarks.retain(|b| b.path != path);
+        self.bookmarks.len() < before
+    }
+
+    /// Reorders a bookmark from index `from` to index `to`. Returns `true` if successful.
+    pub fn reorder_bookmarks(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.bookmarks.len() || to >= self.bookmarks.len() {
+            return false;
+        }
+        let item = self.bookmarks.remove(from);
+        self.bookmarks.insert(to, item);
+        true
     }
 
     /// `between_write_and_rename` runs after the temporary file is written, letting tests
@@ -152,6 +314,28 @@ impl Settings {
             "list_timeout_secs".into(),
             Value::Integer(self.list_timeout_secs.into()),
         );
+        table.insert(
+            "remote_poll_enabled".into(),
+            Value::Boolean(self.remote_poll_enabled),
+        );
+        table.insert(
+            "remote_poll_interval_secs".into(),
+            Value::Integer(self.remote_poll_interval_secs.into()),
+        );
+        let bookmark_tables: Vec<Value> = self
+            .bookmarks
+            .iter()
+            .map(|b| {
+                let mut t = Table::new();
+                t.insert("name".into(), Value::String(b.name.clone()));
+                t.insert(
+                    "path".into(),
+                    Value::String(b.path.to_string_lossy().to_string()),
+                );
+                Value::Table(t)
+            })
+            .collect();
+        table.insert("bookmarks".into(), Value::Array(bookmark_tables));
         let text = toml::to_string(&table)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
