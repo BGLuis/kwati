@@ -271,6 +271,16 @@ fn sorting_headers_and_hidden_files_toggle() {
     std::fs::create_dir_all(&temp_dir).unwrap();
     std::fs::write(temp_dir.join("normal.txt"), "hello").unwrap();
     std::fs::write(temp_dir.join(".hidden.txt"), "secret").unwrap();
+    // Windows hides by file attribute, not by a leading dot.
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("attrib")
+            .arg("+h")
+            .arg(temp_dir.join(".hidden.txt"))
+            .status()
+            .expect("attrib command failed");
+        assert!(status.success(), "attrib +h must succeed");
+    }
 
     let mut state_hidden = AppState::new(Location::Local(temp_dir.clone()));
     state_hidden.reload_entries();
