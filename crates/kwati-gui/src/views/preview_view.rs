@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use gpui::{div, img, prelude::*, px, Context, Entity, FontWeight, Subscription, Window};
 use kwati_core::preview::{read_preview, Preview};
 
+use crate::components::{icon, IconName};
 use crate::state::{AppState, PreviewData, PreviewKind};
 use crate::theme::Theme;
 
@@ -266,12 +267,7 @@ impl Render for PreviewView {
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .child(
-                    div()
-                        .text_size(px(24.))
-                        .text_color(theme.text_muted)
-                        .child("🔍"),
-                )
+                .child(icon(IconName::File).text_color(theme.border_strong))
                 .child(
                     div()
                         .text_color(theme.text_muted)
@@ -366,12 +362,7 @@ impl Render for PreviewView {
                     .p_4()
                     .rounded_md()
                     .bg(theme.surface)
-                    .child(
-                        div()
-                            .text_size(px(28.))
-                            .text_color(theme.text_muted)
-                            .child("📦"),
-                    )
+                    .child(icon(IconName::File).text_color(theme.text_muted))
                     .child(
                         div()
                             .text_size(px(13.))

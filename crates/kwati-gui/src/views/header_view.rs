@@ -12,6 +12,7 @@ use gpui::{
 use kwati_core::Location;
 
 use crate::components::TextInput;
+use crate::components::{icon, IconName};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole};
@@ -174,16 +175,15 @@ impl Render for HeaderView {
                     } else {
                         CursorStyle::Arrow
                     })
-                    .text_color(if can_go_back {
-                        theme.text
-                    } else {
-                        theme.border_strong
-                    })
                     .when(can_go_back, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_back, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_back_click))
                     })
-                    .child("◀"),
+                    .child(icon(IconName::ArrowLeft).text_color(if can_go_back {
+                        theme.text
+                    } else {
+                        theme.border_strong
+                    })),
             )
             // Forward button
             .child(
@@ -196,16 +196,15 @@ impl Render for HeaderView {
                     } else {
                         CursorStyle::Arrow
                     })
-                    .text_color(if can_go_forward {
-                        theme.text
-                    } else {
-                        theme.border_strong
-                    })
                     .when(can_go_forward, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_forward, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_forward_click))
                     })
-                    .child("▶"),
+                    .child(icon(IconName::ArrowRight).text_color(if can_go_forward {
+                        theme.text
+                    } else {
+                        theme.border_strong
+                    })),
             )
             // Up button
             .child(
@@ -218,16 +217,15 @@ impl Render for HeaderView {
                     } else {
                         CursorStyle::Arrow
                     })
-                    .text_color(if can_go_up {
-                        theme.text
-                    } else {
-                        theme.border_strong
-                    })
                     .when(can_go_up, |s| s.hover(|h| h.bg(theme.surface_raised)))
                     .when(can_go_up, |s| {
                         s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_up_click))
                     })
-                    .child("▲ Up"),
+                    .child(icon(IconName::ArrowUp).text_color(if can_go_up {
+                        theme.text
+                    } else {
+                        theme.border_strong
+                    })),
             )
             // Address bar with Enter and Escape key listeners
             .child(

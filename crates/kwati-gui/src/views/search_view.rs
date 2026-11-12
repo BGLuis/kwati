@@ -14,6 +14,7 @@ use gpui::{
 use kwati_core::{Location, SearchHandle, SearchHit, SearchOptions, Searcher};
 
 use crate::components::TextInput;
+use crate::components::{icon, IconName};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{size, space};
@@ -384,7 +385,7 @@ impl Render for SearchView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child("📄")
+                            .child(icon(IconName::File).text_color(theme.text))
                             .child(
                                 div()
                                     .text_color(theme.text)
@@ -444,12 +445,7 @@ impl Render for SearchView {
                     .items_center()
                     .gap_2()
                     .p_2()
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .text_color(theme.text_muted)
-                            .child("🔍"),
-                    )
+                    .child(icon(IconName::Search).text_color(theme.text_muted))
                     .child(div().flex_1().child(self.search_input.clone()))
                     .child(
                         // Respect .gitignore toggle
@@ -487,11 +483,9 @@ impl Render for SearchView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .text_size(px(13.))
-                            .text_color(theme.text_muted)
-                            .hover(|s| s.text_color(theme.text))
+                            .hover(|s| s.bg(theme.surface_raised))
                             .cursor_pointer()
-                            .child("✕")
+                            .child(icon(IconName::Close).text_color(theme.text_muted))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {

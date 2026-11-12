@@ -473,7 +473,6 @@ fn test_sidebar_standard_places_discovery() {
 
     for place in &places {
         assert!(!place.name.is_empty());
-        assert!(!place.icon.is_empty());
     }
 }
 

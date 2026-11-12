@@ -14,7 +14,7 @@ use crate::actions::navigation::{
     GoBack, GoForward, GoUp, OpenSelected, PageDown, PageUp, Refresh, SelectFirst, SelectLast,
     SelectNext, SelectPrevious, ToggleHidden,
 };
-use crate::components::ScrollbarState;
+use crate::components::{icon, IconName, ScrollbarState};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole};
@@ -338,11 +338,12 @@ impl Render for ListView {
             .set_metrics(entry_count, visible_items, current_top);
 
         let entries_clone = entries.clone();
-        let (row_selected, row_hover, row_text, row_muted) = (
+        let (row_selected, row_hover, row_text, row_muted, row_accent) = (
             theme.selection,
             theme.surface_raised,
             theme.text,
             theme.text_muted,
+            theme.accent,
         );
         let row_fonts = fonts.clone();
 
@@ -577,7 +578,18 @@ impl Render for ListView {
                                                         .flex()
                                                         .items_center()
                                                         .gap(space::S8)
-                                                        .child(if is_dir { "📁" } else { "📄" })
+                                                        .child(if is_dir {
+                                                            icon(IconName::Folder)
+                                                                .text_color(row_accent)
+                                                        } else {
+                                                            icon(IconName::File).text_color(
+                                                                if is_hidden && !is_selected {
+                                                                    row_muted
+                                                                } else {
+                                                                    row_text
+                                                                },
+                                                            )
+                                                        })
                                                         .child(name),
                                                 )
                                                 .child(

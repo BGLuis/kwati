@@ -5,6 +5,7 @@
 use gpui::{div, prelude::*, px, Context, Entity, MouseButton, MouseDownEvent, Window};
 use kwati_core::{volume_kind, Location, VolumeKind};
 
+use crate::components::{icon, IconName};
 use crate::state::{AppState, NetworkMountStatus};
 use crate::theme::Theme;
 
@@ -121,7 +122,8 @@ impl Render for NetworkView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child("🌐 Network Share")
+                        .child(icon(IconName::Network).text_color(theme.text))
+                        .child("Network share")
                         .child(
                             div()
                                 .text_color(theme.text_muted)
@@ -147,8 +149,8 @@ impl Render for NetworkView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child("🌐")
-                        .child("Connecting to network share..."),
+                        .child(icon(IconName::Network).text_color(theme.text))
+                        .child("Connecting to network share…"),
                 )
                 .child(
                     div()
@@ -173,7 +175,8 @@ impl Render for NetworkView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child("🌐 Connected:")
+                        .child(icon(IconName::Check).text_color(theme.secondary))
+                        .child("Connected:")
                         .child(
                             div()
                                 .text_color(theme.text)
@@ -199,7 +202,7 @@ impl Render for NetworkView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child("⚠️")
+                        .child(icon(IconName::Alert).text_color(theme.danger))
                         .child(format!(
                             "Network connection timed out ({}s). Slow or unresponsive mount.",
                             self.timeout_secs
@@ -249,7 +252,7 @@ impl Render for NetworkView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child("⏳")
+                        .child(icon(IconName::Alert).text_color(theme.warning))
                         .child("Network mount is busy. Waiting for server response..."),
                 )
                 .child(
