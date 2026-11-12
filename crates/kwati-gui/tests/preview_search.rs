@@ -343,3 +343,136 @@ fn search_cancellation_on_directory_change() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+use kwati_gui::actions::open_with::{
+    applications_for, launch_application, launch_custom_command, which_in_path, AppInfo,
+};
+use kwati_gui::views::dialogs::DialogKind;
+
+#[test]
+fn open_with_dialog_kind_state() {
+    let target = PathBuf::from("document.pdf");
+    let apps = applications_for(&target);
+    let dialog = DialogKind::OpenWith {
+        target_path: target.clone(),
+        available_apps: apps.clone(),
+        selected_index: Some(0),
+        error: None,
+    };
+
+    if let DialogKind::OpenWith {
+        target_path,
+        available_apps,
+        selected_index,
+        error,
+    } = dialog
+    {
+        assert_eq!(target_path, target);
+        assert_eq!(available_apps.len(), apps.len());
+        assert_eq!(selected_index, Some(0));
+        assert!(error.is_none());
+    } else {
+        panic!("expected DialogKind::OpenWith");
+    }
+}
+
+#[test]
+fn open_with_png_lists_image_applications_default_first() {
+    let png_path = PathBuf::from("picture.png");
+    let apps = applications_for(&png_path);
+
+    assert!(!apps.is_empty());
+    // Default application must be first
+    assert!(apps[0].is_default);
+    // Should include image-specific application
+    let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
+    assert!(names
+        .iter()
+        .any(|n| n.contains("Image") || n.contains("Viewer")));
+
+    // At least one non-default application is present
+    let non_default = apps.iter().find(|a| !a.is_default);
+    assert!(non_default.is_some());
+}
+
+#[test]
+fn open_with_missing_app_returns_error() {
+    let missing_app = AppInfo::new(
+        "Ghost Viewer",
+        "ghost_viewer_binary_that_does_not_exist",
+        false,
+    );
+    let target = PathBuf::from("test.png");
+
+    let result = launch_application(&missing_app, &target);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn open_with_custom_command_missing_executable_returns_error() {
+    let target = PathBuf::from("test.txt");
+    let result = launch_custom_command("nonexistent_executable_12345 %f", &target);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn open_with_custom_command_launches_executable() {
+    let temp_dir = std::env::temp_dir().join("kwati_openwith_custom_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let file_path = temp_dir.join("input.txt");
+    fs::write(&file_path, b"data").unwrap();
+
+    // "echo" or "true" or "cat" is always installed on Linux/Unix systems
+    #[cfg(unix)]
+    {
+        let result = launch_custom_command("true", &file_path);
+        assert!(result.is_ok());
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn which_in_path_finds_standard_utilities() {
+    #[cfg(unix)]
+    {
+        assert!(which_in_path("ls") || which_in_path("sh"));
+        assert!(!which_in_path("nonexistent_binary_xyz_123456789"));
+    }
+}
+
+#[test]
+fn open_with_desktop_file_discovery_in_xdg_data_home() {
+    let temp_dir = std::env::temp_dir().join("kwati_xdg_test");
+    let _ = fs::remove_dir_all(&temp_dir);
+    let apps_dir = temp_dir.join("applications");
+    fs::create_dir_all(&apps_dir).unwrap();
+
+    let desktop_content = "[Desktop Entry]\nType=Application\nName=CustomPhotoEditor\nExec=custom-editor %f\nMimeType=image/png;\n";
+    let desktop_path = apps_dir.join("custom-photo.desktop");
+    fs::write(&desktop_path, desktop_content).unwrap();
+
+    // Temporarily point XDG_DATA_HOME to temp_dir
+    let old_xdg = std::env::var_os("XDG_DATA_HOME");
+    std::env::set_var("XDG_DATA_HOME", &temp_dir);
+
+    let apps = applications_for(&PathBuf::from("sample.png"));
+    let found = apps.iter().any(|a| a.name == "CustomPhotoEditor");
+
+    // Restore env var
+    if let Some(old) = old_xdg {
+        std::env::set_var("XDG_DATA_HOME", old);
+    } else {
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+
+    assert!(
+        found,
+        "Should have discovered CustomPhotoEditor in XDG_DATA_HOME"
+    );
+    let _ = fs::remove_dir_all(&temp_dir);
+}

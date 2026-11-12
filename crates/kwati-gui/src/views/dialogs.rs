@@ -10,6 +10,9 @@ use std::sync::Arc;
 use gpui::{div, prelude::*, px, rgb, rgba, Context, Entity, MouseButton, Window};
 use kwati_core::ConflictPolicy;
 
+use crate::actions::open_with::{
+    applications_for, launch_application, launch_custom_command, AppInfo,
+};
 use crate::actions::operations::{
     execute_copy, execute_create_folder, execute_move, execute_permanent_delete, execute_rename,
     execute_trash,
@@ -41,6 +44,12 @@ pub enum DialogKind {
         dest_dir: PathBuf,
         is_cut: bool,
         conflict_name: String,
+    },
+    OpenWith {
+        target_path: PathBuf,
+        available_apps: Vec<AppInfo>,
+        selected_index: Option<usize>,
+        error: Option<String>,
     },
 }
 
@@ -156,6 +165,33 @@ impl DialogsView {
         self.close(cx);
     }
 
+    /// Opens the "Open With..." application picker dialog.
+    pub fn open_open_with(&mut self, target: PathBuf, cx: &mut Context<Self>) {
+        let apps = applications_for(&target);
+        self.input.update(cx, |input, cx| {
+            input.set_text("", cx);
+        });
+        self.current_dialog = DialogKind::OpenWith {
+            target_path: target,
+            available_apps: apps,
+            selected_index: Some(0),
+            error: None,
+        };
+        cx.notify();
+    }
+
+    /// Selects an application in the Open With dialog.
+    pub fn select_app(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let DialogKind::OpenWith {
+            ref mut selected_index,
+            ..
+        } = self.current_dialog
+        {
+            *selected_index = Some(index);
+            cx.notify();
+        }
+    }
+
     /// Submits the current active dialog (NewFolder or Rename).
     pub fn submit(&mut self, cx: &mut Context<Self>) {
         let input_text = self.input.read(cx).text().to_string();
@@ -231,6 +267,49 @@ impl DialogsView {
             DialogKind::ConflictResolution { .. } => {
                 self.close(cx);
             }
+            DialogKind::OpenWith {
+                target_path,
+                available_apps,
+                selected_index,
+                ..
+            } => {
+                let custom_cmd = self.input.read(cx).text().trim().to_string();
+                let target = target_path.clone();
+                let res = if !custom_cmd.is_empty() {
+                    launch_custom_command(&custom_cmd, &target)
+                } else if let Some(idx) = *selected_index {
+                    if let Some(app) = available_apps.get(idx) {
+                        launch_application(app, &target)
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "no application selected",
+                        ))
+                    }
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no application selected",
+                    ))
+                };
+
+                match res {
+                    Ok(_) => self.close(cx),
+                    Err(err) => {
+                        let err_msg = err.to_string();
+                        self.app_state.update(cx, |state, _cx| {
+                            state.set_status(err_msg.clone());
+                        });
+                        self.current_dialog = DialogKind::OpenWith {
+                            target_path: target,
+                            available_apps: available_apps.clone(),
+                            selected_index: *selected_index,
+                            error: Some(err_msg),
+                        };
+                        cx.notify();
+                    }
+                }
+            }
             DialogKind::None => {}
         }
     }
@@ -245,6 +324,7 @@ impl Render for DialogsView {
         let is_conflict_dialog =
             matches!(self.current_dialog, DialogKind::ConflictResolution { .. });
         let is_delete_dialog = matches!(self.current_dialog, DialogKind::ConfirmDelete { .. });
+        let is_open_with = matches!(self.current_dialog, DialogKind::OpenWith { .. });
 
         let (title, error_msg, is_input_dialog, prompt_text) = match &self.current_dialog {
             DialogKind::NewFolder { error, .. } => {
@@ -282,6 +362,14 @@ impl Render for DialogsView {
                     conflict_name
                 );
                 ("Name Conflict", None, false, Some(msg))
+            }
+            DialogKind::OpenWith { target_path, .. } => {
+                let file_name = target_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| target_path.to_string_lossy().to_string());
+                let msg = format!("Choose an application to open '{}':", file_name);
+                ("Open with...", None, false, Some(msg))
             }
             DialogKind::None => ("", None, false, None),
         };
@@ -334,6 +422,108 @@ impl Render for DialogsView {
                     } else {
                         None
                     })
+                    .children(
+                        if let DialogKind::OpenWith {
+                            ref available_apps,
+                            selected_index,
+                            ref error,
+                            ..
+                        } = self.current_dialog
+                        {
+                            let mut app_nodes = Vec::new();
+                            for (ix, app) in available_apps.iter().enumerate() {
+                                let is_sel = selected_index == Some(ix);
+                                let app_name = app.name.clone();
+                                let is_default = app.is_default;
+                                app_nodes.push(
+                                    div()
+                                        .id(ix)
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .bg(if is_sel {
+                                            rgba(0x89b4fa26)
+                                        } else {
+                                            rgba(0x00000000)
+                                        })
+                                        .hover(|s| s.bg(rgba(0xffffff0d)))
+                                        .text_size(px(12.))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(if is_sel { "🔘" } else { "⚪" })
+                                                .child(
+                                                    div()
+                                                        .text_color(if is_sel {
+                                                            self.theme.accent
+                                                        } else {
+                                                            self.theme.text_primary
+                                                        })
+                                                        .child(app_name),
+                                                ),
+                                        )
+                                        .children(if is_default {
+                                            Some(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .bg(self.theme.bg_content)
+                                                    .text_color(self.theme.text_muted)
+                                                    .child("Default"),
+                                            )
+                                        } else {
+                                            None
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.select_app(ix, cx);
+                                            }),
+                                        ),
+                                );
+                            }
+
+                            Some(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .max_h(px(160.))
+                                            .overflow_hidden()
+                                            .children(app_nodes),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(self.theme.text_muted)
+                                            .child("Or specify custom command / executable:"),
+                                    )
+                                    .child(self.input.clone())
+                                    .children(error.as_ref().map(|err| {
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(self.theme.text_error)
+                                            .child(err.clone())
+                                    })),
+                            )
+                        } else {
+                            None
+                        },
+                    )
                     .children(if is_conflict_dialog {
                         Some(
                             div()
@@ -439,6 +629,8 @@ impl Render for DialogsView {
                                         .cursor_pointer()
                                         .child(if is_delete_dialog {
                                             "Permanently Delete"
+                                        } else if is_open_with {
+                                            "Open"
                                         } else {
                                             "Confirm"
                                         })
