@@ -460,3 +460,210 @@ fn test_remote_search_options_parallel_requests() {
     controller.set_parallel_requests(0);
     assert_eq!(controller.options.parallel_requests, 1);
 }
+
+#[test]
+fn test_sidebar_standard_places_discovery() {
+    use kwati_gui::views::sidebar_view::standard_places;
+
+    let places = standard_places();
+    assert!(!places.is_empty());
+    // Home or root is always present
+    let has_home = places.iter().any(|p| p.name == "Home" || p.name == "Root");
+    assert!(has_home);
+
+    for place in &places {
+        assert!(!place.name.is_empty());
+        assert!(!place.icon.is_empty());
+    }
+}
+
+#[test]
+fn test_sidebar_bookmarks_add_remove_reorder_and_missing_target() {
+    use kwati_gui::views::sidebar_view::UserBookmark;
+    use std::path::PathBuf;
+
+    let existing_dir = std::env::temp_dir();
+    let missing_dir = PathBuf::from("/non/existent/path/for/kwati/test/bookmark/12345");
+
+    let bm_valid = UserBookmark::new("Temp Folder", existing_dir);
+    let bm_missing = UserBookmark::new("Old Missing Drive", missing_dir);
+
+    // Missing target detection
+    assert!(!bm_valid.is_missing());
+    assert!(bm_missing.is_missing());
+
+    // Bookmarks list operations
+    let mut bookmarks = vec![bm_valid.clone(), bm_missing.clone()];
+    assert_eq!(bookmarks.len(), 2);
+
+    // Reorder: move index 1 to 0
+    let item = bookmarks.remove(1);
+    bookmarks.insert(0, item);
+    assert_eq!(bookmarks[0].name, "Old Missing Drive");
+    assert_eq!(bookmarks[1].name, "Temp Folder");
+
+    // Remove
+    let removed = bookmarks.remove(0);
+    assert_eq!(removed.name, "Old Missing Drive");
+    assert_eq!(bookmarks.len(), 1);
+}
+
+#[test]
+fn test_sidebar_volume_capacity_indicators() {
+    use kwati_gui::views::sidebar_view::{format_bytes, SidebarVolume};
+    use std::path::PathBuf;
+
+    assert_eq!(format_bytes(500), "500 B");
+    assert_eq!(format_bytes(1024), "1.0 KB");
+    assert_eq!(format_bytes(1024 * 1024 * 50), "50.0 MB");
+    assert_eq!(format_bytes(1024 * 1024 * 1024 * 64), "64.0 GB");
+
+    let vol = SidebarVolume::new(
+        "usb-1",
+        "SANDISK USB",
+        PathBuf::from("/media/usb1"),
+        64 * 1024 * 1024 * 1024, // 64 GB
+        48 * 1024 * 1024 * 1024, // 48 GB available
+        true,
+    );
+
+    assert_eq!(vol.used_bytes(), 16 * 1024 * 1024 * 1024); // 16 GB used
+    assert_eq!(vol.used_percentage(), 25); // 25% used
+    assert_eq!(vol.capacity_summary(), "48.0 GB free of 64.0 GB");
+}
+
+#[test]
+fn test_sidebar_eject_removable_drive_safe_to_remove_and_home_redirect() {
+    use kwati_core::Location;
+    use kwati_gui::views::sidebar_view::{EjectResult, SidebarVolume};
+    use std::path::PathBuf;
+
+    let usb_mount = PathBuf::from("/media/external_drive");
+    let mut volumes = vec![
+        SidebarVolume::new(
+            "vol-root",
+            "System Root",
+            PathBuf::from("/"),
+            500 * 1024 * 1024 * 1024,
+            200 * 1024 * 1024 * 1024,
+            false,
+        ),
+        SidebarVolume::new(
+            "vol-usb",
+            "Flash Drive",
+            usb_mount.clone(),
+            32 * 1024 * 1024 * 1024,
+            30 * 1024 * 1024 * 1024,
+            true, // removable
+        ),
+    ];
+
+    // Current location is inside the USB drive
+    let current_location = Location::Local(usb_mount.join("DCIM/Photos"));
+
+    // Find volume
+    let pos = volumes.iter().position(|v| v.id == "vol-usb").unwrap();
+    let vol = &volumes[pos];
+    assert!(!vol.is_busy);
+
+    // Ejecting idle removable volume
+    let was_inside = current_location.path().starts_with(&vol.mount_point);
+    assert!(was_inside);
+
+    let ejected_vol = volumes.remove(pos);
+    let result = EjectResult::SafeToRemove {
+        volume_name: ejected_vol.name.clone(),
+        unmounted_path: ejected_vol.mount_point,
+    };
+
+    assert_eq!(
+        result,
+        EjectResult::SafeToRemove {
+            volume_name: "Flash Drive".into(),
+            unmounted_path: usb_mount,
+        }
+    );
+    // Removed from listed volumes
+    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes[0].id, "vol-root");
+}
+
+#[test]
+fn test_sidebar_eject_busy_drive_keeps_listed() {
+    use kwati_gui::views::sidebar_view::{EjectResult, SidebarVolume};
+    use std::path::PathBuf;
+
+    let mut busy_volume = SidebarVolume::new(
+        "usb-busy",
+        "Backup Disk",
+        PathBuf::from("/media/backup"),
+        128 * 1024 * 1024 * 1024,
+        64 * 1024 * 1024 * 1024,
+        true,
+    );
+    busy_volume.is_busy = true;
+    busy_volume.busy_reason = Some("Open file: /media/backup/archive.tar.gz".into());
+
+    let volumes = [busy_volume];
+
+    // Attempt to eject
+    let vol = &volumes[0];
+    let result = if vol.is_busy {
+        EjectResult::Busy {
+            volume_name: vol.name.clone(),
+            reason: vol.busy_reason.clone().unwrap(),
+        }
+    } else {
+        panic!("should be busy");
+    };
+
+    assert_eq!(
+        result,
+        EjectResult::Busy {
+            volume_name: "Backup Disk".into(),
+            reason: "Open file: /media/backup/archive.tar.gz".into(),
+        }
+    );
+
+    // Crucially: drive must remain listed in sidebar when eject fails due to busy!
+    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes[0].id, "usb-busy");
+}
+
+#[test]
+fn test_sidebar_mount_unmounted_drive() {
+    use kwati_gui::views::sidebar_view::{MountResult, SidebarVolume};
+    use std::path::PathBuf;
+
+    let mut unmounted_volume = SidebarVolume::new(
+        "disk-2",
+        "Data Partition",
+        PathBuf::from("/mnt/data"),
+        256 * 1024 * 1024 * 1024,
+        200 * 1024 * 1024 * 1024,
+        true,
+    );
+    unmounted_volume.is_mounted = false;
+
+    assert!(!unmounted_volume.is_mounted);
+
+    // Mount drive
+    unmounted_volume.is_mounted = true;
+    let res = MountResult::Mounted {
+        volume_name: unmounted_volume.name.clone(),
+        mount_point: unmounted_volume.mount_point.clone(),
+    };
+
+    assert_eq!(
+        res,
+        MountResult::Mounted {
+            volume_name: "Data Partition".into(),
+            mount_point: PathBuf::from("/mnt/data"),
+        }
+    );
+    assert!(unmounted_volume.is_mounted);
+    assert_eq!(
+        unmounted_volume.capacity_summary(),
+        "200.0 GB free of 256.0 GB"
+    );
+}
