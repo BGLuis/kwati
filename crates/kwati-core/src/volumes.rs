@@ -180,9 +180,12 @@ impl VolumeManager {
     }
 }
 
-/// Returns the currently mounted volumes, excluding pseudo filesystems.
+/// Returns the currently mounted volumes, excluding pseudo filesystems. When the system's
+/// disk list cannot be read the result is empty, so a sidebar still renders.
 pub fn list_volumes() -> Vec<Volume> {
-    VolumeManager::new().volumes()
+    VolumeManager::try_new()
+        .map(|manager| manager.volumes())
+        .unwrap_or_default()
 }
 
 /// Alias for [`list_volumes`].
