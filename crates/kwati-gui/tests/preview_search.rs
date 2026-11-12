@@ -193,3 +193,153 @@ fn preview_replacement_and_navigation() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+use kwati_core::{SearchHit, SearchOptions, Searcher};
+
+#[test]
+fn search_recursive_ranking() {
+    let temp_dir = std::env::temp_dir().join("kwati_search_test_rank");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let readme = temp_dir.join("README.md");
+    let random = temp_dir.join("random.md");
+    fs::write(&readme, b"docs").unwrap();
+    fs::write(&random, b"other").unwrap();
+
+    let mut searcher = Searcher::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = searcher.search(&temp_dir, "rdm", SearchOptions::default(), move |hit| {
+        let _ = tx.send(hit);
+    });
+    handle.join();
+
+    let mut hits = Vec::new();
+    while let Ok(hit) = rx.try_recv() {
+        hits.push(hit);
+    }
+    hits.sort_by_key(|b| std::cmp::Reverse(b.score));
+
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].path, readme);
+    assert!(hits[0].score > hits[1].score);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn search_ignore_toggle_finds_ignored_file() {
+    let temp_dir = std::env::temp_dir().join("kwati_search_test_ignore");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let gitignore = temp_dir.join(".gitignore");
+    fs::write(&gitignore, b"ignored.txt\n").unwrap();
+    let ignored_file = temp_dir.join("ignored.txt");
+    fs::write(&ignored_file, b"secret").unwrap();
+    let regular_file = temp_dir.join("regular.txt");
+    fs::write(&regular_file, b"public").unwrap();
+
+    // 1. With respect_ignore = true (default)
+    let mut searcher = Searcher::new();
+    let (tx1, rx1) = std::sync::mpsc::channel();
+    let handle1 = searcher.search(
+        &temp_dir,
+        "txt",
+        SearchOptions {
+            respect_ignore: true,
+        },
+        move |hit| {
+            let _ = tx1.send(hit);
+        },
+    );
+    handle1.join();
+
+    let mut hits1 = Vec::new();
+    while let Ok(hit) = rx1.try_recv() {
+        hits1.push(hit);
+    }
+    assert_eq!(hits1.len(), 1);
+    assert_eq!(hits1[0].path, regular_file);
+
+    // 2. With respect_ignore = false (toggle OFF)
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    let handle2 = searcher.search(
+        &temp_dir,
+        "txt",
+        SearchOptions {
+            respect_ignore: false,
+        },
+        move |hit| {
+            let _ = tx2.send(hit);
+        },
+    );
+    handle2.join();
+
+    let mut hits2 = Vec::new();
+    while let Ok(hit) = rx2.try_recv() {
+        hits2.push(hit);
+    }
+    assert!(hits2.len() >= 2);
+    let paths: Vec<PathBuf> = hits2.into_iter().map(|h| h.path).collect();
+    assert!(paths.contains(&ignored_file));
+    assert!(paths.contains(&regular_file));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn search_navigation_and_jump_to_result() {
+    let temp_dir = std::env::temp_dir().join("kwati_search_test_jump");
+    let _ = fs::remove_dir_all(&temp_dir);
+    let nested_dir = temp_dir.join("sub").join("nested");
+    fs::create_dir_all(&nested_dir).unwrap();
+
+    let target_file = nested_dir.join("target.rs");
+    fs::write(&target_file, b"fn main() {}").unwrap();
+
+    let mut state = AppState::new(Location::Local(temp_dir.clone()));
+
+    // Simulate search hit
+    let hit = SearchHit {
+        path: target_file.clone(),
+        score: 100,
+    };
+
+    // Jumping to hit opens its folder and selects the file
+    let parent = hit.path.parent().unwrap().to_path_buf();
+    state.navigate_to(Location::Local(parent.clone()));
+    state
+        .selection
+        .select_only(Location::Local(hit.path.clone()));
+
+    assert_eq!(state.current_location, Location::Local(nested_dir.clone()));
+    assert_eq!(state.selection.len(), 1);
+    assert!(state
+        .selection
+        .contains(&Location::Local(target_file.clone())));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn search_cancellation_on_directory_change() {
+    let temp_dir = std::env::temp_dir().join("kwati_search_test_cancel");
+    let _ = fs::remove_dir_all(&temp_dir);
+    let dir_a = temp_dir.join("dir_a");
+    let dir_b = temp_dir.join("dir_b");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+
+    let file_a = dir_a.join("file_a.txt");
+    fs::write(&file_a, b"content").unwrap();
+
+    let mut searcher = Searcher::new();
+    let handle = searcher.search(&dir_a, "file", SearchOptions::default(), |_| {});
+
+    // Navigating to dir_b stops the running search
+    handle.stop();
+    handle.join();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
