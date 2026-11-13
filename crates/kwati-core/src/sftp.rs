@@ -54,6 +54,8 @@ pub struct HostKeyChanged {
     pub port: u16,
     /// The fingerprint of the key the server presented now.
     pub fingerprint: String,
+    /// The fingerprints recorded for this host and port, so the user can compare them.
+    pub stored: Vec<String>,
 }
 
 impl fmt::Display for HostKeyChanged {
@@ -124,6 +126,16 @@ impl KnownHosts {
         .map_err(keys_error)
     }
 
+    /// The `SHA256:` fingerprints of the keys recorded for `host` and `port`.
+    pub fn stored_fingerprints(&self, host: &str, port: u16) -> io::Result<Vec<String>> {
+        let keys =
+            keys::known_hosts::known_host_keys_path(host, port, &self.path).map_err(keys_error)?;
+        Ok(keys
+            .into_iter()
+            .map(|(_, key)| key.fingerprint(HashAlg::Sha256).to_string())
+            .collect())
+    }
+
     fn check(&self, host: &str, port: u16, key: &PublicKey) -> io::Result<Verdict> {
         match keys::check_known_hosts_path(host, port, key, &self.path) {
             Ok(true) => Ok(Verdict::Trusted),
@@ -192,6 +204,7 @@ impl HostKeyHandler {
             Verdict::Changed => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 HostKeyChanged {
+                    stored: self.known_hosts.stored_fingerprints(&host, port)?,
                     host,
                     port,
                     fingerprint,
@@ -704,6 +717,19 @@ mod tests {
     }
 
     #[test]
+    fn stored_fingerprints_list_the_keys_recorded_for_the_host() {
+        let file = TempFile::new();
+        let known = KnownHosts::new(&file.0);
+        assert!(known.stored_fingerprints("h", 22).unwrap().is_empty());
+        known.trust(&unknown("h", 22, key(KEY_A))).unwrap();
+        known.trust(&unknown("other", 22, key(KEY_B))).unwrap();
+        assert_eq!(
+            known.stored_fingerprints("h", 22).unwrap(),
+            [key(KEY_A).fingerprint(HashAlg::Sha256).to_string()]
+        );
+    }
+
+    #[test]
     fn host_key_errors_are_found_through_backend_error() {
         let k = key(KEY_A);
         let unknown_err: BackendError =
@@ -718,6 +744,7 @@ mod tests {
             host: "h".into(),
             port: 22,
             fingerprint: "SHA256:x".into(),
+            stored: vec!["SHA256:y".into()],
         };
         let changed_err: BackendError =
             io::Error::new(io::ErrorKind::PermissionDenied, changed.clone()).into();
