@@ -1,14 +1,33 @@
-//! Remote sync and network actions (owned by guinet-worker for #50, #52).
+//! Remote sync, auto-refresh polling, and network actions (#50, #52).
 //!
-//! Provides remote directory auto-refresh poller controller, window focus pause/resume,
-//! selection retention across refreshes, and remote search depth/cancellation management.
+//! Wires [`RemoteSyncController`] and [`RemotePollerHost`] to [`kwati_core::RemotePoller`]
+//! for automatic remote directory refreshing, pauses polling immediately when the window
+//! loses focus, and preserves selection by [`Location`].
+//!
+//! ## MainView integration (`views/mod.rs`)
+//! - Instantiate [`RemotePollerHost`] in `MainView::new` as `Entity<RemotePollerHost>`:
+//!   `let remote_sync = cx.new(|cx| RemotePollerHost::new(app_state.clone(), cx));`
+//! - Forward window focus changes via `cx.observe_window_activation(window, ...)`:
+//!   `this.remote_sync.update(cx, |host, cx| host.on_window_activation(window.is_window_active(), cx));`
+//! - `RemotePollerHost` observes `AppState` automatically for location, settings, and
+//!   connection changes; `MainView` may also call [`RemotePollerHost::on_location_changed`]
+//!   or [`RemotePollerHost::on_settings_changed`] explicitly when needed.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, RwLock, Weak};
+use std::time::{Duration, Instant};
 
-use gpui::actions;
-use kwati_core::{Entry, Selection};
+use futures::channel::mpsc;
+use futures::StreamExt;
+use gpui::{actions, Context, Entity, Subscription, Task};
+use kwati_core::{Backend, ConnectionState, Entry, Location, RemotePoller, Selection, Settings};
+
+pub use kwati_core::{
+    DEFAULT_REMOTE_POLL_INTERVAL_SECS, DEFAULT_REMOTE_SEARCH_DEPTH, DEFAULT_REMOTE_SEARCH_PARALLEL,
+    MIN_REMOTE_POLL_INTERVAL_SECS,
+};
+
+use crate::state::{entry_location, AppState};
 
 actions!(
     remote_sync,
@@ -22,9 +41,6 @@ actions!(
     ]
 );
 
-pub const DEFAULT_REMOTE_POLL_INTERVAL_SECS: u32 = 30;
-pub const MIN_REMOTE_POLL_INTERVAL_SECS: u32 = 10;
-
 /// Status of the remote folder poller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemotePollingState {
@@ -32,6 +48,24 @@ pub enum RemotePollingState {
     Active,
     Polling,
     PausedUnfocused,
+}
+
+#[derive(Clone)]
+struct PollerKey {
+    location: Location,
+    interval: Duration,
+    backend: Weak<dyn Backend>,
+}
+
+impl PollerKey {
+    fn matches(&self, location: &Location, interval: Duration, backend: &Arc<dyn Backend>) -> bool {
+        self.location == *location
+            && self.interval == interval
+            && self
+                .backend
+                .upgrade()
+                .is_some_and(|existing| Arc::ptr_eq(&existing, backend))
+    }
 }
 
 /// Controller for remote folder synchronization, auto-refresh, and background polling.
@@ -42,6 +76,9 @@ pub struct RemoteSyncController {
     pub polling_state: RemotePollingState,
     pub last_poll_time: Option<Instant>,
     paused_flag: Arc<AtomicBool>,
+    poller: Option<RemotePoller>,
+    poller_key: Option<PollerKey>,
+    poll_duration_override: Option<Duration>,
 }
 
 impl Default for RemoteSyncController {
@@ -59,7 +96,31 @@ impl RemoteSyncController {
             polling_state: RemotePollingState::Disabled,
             last_poll_time: None,
             paused_flag: Arc::new(AtomicBool::new(false)),
+            poller: None,
+            poller_key: None,
+            poll_duration_override: None,
         }
+    }
+
+    /// Synchronizes enabled flag and interval from `settings`.
+    pub fn sync_from_settings(&mut self, settings: &Settings) {
+        if settings.remote_poll_enabled {
+            self.enable_auto_refresh(settings.remote_poll_interval_secs);
+        } else {
+            self.set_poll_interval(settings.remote_poll_interval_secs);
+            self.disable_auto_refresh();
+        }
+    }
+
+    /// Returns the effective poll interval duration (respecting any test duration override).
+    pub fn effective_poll_duration(&self) -> Duration {
+        self.poll_duration_override
+            .unwrap_or_else(|| Duration::from_secs(u64::from(self.poll_interval_secs)))
+    }
+
+    #[doc(hidden)]
+    pub fn set_poll_duration_override(&mut self, duration: Option<Duration>) {
+        self.poll_duration_override = duration;
     }
 
     /// Enables automatic background refreshing of the open remote folder.
@@ -69,17 +130,24 @@ impl RemoteSyncController {
         if self.is_window_focused {
             self.polling_state = RemotePollingState::Active;
             self.paused_flag.store(false, Ordering::SeqCst);
+            if let Some(poller) = &self.poller {
+                poller.resume();
+            }
         } else {
             self.polling_state = RemotePollingState::PausedUnfocused;
             self.paused_flag.store(true, Ordering::SeqCst);
+            if let Some(poller) = &self.poller {
+                poller.pause();
+            }
         }
     }
 
-    /// Disables automatic refreshing.
+    /// Disables automatic refreshing and stops any running [`RemotePoller`].
     pub fn disable_auto_refresh(&mut self) {
         self.auto_refresh_enabled = false;
         self.polling_state = RemotePollingState::Disabled;
         self.paused_flag.store(true, Ordering::SeqCst);
+        self.stop_poller();
     }
 
     /// Toggles automatic refreshing on or off.
@@ -102,15 +170,24 @@ impl RemoteSyncController {
         self.is_window_focused = focused;
         if !self.auto_refresh_enabled {
             self.polling_state = RemotePollingState::Disabled;
+            if let Some(poller) = &self.poller {
+                poller.pause();
+            }
             return;
         }
 
         if focused {
             self.polling_state = RemotePollingState::Active;
             self.paused_flag.store(false, Ordering::SeqCst);
+            if let Some(poller) = &self.poller {
+                poller.resume();
+            }
         } else {
             self.polling_state = RemotePollingState::PausedUnfocused;
             self.paused_flag.store(true, Ordering::SeqCst);
+            if let Some(poller) = &self.poller {
+                poller.pause();
+            }
         }
     }
 
@@ -150,6 +227,83 @@ impl RemoteSyncController {
         Arc::clone(&self.paused_flag)
     }
 
+    /// Stops and drops the active [`RemotePoller`], if any.
+    pub fn stop_poller(&mut self) {
+        if let Some(mut poller) = self.poller.take() {
+            poller.stop();
+        }
+        self.poller_key = None;
+    }
+
+    /// Returns whether a background [`RemotePoller`] instance is currently attached.
+    pub fn has_poller(&self) -> bool {
+        self.poller.is_some()
+    }
+
+    /// Returns whether an attached [`RemotePoller`] is currently paused.
+    pub fn is_poller_paused(&self) -> bool {
+        self.poller.as_ref().is_some_and(RemotePoller::is_paused)
+    }
+
+    /// Synchronizes the live [`RemotePoller`] with the given location, backend, and connection
+    /// state (used directly in synchronous/headless setups; [`RemotePollerHost`] runs creation
+    /// on the GPUI background executor).
+    pub fn sync_poller<F, M>(
+        &mut self,
+        location: &Location,
+        backend: Option<Arc<dyn Backend>>,
+        connection_state: Option<ConnectionState>,
+        make_on_change: M,
+    ) where
+        M: FnOnce() -> F,
+        F: FnMut() + Send + 'static,
+    {
+        let Some(backend) = (match location {
+            Location::Remote { .. } if self.auto_refresh_enabled => backend,
+            _ => None,
+        }) else {
+            self.stop_poller();
+            return;
+        };
+
+        let interval = self.effective_poll_duration();
+        let conn_state = connection_state.unwrap_or(ConnectionState::Connected);
+
+        if let (Some(poller), Some(key)) = (&self.poller, &self.poller_key) {
+            if key.matches(location, interval, &backend) {
+                poller.set_connection_state(conn_state);
+                if self.is_window_focused {
+                    poller.resume();
+                } else {
+                    poller.pause();
+                }
+                return;
+            }
+        }
+
+        self.stop_poller();
+
+        // Do not start a new poller (which fetches a baseline listing) while unfocused or
+        // disconnected, so zero requests reach the server.
+        if !self.is_window_focused || conn_state == ConnectionState::Disconnected {
+            return;
+        }
+
+        let poller = RemotePoller::with_connection_state(
+            backend.clone(),
+            location.clone(),
+            interval,
+            Arc::new(RwLock::new(conn_state)),
+            make_on_change(),
+        );
+        self.poller = Some(poller);
+        self.poller_key = Some(PollerKey {
+            location: location.clone(),
+            interval,
+            backend: Arc::downgrade(&backend),
+        });
+    }
+
     /// Human-readable indicator string for status bar or remote banner.
     pub fn status_indicator(&self) -> String {
         match self.polling_state {
@@ -164,29 +318,264 @@ impl RemoteSyncController {
         }
     }
 
-    /// Preserves user selection across directory listing refreshes.
-    /// Only selected items that still exist in `new_entries` are retained.
+    /// Preserves user selection across local directory listing refreshes.
     pub fn retain_selection(selection: &mut Selection, new_entries: &[Entry]) {
         selection.retain_existing(new_entries);
     }
+
+    /// Preserves user selection across local or remote directory refreshes by mapping each
+    /// entry through `current_location` (`Location::Local` or `Location::Remote`).
+    pub fn retain_selection_for_location(
+        selection: &mut Selection,
+        current_location: &Location,
+        new_entries: &[Entry],
+    ) {
+        let locations: Vec<Location> = new_entries
+            .iter()
+            .map(|entry| entry_location(current_location, entry))
+            .collect();
+        selection.reload_locations(&locations);
+    }
+
+    /// Refreshes `state` while preserving existing selection by `Location`.
+    pub fn refresh_preserving_selection(state: &mut AppState) {
+        let previously_selected = state.selected_locations();
+        state.reload_entries();
+        if state.selected_locations().is_empty() && !previously_selected.is_empty() {
+            for loc in previously_selected {
+                if state
+                    .entries
+                    .iter()
+                    .any(|entry| state.location_of(entry) == loc)
+                {
+                    state.toggle_select_location(loc);
+                }
+            }
+        }
+    }
 }
 
-pub const DEFAULT_REMOTE_SEARCH_DEPTH: usize = 3;
-pub const DEFAULT_PARALLEL_REQUESTS: usize = 4;
+/// GPUI host that wires [`RemoteSyncController`] and [`kwati_core::RemotePoller`] to
+/// [`AppState`], reacting to location, settings, connection, and window-focus changes.
+pub struct RemotePollerHost {
+    pub app_state: Entity<AppState>,
+    pub controller: RemoteSyncController,
+    change_tx: mpsc::UnboundedSender<()>,
+    target_key: Option<PollerKey>,
+    poller_generation: u64,
+    spawn_task: Option<Task<()>>,
+    _state_sub: Subscription,
+    _poll_task: Task<()>,
+}
+
+impl RemotePollerHost {
+    /// Creates a host bound to `app_state` and starts observing settings, location, and
+    /// remote connection changes.
+    pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let (change_tx, mut change_rx) = mpsc::unbounded::<()>();
+
+        let poll_task = cx.spawn(async move |this, cx| {
+            while change_rx.next().await.is_some() {
+                let updated = this.update(cx, |host, cx| {
+                    if !host.controller.can_poll() {
+                        return;
+                    }
+                    host.controller.start_poll();
+                    host.app_state.update(cx, |state, cx| {
+                        RemoteSyncController::refresh_preserving_selection(state);
+                        cx.notify();
+                    });
+                    host.controller.finish_poll();
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let state_sub = cx.observe(&app_state, |this, _app_state, cx| {
+            this.sync_with_state(cx);
+        });
+
+        let mut host = Self {
+            app_state,
+            controller: RemoteSyncController::new(),
+            change_tx,
+            target_key: None,
+            poller_generation: 0,
+            spawn_task: None,
+            _state_sub: state_sub,
+            _poll_task: poll_task,
+        };
+        host.sync_with_state(cx);
+        host
+    }
+
+    /// Call from `MainView` (`cx.observe_window_activation`) when the window gains or loses
+    /// focus. Immediately pauses polling while unfocused so zero listing requests are sent.
+    pub fn on_window_activation(&mut self, focused: bool, cx: &mut Context<Self>) {
+        self.controller.set_window_focused(focused);
+        self.sync_with_state(cx);
+        cx.notify();
+    }
+
+    /// Call from `MainView` if location changed outside an observed `AppState` update.
+    pub fn on_location_changed(&mut self, cx: &mut Context<Self>) {
+        self.sync_with_state(cx);
+    }
+
+    /// Call from `MainView` when polling settings change.
+    pub fn on_settings_changed(&mut self, cx: &mut Context<Self>) {
+        self.sync_with_state(cx);
+    }
+
+    /// Overrides the poll interval duration for headless/integration tests so tests can run
+    /// with sub-second intervals instead of waiting `MIN_REMOTE_POLL_INTERVAL_SECS` (10s).
+    #[doc(hidden)]
+    pub fn set_poll_duration_override(
+        &mut self,
+        duration: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) {
+        self.controller.set_poll_duration_override(duration);
+        self.sync_with_state(cx);
+    }
+
+    /// Reconciles the active [`RemotePoller`] with `AppState` (`settings`, `current_location`,
+    /// `current_backend`, `remote_state`) and current window focus.
+    pub fn sync_with_state(&mut self, cx: &mut Context<Self>) {
+        let (settings, location, backend, conn_state) = {
+            let state = self.app_state.read(cx);
+            (
+                state.settings.clone(),
+                state.current_location().clone(),
+                state.current_backend(),
+                state.remote_state(),
+            )
+        };
+
+        self.controller.sync_from_settings(&settings);
+
+        let Some(backend) = (match &location {
+            Location::Remote { .. } if self.controller.auto_refresh_enabled => backend,
+            _ => None,
+        }) else {
+            self.stop_active_poller();
+            cx.notify();
+            return;
+        };
+
+        let interval = self.controller.effective_poll_duration();
+        let conn_state = conn_state.unwrap_or(ConnectionState::Connected);
+
+        if let Some(key) = &self.target_key {
+            if key.matches(&location, interval, &backend) {
+                if let Some(poller) = &self.controller.poller {
+                    poller.set_connection_state(conn_state);
+                    if self.controller.is_window_focused {
+                        poller.resume();
+                    } else {
+                        poller.pause();
+                    }
+                }
+                cx.notify();
+                return;
+            }
+        }
+
+        self.stop_active_poller();
+
+        if !self.controller.is_window_focused || conn_state == ConnectionState::Disconnected {
+            cx.notify();
+            return;
+        }
+
+        self.poller_generation = self.poller_generation.wrapping_add(1);
+        let generation = self.poller_generation;
+        self.target_key = Some(PollerKey {
+            location: location.clone(),
+            interval,
+            backend: Arc::downgrade(&backend),
+        });
+
+        let tx = self.change_tx.clone();
+        let bg = cx.background_executor().clone();
+        self.spawn_task = Some(cx.spawn(async move |this, cx| {
+            let poller = bg
+                .spawn(async move {
+                    RemotePoller::with_connection_state(
+                        backend,
+                        location,
+                        interval,
+                        Arc::new(RwLock::new(conn_state)),
+                        move || {
+                            let _ = tx.unbounded_send(());
+                        },
+                    )
+                })
+                .await;
+
+            let _ = this.update(cx, |host, cx| {
+                if host.poller_generation != generation || !host.controller.auto_refresh_enabled {
+                    drop(poller);
+                    return;
+                }
+                if !host.controller.is_window_focused {
+                    poller.pause();
+                }
+                host.controller.poller = Some(poller);
+                host.controller.poller_key = host.target_key.clone();
+                host.spawn_task = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn stop_active_poller(&mut self) {
+        self.poller_generation = self.poller_generation.wrapping_add(1);
+        self.spawn_task = None;
+        self.target_key = None;
+        self.controller.stop_poller();
+    }
+
+    /// Human-readable indicator for the status bar or network banner.
+    pub fn status_indicator(&self) -> String {
+        self.controller.status_indicator()
+    }
+
+    /// Current polling state.
+    pub fn polling_state(&self) -> RemotePollingState {
+        self.controller.polling_state
+    }
+
+    /// Returns whether a [`RemotePoller`] is currently attached.
+    pub fn has_poller(&self) -> bool {
+        self.controller.has_poller()
+    }
+
+    /// Returns whether the attached [`RemotePoller`] is paused.
+    pub fn is_poller_paused(&self) -> bool {
+        self.controller.is_poller_paused()
+    }
+}
+
+pub const DEFAULT_PARALLEL_REQUESTS: usize = DEFAULT_REMOTE_SEARCH_PARALLEL as usize;
 
 /// A search hit found in a remote filesystem hierarchy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSearchMatch {
     pub name: String,
     pub path: std::path::PathBuf,
-    pub depth: usize,
+    pub depth: u32,
     pub is_dir: bool,
 }
 
 /// Configuration options for remote searches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSearchOptions {
-    pub depth_limit: usize,
+    pub depth_limit: u32,
     pub parallel_requests: usize,
 }
 
@@ -233,7 +622,7 @@ impl RemoteSearchController {
     }
 
     /// Sets the maximum recursive depth limit for remote searching.
-    pub fn set_depth_limit(&mut self, depth: usize) {
+    pub fn set_depth_limit(&mut self, depth: u32) {
         self.options.depth_limit = depth;
     }
 
@@ -280,7 +669,7 @@ impl RemoteSearchController {
     /// Halts immediately when `cancel()` is triggered.
     pub fn stream_search_items<F>(
         &mut self,
-        items: &[(std::path::PathBuf, String, usize, bool)],
+        items: &[(std::path::PathBuf, String, u32, bool)],
         query: &str,
         mut on_stream_hit: F,
     ) where
@@ -290,18 +679,15 @@ impl RemoteSearchController {
         let query_lower = query.to_lowercase();
 
         for (path, name, depth, is_dir) in items {
-            // Check cancellation before processing next item
             if self.is_cancelled() {
                 self.is_searching = false;
                 break;
             }
 
-            // Exclude items deeper than configured depth limit
             if *depth > self.options.depth_limit {
                 continue;
             }
 
-            // Match query
             if name.to_lowercase().contains(&query_lower) {
                 let match_item = RemoteSearchMatch {
                     name: name.clone(),
@@ -320,7 +706,7 @@ impl RemoteSearchController {
     /// Filters a collection of remote matches by depth limit.
     pub fn filter_by_depth(
         matches: &[RemoteSearchMatch],
-        depth_limit: usize,
+        depth_limit: u32,
     ) -> Vec<RemoteSearchMatch> {
         matches
             .iter()
