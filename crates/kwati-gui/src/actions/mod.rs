@@ -21,6 +21,7 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("down", navigation::SelectNext, None),
         KeyBinding::new("up", navigation::SelectPrevious, None),
         KeyBinding::new("f5", navigation::Refresh, None),
+        KeyBinding::new("alt-p", navigation::TogglePreview, None),
         // File operations
         KeyBinding::new("ctrl-c", operations::Copy, None),
         KeyBinding::new("cmd-c", operations::Copy, None),

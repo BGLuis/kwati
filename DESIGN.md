@@ -130,7 +130,15 @@ sentence and, where it helps, one action.
   fixed-width mono columns. Hover uses `surface-raised`, selection uses
   `selection`, and the focused row carries the focus ring.
 - **Sidebar:** `surface-raised` background, `label` section titles, the active
-  place marked with `selection`.
+  place marked with `selection`. Dragged near the window edge, or when the
+  window is too narrow, it collapses to icons that name themselves in a
+  tooltip.
+- **Panes:** the sidebar and preview resize by dragging their inner edge. The
+  preview closes and opens from the toolbar button or Alt+P, or closes when its
+  edge is dragged near the window edge; it reopens at its last width. When
+  the window narrows, the file list keeps at least 480 px: the preview narrows
+  first, then the sidebar, then the sidebar collapses to icons, and only then
+  the preview hides.
 - **Path bar:** mono text; segments are clickable and the whole bar turns into
   a text input on click or shortcut.
 - **Buttons:** one primary button per dialog (`accent` fill, `on-accent`
