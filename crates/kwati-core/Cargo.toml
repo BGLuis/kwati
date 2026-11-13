@@ -18,7 +18,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 rustls-native-certs = "0.8.5"
 smb = { version = "=0.12.1", default-features = false, features = ["multi_threaded", "sign", "encrypt"] }
 serde = { version = "1.0.229", features = ["derive"] }
-suppaftp = { version = "12.2.1", default-features = false, features = ["rustls-ring"] }
+suppaftp = { version = "12.2.1", default-features = false, features = ["rustls-ring", "deprecated"] }
 sysinfo = "0.40.3"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "io-util"] }
 toml = "1.2.1"
