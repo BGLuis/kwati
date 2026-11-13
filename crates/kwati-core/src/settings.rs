@@ -11,6 +11,8 @@ pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 5;
 pub const DEFAULT_LIST_TIMEOUT_SECS: u32 = 10;
 pub const DEFAULT_REMOTE_POLL_INTERVAL_SECS: u32 = 30;
 pub const MIN_REMOTE_POLL_INTERVAL_SECS: u32 = 10;
+pub const DEFAULT_REMOTE_SEARCH_DEPTH: u32 = 3;
+pub const DEFAULT_REMOTE_SEARCH_PARALLEL: u32 = 2;
 
 /// A value in the settings file that was ignored in favour of its default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,10 @@ pub struct Settings {
     pub list_timeout_secs: u32,
     pub remote_poll_enabled: bool,
     pub remote_poll_interval_secs: u32,
+    /// Folder levels a remote search lists (see `RemoteSearchOptions::max_depth`); at least 1.
+    pub remote_search_depth: u32,
+    /// Listing requests a remote search may have in flight at once; at least 1.
+    pub remote_search_parallel: u32,
     pub bookmarks: Vec<Bookmark>,
     /// Keys this version does not know, kept so a newer version's file survives a save.
     unknown: Table,
@@ -41,6 +47,8 @@ impl Default for Settings {
             list_timeout_secs: DEFAULT_LIST_TIMEOUT_SECS,
             remote_poll_enabled: false,
             remote_poll_interval_secs: DEFAULT_REMOTE_POLL_INTERVAL_SECS,
+            remote_search_depth: DEFAULT_REMOTE_SEARCH_DEPTH,
+            remote_search_parallel: DEFAULT_REMOTE_SEARCH_PARALLEL,
             bookmarks: Vec::new(),
             unknown: Table::new(),
         }
@@ -70,6 +78,25 @@ fn take_u32_or_default(
             });
             default
         }
+    }
+}
+
+/// Like [`take_u32_or_default`], but 0 is also rejected.
+fn take_positive_or_default(
+    table: &mut Table,
+    key: &'static str,
+    default: u32,
+    warnings: &mut Vec<SettingsWarning>,
+) -> u32 {
+    match take_u32_or_default(table, key, default, warnings) {
+        0 => {
+            warnings.push(SettingsWarning {
+                key,
+                message: "must be at least 1".into(),
+            });
+            default
+        }
+        value => value,
     }
 }
 
@@ -186,6 +213,19 @@ impl Settings {
             raw_remote_poll_interval
         };
 
+        let remote_search_depth = take_positive_or_default(
+            &mut table,
+            "remote_search_depth",
+            defaults.remote_search_depth,
+            &mut warnings,
+        );
+        let remote_search_parallel = take_positive_or_default(
+            &mut table,
+            "remote_search_parallel",
+            defaults.remote_search_parallel,
+            &mut warnings,
+        );
+
         let mut bookmarks = Vec::new();
         if let Some(val) = table.remove("bookmarks") {
             match val {
@@ -234,6 +274,8 @@ impl Settings {
             list_timeout_secs,
             remote_poll_enabled,
             remote_poll_interval_secs,
+            remote_search_depth,
+            remote_search_parallel,
             bookmarks,
             unknown: table,
         };
@@ -322,6 +364,14 @@ impl Settings {
             "remote_poll_interval_secs".into(),
             Value::Integer(self.remote_poll_interval_secs.into()),
         );
+        table.insert(
+            "remote_search_depth".into(),
+            Value::Integer(self.remote_search_depth.into()),
+        );
+        table.insert(
+            "remote_search_parallel".into(),
+            Value::Integer(self.remote_search_parallel.into()),
+        );
         let bookmark_tables: Vec<Value> = self
             .bookmarks
             .iter()
@@ -396,6 +446,47 @@ mod tests {
         assert_eq!(settings.version, 7);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].key, "refresh_interval_secs");
+    }
+
+    #[test]
+    fn settings_remote_search_limits() {
+        let dir = TestDir::new("settings_remote_search_limits");
+        let path = dir.path.join("settings.toml");
+        let defaults = Settings::default();
+        assert_eq!(
+            (
+                defaults.remote_search_depth,
+                defaults.remote_search_parallel
+            ),
+            (3, 2)
+        );
+
+        let mut settings = defaults;
+        settings.remote_search_depth = 5;
+        settings.remote_search_parallel = 4;
+        settings.save_to(&path).unwrap();
+        let (saved, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            (saved.remote_search_depth, saved.remote_search_parallel),
+            (5, 4)
+        );
+
+        fs::write(
+            &path,
+            "remote_search_depth = 0\nremote_search_parallel = 0\n",
+        )
+        .unwrap();
+        let (settings, warnings) = Settings::load_from(&path).unwrap();
+        assert_eq!(
+            (
+                settings.remote_search_depth,
+                settings.remote_search_parallel
+            ),
+            (DEFAULT_REMOTE_SEARCH_DEPTH, DEFAULT_REMOTE_SEARCH_PARALLEL),
+            "0 would search nothing or never send a request"
+        );
+        assert_eq!(warnings.len(), 2);
     }
 
     #[test]
