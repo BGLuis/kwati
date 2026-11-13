@@ -2,8 +2,10 @@
 //!
 //! Shows network status, timeouts, cancellation, and retry actions when browsing network shares.
 
-use gpui::{div, prelude::*, px, Context, Entity, MouseButton, MouseDownEvent, Window};
-use kwati_core::{volume_kind, Location, VolumeKind};
+use gpui::{
+    div, prelude::*, px, Context, Entity, MouseButton, MouseDownEvent, Subscription, Window,
+};
+use kwati_core::{volume_kind, ConnectionState, Location, VolumeKind};
 
 use crate::components::{icon, IconName};
 use crate::state::{AppState, NetworkMountStatus};
@@ -28,14 +30,26 @@ pub fn is_network_location(location: &Location) -> bool {
 pub struct NetworkView {
     pub app_state: Entity<AppState>,
     pub timeout_secs: u32,
+    _state_sub: Subscription,
 }
 
 impl NetworkView {
-    pub fn new(app_state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let timeout_secs = app_state.read(cx).list_timeout().as_secs().max(1) as u32;
+        let state_sub = cx.observe(&app_state, |this, app_state, cx| {
+            this.timeout_secs = app_state.read(cx).list_timeout().as_secs().max(1) as u32;
+            cx.notify();
+        });
         Self {
             app_state,
-            timeout_secs: DEFAULT_NETWORK_TIMEOUT_SECS,
+            timeout_secs,
+            _state_sub: state_sub,
         }
+    }
+
+    /// Returns the effective listing timeout in seconds from `AppState`.
+    pub fn effective_timeout_secs(&self, state: &AppState) -> u32 {
+        state.list_timeout().as_secs().max(1) as u32
     }
 
     /// Updates the configured network timeout in seconds (without requiring a restart).
@@ -51,8 +65,13 @@ impl NetworkView {
     /// Triggers a retry of the network mount connection or read.
     pub fn retry(&mut self, cx: &mut Context<Self>) {
         self.app_state.update(cx, |state, _cx| {
-            state.network_status = NetworkMountStatus::Connecting;
-            state.set_status("Retrying network connection...");
+            if state.is_remote()
+                && !matches!(state.remote_state(), Some(ConnectionState::Connected))
+            {
+                state.reconnect_current();
+            } else {
+                state.refresh_current();
+            }
         });
         cx.notify();
     }
@@ -60,7 +79,8 @@ impl NetworkView {
     /// Cancels an in-progress or timed-out network operation.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         self.app_state.update(cx, |state, _cx| {
-            state.network_status = NetworkMountStatus::Disconnected;
+            state.cancel_connect();
+            state.cancel_load();
             state.set_status("Network operation cancelled");
         });
         cx.notify();
@@ -102,10 +122,15 @@ impl NetworkView {
 impl Render for NetworkView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
-        let (status, current_loc) = {
+        let (status, current_loc, timeout_secs) = {
             let state = self.app_state.read(cx);
-            (state.network_status, state.current_location.clone())
+            (
+                state.network_status,
+                state.current_location.clone(),
+                self.effective_timeout_secs(state),
+            )
         };
+        self.timeout_secs = timeout_secs;
 
         let is_network = is_network_location(&current_loc);
 

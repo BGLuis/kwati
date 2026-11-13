@@ -5,14 +5,25 @@ use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
 use crate::places::Bookmark;
+use crate::{SortColumn, SortDirection, SortOrder};
 
 pub const CURRENT_VERSION: u32 = 1;
+pub const DEFAULT_SHOW_HIDDEN: bool = false;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 5;
+pub const MIN_REFRESH_INTERVAL_SECS: u32 = 1;
+pub const MAX_REFRESH_INTERVAL_SECS: u32 = 3600;
 pub const DEFAULT_LIST_TIMEOUT_SECS: u32 = 10;
+pub const MIN_LIST_TIMEOUT_SECS: u32 = 1;
+pub const MAX_LIST_TIMEOUT_SECS: u32 = 3600;
 pub const DEFAULT_REMOTE_POLL_INTERVAL_SECS: u32 = 30;
 pub const MIN_REMOTE_POLL_INTERVAL_SECS: u32 = 10;
+pub const MAX_REMOTE_POLL_INTERVAL_SECS: u32 = 3600;
 pub const DEFAULT_REMOTE_SEARCH_DEPTH: u32 = 3;
+pub const MIN_REMOTE_SEARCH_DEPTH: u32 = 1;
+pub const MAX_REMOTE_SEARCH_DEPTH: u32 = 64;
 pub const DEFAULT_REMOTE_SEARCH_PARALLEL: u32 = 2;
+pub const MIN_REMOTE_SEARCH_PARALLEL: u32 = 1;
+pub const MAX_REMOTE_SEARCH_PARALLEL: u32 = 32;
 
 /// A value in the settings file that was ignored in favour of its default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +36,8 @@ pub struct SettingsWarning {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub version: u32,
+    pub show_hidden: bool,
+    pub default_sort: SortOrder,
     pub refresh_interval_secs: u32,
     /// Seconds a directory listing may take before it is abandoned (see `list_dir_bounded`).
     pub list_timeout_secs: u32,
@@ -43,6 +56,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             version: CURRENT_VERSION,
+            show_hidden: DEFAULT_SHOW_HIDDEN,
+            default_sort: SortOrder::default(),
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
             list_timeout_secs: DEFAULT_LIST_TIMEOUT_SECS,
             remote_poll_enabled: false,
@@ -81,25 +96,6 @@ fn take_u32_or_default(
     }
 }
 
-/// Like [`take_u32_or_default`], but 0 is also rejected.
-fn take_positive_or_default(
-    table: &mut Table,
-    key: &'static str,
-    default: u32,
-    warnings: &mut Vec<SettingsWarning>,
-) -> u32 {
-    match take_u32_or_default(table, key, default, warnings) {
-        0 => {
-            warnings.push(SettingsWarning {
-                key,
-                message: "must be at least 1".into(),
-            });
-            default
-        }
-        value => value,
-    }
-}
-
 fn take_bool_or_default(
     table: &mut Table,
     key: &'static str,
@@ -119,6 +115,131 @@ fn take_bool_or_default(
             default
         }
     }
+}
+
+fn take_bounded_u32_or_default(
+    table: &mut Table,
+    key: &'static str,
+    min: u32,
+    max: u32,
+    default: u32,
+    warnings: &mut Vec<SettingsWarning>,
+) -> u32 {
+    let Some(value) = table.remove(key) else {
+        return default;
+    };
+    let parsed: u32 = match value.try_into() {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warnings.push(SettingsWarning {
+                key,
+                message: err.to_string(),
+            });
+            return default;
+        }
+    };
+    if parsed < min || parsed > max {
+        warnings.push(SettingsWarning {
+            key,
+            message: format!("value ({parsed}) must be between {min} and {max}"),
+        });
+        default
+    } else {
+        parsed
+    }
+}
+
+fn parse_sort_column(raw: &str) -> Option<SortColumn> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "name" => Some(SortColumn::Name),
+        "size" => Some(SortColumn::Size),
+        "date" => Some(SortColumn::Date),
+        _ => None,
+    }
+}
+
+fn parse_sort_direction(raw: &str) -> Option<SortDirection> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ascending" | "asc" => Some(SortDirection::Ascending),
+        "descending" | "desc" => Some(SortDirection::Descending),
+        _ => None,
+    }
+}
+
+fn sort_column_str(column: SortColumn) -> &'static str {
+    match column {
+        SortColumn::Name => "name",
+        SortColumn::Size => "size",
+        SortColumn::Date => "date",
+    }
+}
+
+fn sort_direction_str(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::Ascending => "ascending",
+        SortDirection::Descending => "descending",
+    }
+}
+
+fn take_default_sort_or_default(
+    table: &mut Table,
+    default: SortOrder,
+    warnings: &mut Vec<SettingsWarning>,
+) -> SortOrder {
+    let Some(value) = table.remove("default_sort") else {
+        return default;
+    };
+    let Value::Table(mut sort_table) = value else {
+        warnings.push(SettingsWarning {
+            key: "default_sort",
+            message: "default_sort must be a table".into(),
+        });
+        return default;
+    };
+
+    let column = match sort_table.remove("column") {
+        None => default.column,
+        Some(Value::String(raw)) => match parse_sort_column(&raw) {
+            Some(col) => col,
+            None => {
+                warnings.push(SettingsWarning {
+                    key: "default_sort",
+                    message: format!("unknown sort column '{raw}'"),
+                });
+                default.column
+            }
+        },
+        Some(_) => {
+            warnings.push(SettingsWarning {
+                key: "default_sort",
+                message: "default_sort.column must be a string".into(),
+            });
+            default.column
+        }
+    };
+
+    let direction = match sort_table.remove("direction") {
+        None => default.direction,
+        Some(Value::String(raw)) => match parse_sort_direction(&raw) {
+            Some(dir) => dir,
+            None => {
+                warnings.push(SettingsWarning {
+                    key: "default_sort",
+                    message: format!("unknown sort direction '{raw}'"),
+                });
+                default.direction
+            }
+        },
+        Some(_) => {
+            warnings.push(SettingsWarning {
+                key: "default_sort",
+                message: "default_sort.direction must be a string".into(),
+            });
+            default.direction
+        }
+    };
+
+    SortOrder::new(column, direction)
 }
 
 /// Writes `text` to a temporary file beside `path`, then renames it over `path`.
@@ -148,14 +269,81 @@ pub(crate) fn write_atomic(
 }
 
 impl Settings {
-    /// Sets the remote polling interval in seconds. Rejects values below [`MIN_REMOTE_POLL_INTERVAL_SECS`].
+    /// Sets the local/mount refresh interval in seconds (`1..=3600`).
+    pub fn set_refresh_interval_secs(&mut self, secs: u32) -> Result<(), &'static str> {
+        if !(MIN_REFRESH_INTERVAL_SECS..=MAX_REFRESH_INTERVAL_SECS).contains(&secs) {
+            Err("refresh interval must be between 1 and 3600 seconds")
+        } else {
+            self.refresh_interval_secs = secs;
+            Ok(())
+        }
+    }
+
+    /// Sets the bounded listing timeout in seconds (`1..=3600`).
+    pub fn set_list_timeout_secs(&mut self, secs: u32) -> Result<(), &'static str> {
+        if !(MIN_LIST_TIMEOUT_SECS..=MAX_LIST_TIMEOUT_SECS).contains(&secs) {
+            Err("list timeout must be between 1 and 3600 seconds")
+        } else {
+            self.list_timeout_secs = secs;
+            Ok(())
+        }
+    }
+
+    /// Sets the remote polling interval in seconds (`10..=3600`).
     pub fn set_remote_poll_interval_secs(&mut self, secs: u32) -> Result<(), &'static str> {
-        if secs < MIN_REMOTE_POLL_INTERVAL_SECS {
-            Err("remote poll interval cannot be below minimum of 10 seconds")
+        if !(MIN_REMOTE_POLL_INTERVAL_SECS..=MAX_REMOTE_POLL_INTERVAL_SECS).contains(&secs) {
+            Err("remote poll interval must be between 10 and 3600 seconds")
         } else {
             self.remote_poll_interval_secs = secs;
             Ok(())
         }
+    }
+
+    /// Sets the maximum remote search depth (`1..=64`).
+    pub fn set_remote_search_depth(&mut self, depth: u32) -> Result<(), &'static str> {
+        if !(MIN_REMOTE_SEARCH_DEPTH..=MAX_REMOTE_SEARCH_DEPTH).contains(&depth) {
+            Err("remote search depth must be between 1 and 64")
+        } else {
+            self.remote_search_depth = depth;
+            Ok(())
+        }
+    }
+
+    /// Sets the remote search parallelism (`1..=32`).
+    pub fn set_remote_search_parallel(&mut self, parallel: u32) -> Result<(), &'static str> {
+        if !(MIN_REMOTE_SEARCH_PARALLEL..=MAX_REMOTE_SEARCH_PARALLEL).contains(&parallel) {
+            Err("remote search parallel requests must be between 1 and 32")
+        } else {
+            self.remote_search_parallel = parallel;
+            Ok(())
+        }
+    }
+
+    /// Validates all numeric bounds in `self`.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(MIN_REFRESH_INTERVAL_SECS..=MAX_REFRESH_INTERVAL_SECS)
+            .contains(&self.refresh_interval_secs)
+        {
+            return Err("refresh interval must be between 1 and 3600 seconds");
+        }
+        if !(MIN_LIST_TIMEOUT_SECS..=MAX_LIST_TIMEOUT_SECS).contains(&self.list_timeout_secs) {
+            return Err("list timeout must be between 1 and 3600 seconds");
+        }
+        if !(MIN_REMOTE_POLL_INTERVAL_SECS..=MAX_REMOTE_POLL_INTERVAL_SECS)
+            .contains(&self.remote_poll_interval_secs)
+        {
+            return Err("remote poll interval must be between 10 and 3600 seconds");
+        }
+        if !(MIN_REMOTE_SEARCH_DEPTH..=MAX_REMOTE_SEARCH_DEPTH).contains(&self.remote_search_depth)
+        {
+            return Err("remote search depth must be between 1 and 64");
+        }
+        if !(MIN_REMOTE_SEARCH_PARALLEL..=MAX_REMOTE_SEARCH_PARALLEL)
+            .contains(&self.remote_search_parallel)
+        {
+            return Err("remote search parallel requests must be between 1 and 32");
+        }
+        Ok(())
     }
 
     /// Reads settings from `path`. A missing file yields the defaults; an invalid value falls
@@ -176,15 +364,27 @@ impl Settings {
         let defaults = Self::default();
         let mut warnings = Vec::new();
         let version = take_u32_or_default(&mut table, "version", defaults.version, &mut warnings);
-        let refresh_interval_secs = take_u32_or_default(
+        let show_hidden = take_bool_or_default(
+            &mut table,
+            "show_hidden",
+            defaults.show_hidden,
+            &mut warnings,
+        );
+        let default_sort =
+            take_default_sort_or_default(&mut table, defaults.default_sort, &mut warnings);
+        let refresh_interval_secs = take_bounded_u32_or_default(
             &mut table,
             "refresh_interval_secs",
+            MIN_REFRESH_INTERVAL_SECS,
+            MAX_REFRESH_INTERVAL_SECS,
             defaults.refresh_interval_secs,
             &mut warnings,
         );
-        let list_timeout_secs = take_u32_or_default(
+        let list_timeout_secs = take_bounded_u32_or_default(
             &mut table,
             "list_timeout_secs",
+            MIN_LIST_TIMEOUT_SECS,
+            MAX_LIST_TIMEOUT_SECS,
             defaults.list_timeout_secs,
             &mut warnings,
         );
@@ -194,34 +394,28 @@ impl Settings {
             defaults.remote_poll_enabled,
             &mut warnings,
         );
-        let raw_remote_poll_interval = take_u32_or_default(
+        let remote_poll_interval_secs = take_bounded_u32_or_default(
             &mut table,
             "remote_poll_interval_secs",
+            MIN_REMOTE_POLL_INTERVAL_SECS,
+            MAX_REMOTE_POLL_INTERVAL_SECS,
             defaults.remote_poll_interval_secs,
             &mut warnings,
         );
-        let remote_poll_interval_secs = if raw_remote_poll_interval < MIN_REMOTE_POLL_INTERVAL_SECS
-        {
-            warnings.push(SettingsWarning {
-                key: "remote_poll_interval_secs",
-                message: format!(
-                    "remote poll interval ({raw_remote_poll_interval}s) is below minimum of {MIN_REMOTE_POLL_INTERVAL_SECS}s"
-                ),
-            });
-            defaults.remote_poll_interval_secs
-        } else {
-            raw_remote_poll_interval
-        };
 
-        let remote_search_depth = take_positive_or_default(
+        let remote_search_depth = take_bounded_u32_or_default(
             &mut table,
             "remote_search_depth",
+            MIN_REMOTE_SEARCH_DEPTH,
+            MAX_REMOTE_SEARCH_DEPTH,
             defaults.remote_search_depth,
             &mut warnings,
         );
-        let remote_search_parallel = take_positive_or_default(
+        let remote_search_parallel = take_bounded_u32_or_default(
             &mut table,
             "remote_search_parallel",
+            MIN_REMOTE_SEARCH_PARALLEL,
+            MAX_REMOTE_SEARCH_PARALLEL,
             defaults.remote_search_parallel,
             &mut warnings,
         );
@@ -270,6 +464,8 @@ impl Settings {
 
         let settings = Self {
             version,
+            show_hidden,
+            default_sort,
             refresh_interval_secs,
             list_timeout_secs,
             remote_poll_enabled,
@@ -348,6 +544,17 @@ impl Settings {
     ) -> io::Result<()> {
         let mut table = self.unknown.clone();
         table.insert("version".into(), Value::Integer(self.version.into()));
+        table.insert("show_hidden".into(), Value::Boolean(self.show_hidden));
+        let mut sort_table = Table::new();
+        sort_table.insert(
+            "column".into(),
+            Value::String(sort_column_str(self.default_sort.column).into()),
+        );
+        sort_table.insert(
+            "direction".into(),
+            Value::String(sort_direction_str(self.default_sort.direction).into()),
+        );
+        table.insert("default_sort".into(), Value::Table(sort_table));
         table.insert(
             "refresh_interval_secs".into(),
             Value::Integer(self.refresh_interval_secs.into()),
@@ -553,5 +760,110 @@ mod tests {
         assert_eq!(saved["future_flag"], Value::Boolean(true));
         assert_eq!(saved["future_section"]["name"].as_str(), Some("x"));
         assert_eq!(saved["refresh_interval_secs"].as_integer(), Some(11));
+    }
+
+    #[test]
+    fn settings_show_hidden_and_default_sort_round_trip() {
+        let dir = TestDir::new("settings_general_round_trip");
+        let path = dir.path.join("settings.toml");
+
+        let mut settings = Settings::default();
+        assert!(!settings.show_hidden);
+        assert_eq!(
+            settings.default_sort,
+            SortOrder::new(SortColumn::Name, SortDirection::Ascending)
+        );
+
+        settings.show_hidden = true;
+        settings.default_sort = SortOrder::new(SortColumn::Date, SortDirection::Descending);
+        settings.save_to(&path).unwrap();
+
+        let (loaded, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert!(loaded.show_hidden);
+        assert_eq!(
+            loaded.default_sort,
+            SortOrder::new(SortColumn::Date, SortDirection::Descending)
+        );
+    }
+
+    #[test]
+    fn settings_backward_compatible_without_general_keys() {
+        let dir = TestDir::new("settings_backward_compat");
+        let path = dir.path.join("settings.toml");
+        fs::write(&path, "version = 1\nlist_timeout_secs = 15\n").unwrap();
+
+        let (loaded, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert!(!loaded.show_hidden);
+        assert_eq!(
+            loaded.default_sort,
+            SortOrder::new(SortColumn::Name, SortDirection::Ascending)
+        );
+        assert_eq!(loaded.list_timeout_secs, 15);
+    }
+
+    #[test]
+    fn settings_invalid_general_values_warn_and_fallback() {
+        let dir = TestDir::new("settings_invalid_general");
+        let path = dir.path.join("settings.toml");
+        fs::write(
+            &path,
+            "show_hidden = \"yes\"\n[default_sort]\ncolumn = \"owner\"\ndirection = \"sideways\"\n",
+        )
+        .unwrap();
+
+        let (loaded, warnings) = Settings::load_from(&path).unwrap();
+        assert!(!loaded.show_hidden);
+        assert_eq!(loaded.default_sort, SortOrder::default());
+        assert_eq!(warnings.len(), 3);
+        assert_eq!(warnings[0].key, "show_hidden");
+        assert_eq!(warnings[1].key, "default_sort");
+        assert_eq!(warnings[2].key, "default_sort");
+
+        // Partial default_sort fills missing field with default and emits no warning.
+        fs::write(&path, "[default_sort]\ncolumn = \"size\"\n").unwrap();
+        let (partial, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            partial.default_sort,
+            SortOrder::new(SortColumn::Size, SortDirection::Ascending)
+        );
+    }
+
+    #[test]
+    fn settings_validation_rejects_out_of_range() {
+        let mut s = Settings::default();
+        assert!(s.validate().is_ok());
+
+        assert!(s.set_refresh_interval_secs(0).is_err());
+        assert!(s.set_refresh_interval_secs(3601).is_err());
+        assert_eq!(s.refresh_interval_secs, DEFAULT_REFRESH_INTERVAL_SECS);
+        assert!(s.set_refresh_interval_secs(12).is_ok());
+
+        assert!(s.set_list_timeout_secs(0).is_err());
+        assert!(s.set_list_timeout_secs(3601).is_err());
+        assert_eq!(s.list_timeout_secs, DEFAULT_LIST_TIMEOUT_SECS);
+        assert!(s.set_list_timeout_secs(25).is_ok());
+
+        assert!(s.set_remote_poll_interval_secs(9).is_err());
+        assert!(s.set_remote_poll_interval_secs(3601).is_err());
+        assert_eq!(
+            s.remote_poll_interval_secs,
+            DEFAULT_REMOTE_POLL_INTERVAL_SECS
+        );
+        assert!(s.set_remote_poll_interval_secs(15).is_ok());
+
+        assert!(s.set_remote_search_depth(0).is_err());
+        assert!(s.set_remote_search_depth(65).is_err());
+        assert_eq!(s.remote_search_depth, DEFAULT_REMOTE_SEARCH_DEPTH);
+        assert!(s.set_remote_search_depth(5).is_ok());
+
+        assert!(s.set_remote_search_parallel(0).is_err());
+        assert!(s.set_remote_search_parallel(33).is_err());
+        assert_eq!(s.remote_search_parallel, DEFAULT_REMOTE_SEARCH_PARALLEL);
+        assert!(s.set_remote_search_parallel(4).is_ok());
+
+        assert!(s.validate().is_ok());
     }
 }

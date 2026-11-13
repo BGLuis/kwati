@@ -6,6 +6,7 @@ pub mod network_view;
 pub mod preview_view;
 pub mod remote_dialogs;
 pub mod search_view;
+pub mod settings_view;
 pub mod sidebar_view;
 
 pub use dialogs::{DialogKind, DialogsView};
