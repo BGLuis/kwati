@@ -80,7 +80,7 @@ pub struct Entry {
 
 impl Entry {
     pub fn new(name: OsString, path: PathBuf, is_dir: bool) -> Self {
-        let is_hidden = is_hidden_entry(&name, None);
+        let is_hidden = is_hidden_entry(&name, None) || name.to_string_lossy().starts_with('.');
         Self {
             name,
             path,
@@ -147,6 +147,7 @@ impl Entry {
 }
 
 /// Determines whether an entry is hidden based on platform conventions.
+#[cfg_attr(windows, allow(unused_variables))]
 pub fn is_hidden_entry(name: &OsStr, _metadata: Option<&fs::Metadata>) -> bool {
     #[cfg(windows)]
     {
@@ -876,3 +877,17 @@ pub use preview::*;
 
 pub mod history;
 pub use history::History;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_new_marks_dotfiles_hidden_across_platforms() {
+        let secret = Entry::new(".secret".into(), PathBuf::from("/.secret"), false);
+        assert!(secret.is_hidden);
+
+        let visible = Entry::new("visible.txt".into(), PathBuf::from("/visible.txt"), false);
+        assert!(!visible.is_hidden);
+    }
+}
