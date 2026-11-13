@@ -83,6 +83,14 @@ pub fn preview_from_reader<R: Read>(reader: R) -> io::Result<Preview> {
 /// byte or are not valid UTF-8, and as text otherwise, dropping an incomplete UTF-8 character
 /// at the end.
 pub fn read_preview(path: impl AsRef<Path>) -> io::Result<Preview> {
+    let path = path.as_ref();
+    let meta = std::fs::metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
     let file = File::open(path)?;
     preview_from_reader(file)
 }

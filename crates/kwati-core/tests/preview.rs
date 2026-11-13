@@ -204,3 +204,24 @@ fn classify_preview_direct() {
         Preview::Text("hello ".to_string())
     );
 }
+
+#[test]
+fn preview_rejects_non_regular_files_without_blocking() {
+    let test_dir = TestDir::new("preview_non_regular");
+    let err = read_preview(test_dir.path()).expect_err("directory must fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    #[cfg(unix)]
+    {
+        let fifo_path = test_dir.path().join("pipe.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo should execute");
+        assert!(status.success(), "mkfifo should succeed");
+
+        let fifo_err =
+            read_preview(&fifo_path).expect_err("FIFO must be rejected without blocking");
+        assert_eq!(fifo_err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}

@@ -120,6 +120,26 @@ impl ListView {
         }
     }
 
+    fn update_selection(
+        &mut self,
+        cx: &mut Context<Self>,
+        select: impl FnOnce(&mut AppState) -> Option<usize>,
+        after: impl FnOnce(&Self, usize),
+    ) {
+        let new_ix = self.app_state.update(cx, |state, cx| {
+            let prev = state.selected_index();
+            let ix = select(state);
+            if ix.is_some() && ix != prev {
+                cx.notify();
+            }
+            ix
+        });
+        if let Some(ix) = new_ix {
+            after(self, ix);
+        }
+        cx.notify();
+    }
+
     pub fn on_entry_click(
         &mut self,
         entry: Entry,
@@ -131,65 +151,39 @@ impl ListView {
             self.open_entry(entry, cx);
         } else if event.button == MouseButton::Left {
             // Single click: select entry
-            self.app_state.update(cx, |state, _cx| {
+            self.app_state.update(cx, |state, cx| {
                 let location = state.location_of(&entry);
-                state.selection.select_only(location);
+                if state.selection.len() != 1 || !state.selection.contains(&location) {
+                    state.selection.select_only(location);
+                    cx.notify();
+                }
             });
+            cx.notify();
         }
     }
 
     pub fn select_next(&mut self, cx: &mut Context<Self>) {
-        let new_ix = self.app_state.update(cx, |state, _cx| state.select_next());
-        if let Some(ix) = new_ix {
-            self.scroll_to_item(ix);
-        }
-        cx.notify();
+        self.update_selection(cx, AppState::select_next, Self::scroll_to_item);
     }
 
     pub fn select_previous(&mut self, cx: &mut Context<Self>) {
-        let new_ix = self
-            .app_state
-            .update(cx, |state, _cx| state.select_previous());
-        if let Some(ix) = new_ix {
-            self.scroll_to_item(ix);
-        }
-        cx.notify();
+        self.update_selection(cx, AppState::select_previous, Self::scroll_to_item);
     }
 
     pub fn select_first(&mut self, cx: &mut Context<Self>) {
-        let new_ix = self.app_state.update(cx, |state, _cx| state.select_first());
-        if new_ix.is_some() {
-            self.scroll_to_top();
-        }
-        cx.notify();
+        self.update_selection(cx, AppState::select_first, |this, _| this.scroll_to_top());
     }
 
     pub fn select_last(&mut self, cx: &mut Context<Self>) {
-        let new_ix = self.app_state.update(cx, |state, _cx| state.select_last());
-        if new_ix.is_some() {
-            self.scroll_to_bottom();
-        }
-        cx.notify();
+        self.update_selection(cx, AppState::select_last, |this, _| this.scroll_to_bottom());
     }
 
     pub fn select_page_up(&mut self, cx: &mut Context<Self>) {
-        let new_ix = self
-            .app_state
-            .update(cx, |state, _cx| state.select_page_up(20));
-        if let Some(ix) = new_ix {
-            self.scroll_to_item(ix);
-        }
-        cx.notify();
+        self.update_selection(cx, |s| s.select_page_up(20), Self::scroll_to_item);
     }
 
     pub fn select_page_down(&mut self, cx: &mut Context<Self>) {
-        let new_ix = self
-            .app_state
-            .update(cx, |state, _cx| state.select_page_down(20));
-        if let Some(ix) = new_ix {
-            self.scroll_to_item(ix);
-        }
-        cx.notify();
+        self.update_selection(cx, |s| s.select_page_down(20), Self::scroll_to_item);
     }
 
     pub fn open_selected(&mut self, cx: &mut Context<Self>) {

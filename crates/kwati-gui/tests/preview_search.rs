@@ -1,12 +1,17 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use gpui::{AppContext as _, TestAppContext};
 use kwati_core::{Entry, Location};
+use kwati_gui::actions::register_keybindings;
+use kwati_gui::components::register_text_input_keybindings;
 use kwati_gui::state::{AppState, PreviewKind};
 use kwati_gui::views::preview_view::{
-    file_kind_label, format_file_size, generate_preview_for, is_image_path,
+    file_kind_label, format_file_size, generate_preview_for, is_image_path, prepare_preview_lines,
 };
+use kwati_gui::views::MainView;
 
 #[test]
 fn format_file_size_units() {
@@ -475,5 +480,137 @@ fn open_with_desktop_file_discovery_in_xdg_data_home() {
         found,
         "Should have discovered CustomPhotoEditor in XDG_DATA_HOME"
     );
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn prepare_preview_lines_wraps_long_lines_and_handles_tabs_and_crlf() {
+    assert!(prepare_preview_lines("").is_empty());
+
+    let lines = prepare_preview_lines("first\r\n\tsecond\n");
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].as_ref(), "first");
+    assert_eq!(lines[1].as_ref(), "    second");
+
+    // Single 600-char UTF-8 line (multibyte characters) splits cleanly at 200 chars per visual line
+    let long_line = "á".repeat(450);
+    let wrapped = prepare_preview_lines(&long_line);
+    assert_eq!(wrapped.len(), 3);
+    assert_eq!(wrapped[0].chars().count(), 200);
+    assert_eq!(wrapped[1].chars().count(), 200);
+    assert_eq!(wrapped[2].chars().count(), 50);
+}
+
+#[gpui::test]
+fn preview_loads_asynchronously_cancels_stale_and_skips_when_closed(cx: &mut TestAppContext) {
+    let temp_dir = std::env::temp_dir().join(format!("kwati_preview_async_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let first_path = temp_dir.join("alpha.txt");
+    let second_path = temp_dir.join("beta.txt");
+    let third_path = temp_dir.join("gamma.txt");
+    fs::write(&first_path, "alpha content").unwrap();
+    fs::write(&second_path, "beta content").unwrap();
+    fs::write(&third_path, "gamma content").unwrap();
+
+    cx.update(|cx| {
+        register_keybindings(cx);
+        register_text_input_keybindings(cx);
+    });
+
+    let location = Location::Local(temp_dir.clone());
+    let (main, cx) = cx.add_window_view(|window, cx| {
+        let state = cx.new(|cx| {
+            let mut state = AppState::new(location);
+            state.attach(cx);
+            state.reload_entries();
+            state
+        });
+        MainView::new(state, window, cx)
+    });
+    cx.run_until_parked();
+
+    // Selecting alpha then immediately switching to beta cancels alpha's pending load.
+    main.update(cx, |main, cx| {
+        main.list.update(cx, |list, cx| {
+            list.select_next(cx); // alpha.txt
+            list.select_next(cx); // beta.txt
+        });
+    });
+
+    // Immediately after selection, preview enters Loading state without blocking the UI thread.
+    let loading_path = main.read_with(cx, |main, cx| {
+        main.app_state
+            .read(cx)
+            .preview_state
+            .as_ref()
+            .map(|p| (p.path.clone(), matches!(p.kind, PreviewKind::Loading)))
+    });
+    assert_eq!(loading_path, Some((second_path.clone(), true)));
+
+    // Advance past debounce and let background preview finish.
+    cx.executor().advance_clock(Duration::from_millis(60));
+    cx.run_until_parked();
+
+    let loaded_text = main.read_with(cx, |main, cx| {
+        main.app_state
+            .read(cx)
+            .preview_state
+            .as_ref()
+            .and_then(|p| {
+                if let PreviewKind::Text(ref t) = p.kind {
+                    Some((p.path.clone(), t.clone()))
+                } else {
+                    None
+                }
+            })
+    });
+    assert_eq!(
+        loaded_text,
+        Some((second_path.clone(), "beta content".into()))
+    );
+
+    // Closing the preview panel stops loading new selections until reopened.
+    cx.simulate_keystrokes("alt-p");
+    cx.run_until_parked();
+
+    main.update(cx, |main, cx| {
+        main.list.update(cx, |list, cx| {
+            list.select_next(cx); // gamma.txt
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(60));
+    cx.run_until_parked();
+
+    let while_closed_path = main.read_with(cx, |main, cx| {
+        main.app_state
+            .read(cx)
+            .preview_state
+            .as_ref()
+            .map(|p| p.path.clone())
+    });
+    assert_eq!(while_closed_path, Some(second_path));
+
+    // Reopening the preview loads the currently selected gamma.txt.
+    cx.simulate_keystrokes("alt-p");
+    cx.executor().advance_clock(Duration::from_millis(60));
+    cx.run_until_parked();
+
+    let reopened_text = main.read_with(cx, |main, cx| {
+        main.app_state
+            .read(cx)
+            .preview_state
+            .as_ref()
+            .and_then(|p| {
+                if let PreviewKind::Text(ref t) = p.kind {
+                    Some((p.path.clone(), t.clone()))
+                } else {
+                    None
+                }
+            })
+    });
+    assert_eq!(reopened_text, Some((third_path, "gamma content".into())));
+
     let _ = fs::remove_dir_all(&temp_dir);
 }

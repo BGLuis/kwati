@@ -419,12 +419,13 @@ impl SearchView {
         self.current_location = Some(parent_loc.clone());
         self.pending_reveal = None;
 
-        self.app_state.update(cx, |state, _cx| {
+        self.app_state.update(cx, |state, cx| {
             state.set_search_query(None);
             if state.current_location() != &parent_loc {
                 state.navigate_to(parent_loc.clone());
             }
             state.select_location(target_loc.clone());
+            cx.notify();
         });
 
         // If `navigate_to` ran asynchronously on background executor, `arrive` will clear
