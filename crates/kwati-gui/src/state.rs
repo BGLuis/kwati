@@ -7,11 +7,37 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{AsyncApp, Context, Task, WeakEntity};
 use kwati_core::{
-    list_dir_with_options, sort_entries_by, DirWatcher, Entry, History, ListOptions, Location,
-    Selection, Settings, SortColumn, SortDirection,
+    list_dir_with_options, sort_entries_by, BackendError, ConnectionState, DirWatcher, Entry,
+    History, HostKeyUnknown, ListOptions, Location, ReconnectingBackend, Selection, Settings,
+    SortColumn, SortDirection,
 };
 
 use crate::layout::PanelLayout;
+use crate::remote::{start_location, RemoteSessions};
+
+/// A question the user must answer before a connection can go on.
+#[derive(Debug, Clone)]
+pub enum RemotePrompt {
+    /// No password is saved, or the server refused the one sent.
+    Password {
+        profile_id: String,
+        error: Option<String>,
+    },
+    /// First contact with this server: trusting its key lets the connection go on.
+    TrustHostKey {
+        profile_id: String,
+        unknown: HostKeyUnknown,
+        password: Option<String>,
+        remember: bool,
+    },
+    /// The server's key differs from the stored one; the connection was refused.
+    HostKeyChanged {
+        host: String,
+        port: u16,
+        presented: String,
+        stored: Vec<String>,
+    },
+}
 
 /// Classification of background file operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,8 +143,13 @@ impl UndoStack {
 pub enum PreviewKind {
     Text(String),
     Image(PathBuf),
-    Binary { name: String, size: u64 },
+    Binary {
+        name: String,
+        size: u64,
+    },
     Loading,
+    /// The file cannot be read here, with the reason to show.
+    Unavailable(String),
 }
 
 /// Preview data for the selected file (owned by inspect-worker).
@@ -167,6 +198,11 @@ pub struct AppState {
     pub preview_state: Option<PreviewData>, // Owned by inspect-worker
     pub search_query: Option<String>,       // Owned by inspect-worker
     pub network_status: NetworkMountStatus, // Owned by guinet-worker
+    pub remote: RemoteSessions,
+    /// Set when a connection needs an answer; the remote dialogs take it.
+    pub remote_prompt: Option<RemotePrompt>,
+    /// The profile being connected, while the attempt runs.
+    pub connecting: Option<String>,
     pub status_message: Option<String>,
     pub sort_column: SortColumn,
     pub sort_direction: SortDirection,
@@ -196,6 +232,9 @@ impl AppState {
             preview_state: None,
             search_query: None,
             network_status: NetworkMountStatus::Disconnected,
+            remote: RemoteSessions::in_memory(),
+            remote_prompt: None,
+            connecting: None,
             status_message: None,
             sort_column: SortColumn::Name,
             sort_direction: SortDirection::Ascending,
@@ -281,17 +320,34 @@ impl AppState {
             (Arrival::Reload, Some(pending)) => pending,
             _ => (target, arrival),
         };
-        let Location::Local(path) = &target else {
-            self.arrive(target, arrival);
-            return;
-        };
-        let path = path.clone();
         let options = ListOptions {
             show_hidden: self.show_hidden,
             sort_column: self.sort_column,
             sort_direction: self.sort_direction,
         };
-        let read = move || list_dir_with_options(&path, &options).map(|l| l.into_entries());
+        let read: Box<dyn FnOnce() -> io::Result<Vec<Entry>> + Send> = match &target {
+            Location::Local(path) => {
+                let path = path.clone();
+                Box::new(move || list_dir_with_options(&path, &options).map(|l| l.into_entries()))
+            }
+            Location::Remote { profile_id, .. } => {
+                let Some(backend) = self.remote.backend(profile_id) else {
+                    let name = self.remote.profile(profile_id).map(|p| p.name.clone());
+                    self.set_status(format!(
+                        "Not connected to {}",
+                        name.as_deref().unwrap_or("this server")
+                    ));
+                    return;
+                };
+                let location = target.clone();
+                Box::new(move || {
+                    backend
+                        .list_with_options(&location, &options)
+                        .map(|listing| listing.into_entries())
+                        .map_err(into_io)
+                })
+            }
+        };
 
         let Some(foreground) = &self.foreground else {
             self.finish_load(target, arrival, read());
@@ -445,32 +501,152 @@ impl AppState {
 
     /// Navigates up to the parent directory, returning true if parent exists.
     pub fn go_up(&mut self) -> bool {
-        if let Some(parent) = self.current_location.path().parent() {
-            if !parent.as_os_str().is_empty() {
-                self.navigate_to(parent.into());
-                return true;
+        match self.current_location.parent() {
+            Some(parent) if !parent.path().as_os_str().is_empty() => {
+                self.navigate_to(parent);
+                true
             }
+            _ => false,
         }
-        false
+    }
+
+    /// Where a listed entry lives: on the server of the current location when it is remote.
+    /// `Entry::location` alone is always local, which on a remote folder would name a local
+    /// file of the same path.
+    pub fn location_of(&self, entry: &Entry) -> Location {
+        entry_location(&self.current_location, entry)
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self.current_location, Location::Remote { .. })
+    }
+
+    /// The connection state of the current remote location, if it is one.
+    pub fn remote_state(&self) -> Option<ConnectionState> {
+        match &self.current_location {
+            Location::Remote { profile_id, .. } => self.remote.state(profile_id),
+            Location::Local(_) => None,
+        }
+    }
+
+    /// Opens saved server `profile_id` and browses its start path. Asks for a password first
+    /// when none is saved; `password` is one the user just typed, saved only if `remember`.
+    pub fn connect(&mut self, profile_id: &str, password: Option<String>, remember: bool) {
+        let Some(profile) = self.remote.profile(profile_id).cloned() else {
+            return;
+        };
+        if self.remote.is_connected(profile_id) {
+            self.navigate_to(start_location(&profile));
+            return;
+        }
+        if password.is_none() && self.remote.needs_password(profile_id) {
+            self.remote_prompt = Some(RemotePrompt::Password {
+                profile_id: profile_id.to_owned(),
+                error: None,
+            });
+            return;
+        }
+        let Some(work) = self.remote.connector(profile_id, password.clone()) else {
+            return;
+        };
+        self.connecting = Some(profile_id.to_owned());
+        self.set_status(format!("Connecting to {}…", profile.name));
+        let id = profile_id.to_owned();
+        self.spawn_job(
+            work,
+            |_| {},
+            move |state, result| state.finish_connect(&id, password, remember, result),
+        );
+    }
+
+    fn finish_connect(
+        &mut self,
+        profile_id: &str,
+        password: Option<String>,
+        remember: bool,
+        result: Result<ReconnectingBackend, BackendError>,
+    ) {
+        self.connecting = None;
+        let Some(profile) = self.remote.profile(profile_id).cloned() else {
+            return;
+        };
+        let err = match result {
+            Ok(backend) => {
+                self.remote.add_connection(profile_id, backend);
+                self.clear_status();
+                if let (true, Some(password)) = (remember, &password) {
+                    if let Err(message) = self.remote.remember_password(profile_id, password) {
+                        self.set_status(message);
+                    }
+                }
+                self.navigate_to(start_location(&profile));
+                return;
+            }
+            Err(err) => err,
+        };
+        if let Some(unknown) = err.host_key_unknown() {
+            self.clear_status();
+            self.remote_prompt = Some(RemotePrompt::TrustHostKey {
+                profile_id: profile_id.to_owned(),
+                unknown: unknown.clone(),
+                password,
+                remember,
+            });
+        } else if let Some(changed) = err.host_key_changed() {
+            self.set_status(format!("Connection to {} refused", profile.name));
+            self.remote_prompt = Some(RemotePrompt::HostKeyChanged {
+                host: changed.host.clone(),
+                port: changed.port,
+                presented: changed.fingerprint.clone(),
+                stored: changed.stored.clone(),
+            });
+        } else if err.authentication_failed().is_some() {
+            self.clear_status();
+            self.remote_prompt = Some(RemotePrompt::Password {
+                profile_id: profile_id.to_owned(),
+                error: Some("The server refused the user name or password.".into()),
+            });
+        } else {
+            self.set_status(format!(
+                "Cannot connect to {}: {}",
+                profile.name,
+                describe(&err)
+            ));
+        }
+    }
+
+    /// Stores the key the user agreed to trust and connects again.
+    pub fn trust_and_connect(
+        &mut self,
+        profile_id: &str,
+        unknown: &HostKeyUnknown,
+        password: Option<String>,
+        remember: bool,
+    ) {
+        match self.remote.trust(unknown) {
+            Ok(()) => self.connect(profile_id, password, remember),
+            Err(message) => self.set_status(message),
+        }
     }
 
     /// Replaces the listed entries.
     pub fn set_entries(&mut self, entries: Vec<Entry>) {
         self.entries = Arc::new(entries);
-        self.selection.retain_existing(&self.entries);
+        let listed: Vec<Location> = self.entries.iter().map(|e| self.location_of(e)).collect();
+        self.selection.reload_locations(&listed);
     }
 
     /// Returns the index of the first selected entry in the listed entries, if any.
     pub fn selected_index(&self) -> Option<usize> {
         self.entries
             .iter()
-            .position(|e| self.selection.contains(&e.location()))
+            .position(|e| self.selection.contains(&self.location_of(e)))
     }
 
     /// Selects the entry at the given index.
     pub fn select_index(&mut self, index: usize) {
         if let Some(entry) = self.entries.get(index) {
-            self.selection.select_only(entry.location());
+            self.selection.select_only(self.location_of(entry));
         }
     }
 
@@ -546,7 +722,7 @@ impl AppState {
         if let Some(ix) = self.selected_index() {
             if let Some(entry) = self.entries.get(ix).cloned() {
                 if entry.is_dir() {
-                    self.navigate_to(entry.location());
+                    self.navigate_to(self.location_of(&entry));
                     return true;
                 }
             }
@@ -586,5 +762,31 @@ impl AppState {
     /// Updates network mount status.
     pub fn set_network_status(&mut self, status: NetworkMountStatus) {
         self.network_status = status;
+    }
+}
+
+/// Where `entry`, listed in folder `current`, lives: see [`AppState::location_of`].
+pub fn entry_location(current: &Location, entry: &Entry) -> Location {
+    match current {
+        Location::Remote { profile_id, .. } => Location::Remote {
+            profile_id: profile_id.clone(),
+            path: entry.path.clone(),
+        },
+        Location::Local(_) => entry.location(),
+    }
+}
+
+fn into_io(err: BackendError) -> io::Error {
+    match err {
+        BackendError::Io(err) => err,
+        BackendError::Unsupported => io::ErrorKind::Unsupported.into(),
+    }
+}
+
+/// The reason without the `I/O error:` prefix `BackendError` adds.
+fn describe(err: &BackendError) -> String {
+    match err {
+        BackendError::Io(err) => err.to_string(),
+        BackendError::Unsupported => "the server does not support this".into(),
     }
 }

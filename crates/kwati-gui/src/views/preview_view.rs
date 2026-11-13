@@ -8,10 +8,12 @@ use std::path::{Path, PathBuf};
 
 use gpui::{div, img, prelude::*, px, Context, Entity, FontWeight, Subscription, Window};
 use kwati_core::preview::{read_preview, Preview};
+use kwati_core::{Entry, Location};
 
 use crate::components::{icon, IconName};
 use crate::state::{AppState, PreviewData, PreviewKind};
 use crate::theme::Theme;
+use crate::views::list_view::REMOTE_FILE_NOTICE;
 
 /// Formats a byte size into a human-readable string.
 pub fn format_file_size(bytes: u64) -> String {
@@ -116,6 +118,22 @@ impl MetadataSummary {
     }
 }
 
+impl MetadataSummary {
+    /// What the listing already says about a remote entry; the file itself is not read.
+    pub fn from_listing(entry: &Entry) -> Self {
+        let is_dir = entry.is_dir();
+        Self {
+            name: entry.display_name(),
+            path: entry.path.clone(),
+            size: entry.size.unwrap_or(0),
+            is_dir,
+            is_image: is_image_path(&entry.path),
+            is_binary: false,
+            kind_label: file_kind_label(&entry.path, is_dir, false).to_string(),
+        }
+    }
+}
+
 /// Computes the preview data and metadata summary for a given path.
 pub fn generate_preview_for(path: &Path) -> (PreviewData, MetadataSummary) {
     let name = path
@@ -205,17 +223,20 @@ impl PreviewView {
 
     /// Synchronizes preview with the currently selected entry in AppState.
     pub fn sync_with_selection(&mut self, app_state: Entity<AppState>, cx: &mut Context<Self>) {
-        let (selected_path, needs_clear) = {
+        let (selected, listed, needs_clear) = {
             let state = app_state.read(cx);
             if state.selection.len() == 1 {
-                let path = state
-                    .selection
-                    .iter()
-                    .next()
-                    .map(|loc| loc.path().to_path_buf());
-                (path, false)
+                let selected = state.selection.iter().next().cloned();
+                let listed = selected.as_ref().and_then(|location| {
+                    state
+                        .entries
+                        .iter()
+                        .find(|entry| entry.path == location.path())
+                        .cloned()
+                });
+                (selected, listed, false)
             } else {
-                (None, true)
+                (None, None, true)
             }
         };
 
@@ -231,12 +252,25 @@ impl PreviewView {
             return;
         }
 
-        if let Some(path) = selected_path {
+        if let Some(location) = selected {
+            let path = location.path().to_path_buf();
             if self.current_path.as_ref() == Some(&path) {
                 return;
             }
 
-            let (preview_data, summary) = generate_preview_for(&path);
+            let (preview_data, summary) = match location {
+                Location::Local(_) => generate_preview_for(&path),
+                Location::Remote { .. } => (
+                    PreviewData {
+                        path: path.clone(),
+                        kind: PreviewKind::Unavailable(REMOTE_FILE_NOTICE.into()),
+                    },
+                    listed.as_ref().map_or_else(
+                        || MetadataSummary::from_path(Path::new(""), false),
+                        MetadataSummary::from_listing,
+                    ),
+                ),
+            };
             self.current_path = Some(path);
             self.metadata = Some(summary);
 
@@ -380,6 +414,16 @@ impl Render for PreviewView {
                             .text_color(theme.text_muted)
                             .child("Binary file — preview not available"),
                     ),
+                PreviewKind::Unavailable(reason) => div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_4()
+                    .text_align(gpui::TextAlign::Center)
+                    .text_color(theme.text_muted)
+                    .text_size(px(12.))
+                    .child(reason),
                 PreviewKind::Loading => div()
                     .flex_1()
                     .flex()
