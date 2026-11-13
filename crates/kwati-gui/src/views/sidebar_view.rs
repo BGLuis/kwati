@@ -1,15 +1,16 @@
 //! Sidebar view (owned by guinet-worker for #61).
 //!
-//! Renders quick-access places, bookmarks, and mounted/removable storage drives with
-//! capacity indicators, eject button, busy detection, and safe-to-remove feedback.
+//! Renders quick-access places, bookmarks, the device's mounted drives with capacity
+//! indicators, and mounted network shares.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::{
     div, prelude::*, px, transparent_black, AnyElement, Context, Div, ElementId, Entity,
-    FontWeight, MouseButton, Stateful, Svg, Window,
+    FontWeight, MouseButton, MouseDownEvent, Stateful, Svg, Task, Window,
 };
-use kwati_core::Location;
+use kwati_core::{device_volumes, network_mounts, Location, NetworkMount, Volume};
 
 use crate::components::{icon, Ellipsize, IconName, Tooltip};
 use crate::state::AppState;
@@ -150,6 +151,19 @@ pub struct SidebarVolume {
     pub busy_reason: Option<String>,
 }
 
+impl From<Volume> for SidebarVolume {
+    fn from(volume: Volume) -> Self {
+        Self::new(
+            volume.mount_point.to_string_lossy().into_owned(),
+            volume.name,
+            volume.mount_point,
+            volume.total_space,
+            volume.available_space,
+            volume.is_removable,
+        )
+    }
+}
+
 impl SidebarVolume {
     pub fn new(
         id: impl Into<String>,
@@ -217,20 +231,56 @@ pub enum MountResult {
     Failed(String),
 }
 
+/// How often drives and shares are listed again, so a plugged-in disk or a newly mounted
+/// share shows up without a restart.
+const DEVICE_POLL: Duration = Duration::from_secs(3);
+
 pub struct SidebarView {
     pub app_state: Entity<AppState>,
     pub places: Vec<SidebarPlace>,
     pub bookmarks: Vec<UserBookmark>,
     pub volumes: Vec<SidebarVolume>,
+    pub network: Vec<NetworkMount>,
+    /// Drives show as plain rows unless the user asks for capacity cards with a right click.
+    pub drive_details: bool,
+    _device_poll: Task<()>,
 }
 
 impl SidebarView {
-    pub fn new(app_state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let device_poll = cx.spawn(async move |this, cx| loop {
+            let (volumes, network) = cx
+                .background_executor()
+                .spawn(async { (device_volumes(), network_mounts()) })
+                .await;
+            let listed = this.update(cx, |this, cx| this.set_devices(volumes, network, cx));
+            if listed.is_err() {
+                break;
+            }
+            cx.background_executor().timer(DEVICE_POLL).await;
+        });
         Self {
             app_state,
             places: standard_places(),
             bookmarks: Vec::new(),
             volumes: Vec::new(),
+            network: Vec::new(),
+            drive_details: false,
+            _device_poll: device_poll,
+        }
+    }
+
+    fn set_devices(
+        &mut self,
+        volumes: Vec<Volume>,
+        network: Vec<NetworkMount>,
+        cx: &mut Context<Self>,
+    ) {
+        let volumes: Vec<SidebarVolume> = volumes.into_iter().map(SidebarVolume::from).collect();
+        if volumes != self.volumes || network != self.network {
+            self.volumes = volumes;
+            self.network = network;
+            cx.notify();
         }
     }
 
@@ -330,6 +380,60 @@ impl SidebarView {
 }
 
 impl SidebarView {
+    fn toggle_drive_details(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.drive_details = !self.drive_details;
+        cx.notify();
+    }
+
+    /// A drive as one row, like a place; its capacity waits in the tooltip.
+    fn drive_row(
+        &self,
+        ix: usize,
+        vol: SidebarVolume,
+        current_loc: &Location,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = Theme::get(cx);
+        let is_active = current_loc.path() == vol.mount_point;
+        let tooltip = if vol.is_mounted {
+            format!("{} — {}", vol.mount_point.display(), vol.capacity_summary())
+        } else {
+            format!("{} (not mounted)", vol.name)
+        };
+        let path = vol.mount_point.clone();
+
+        div()
+            .id(("drive-row", ix))
+            .h(size::SIDEBAR_ROW)
+            .px(space::S8)
+            .rounded(radius::CONTROL)
+            .cursor_pointer()
+            .when(is_active, |s| s.bg(theme.selection))
+            .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
+            .text_body()
+            .text_color(if vol.is_mounted {
+                theme.text
+            } else {
+                theme.text_muted
+            })
+            .flex()
+            .items_center()
+            .gap(space::S8)
+            .child(icon(IconName::Drive).text_color(if vol.is_busy {
+                theme.warning
+            } else {
+                theme.text
+            }))
+            .child(div().ellipsize().child(vol.name))
+            .tooltip(Tooltip::text(tooltip))
+            .when(vol.is_mounted, |s| {
+                s.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
+                )
+            })
+    }
+
     /// Icons only, each named by its tooltip. Section titles become dividers, and drive
     /// actions wait for the full sidebar.
     fn render_compact(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -434,6 +538,20 @@ impl SidebarView {
                     )
                 })
             }))
+            .when(!self.network.is_empty(), |s| s.child(divider()))
+            .children(self.network.iter().enumerate().map(|(ix, share)| {
+                let path = share.mount_point.clone();
+                row(
+                    ("share", ix).into(),
+                    icon(IconName::Network).text_color(theme.text),
+                    share.name.clone(),
+                    current_loc.path() == share.mount_point,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
+                )
+            }))
             .into_any_element()
     }
 }
@@ -454,6 +572,8 @@ impl Render for SidebarView {
         let places = self.places.clone();
         let bookmarks = self.bookmarks.clone();
         let volumes = self.volumes.clone();
+        let network = self.network.clone();
+        let drive_details = self.drive_details;
         let current_loc = self.app_state.read(cx).current_location.clone();
 
         div()
@@ -496,14 +616,14 @@ impl Render for SidebarView {
                             .flex()
                             .items_center()
                             .gap(space::S8)
-                            .child(icon(place.icon).text_color(if place.icon == IconName::Folder {
-                                theme.accent
-                            } else {
-                                theme.text
-                            }))
                             .child(
-                                div().ellipsize().child(place.name),
+                                icon(place.icon).text_color(if place.icon == IconName::Folder {
+                                    theme.accent
+                                } else {
+                                    theme.text
+                                }),
                             )
+                            .child(div().ellipsize().child(place.name))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
@@ -594,27 +714,43 @@ impl Render for SidebarView {
                     div()
                         .flex()
                         .flex_col()
-                        .gap_2()
+                        .when(drive_details, |s| s.gap_2())
+                        .when(!drive_details, |s| s.gap_1())
                         .child(
                             div()
                                 .px(space::S8)
                                 .py(space::S4)
                                 .text_label()
                                 .text_color(theme.text_muted)
-                                .child("Drives"),
+                                .child("Drives")
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(Self::toggle_drive_details),
+                                ),
                         )
-                        .children(volumes.into_iter().map(|vol| {
+                        .children(volumes.into_iter().enumerate().map(|(ix, vol)| {
+                            if !drive_details {
+                                return self
+                                    .drive_row(ix, vol, &current_loc, cx)
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(Self::toggle_drive_details),
+                                    )
+                                    .into_any_element();
+                            }
                             let vol_id = vol.id.clone();
-                            let is_removable = vol.is_removable;
                             let is_mounted = vol.is_mounted;
                             let is_busy = vol.is_busy;
                             let capacity_text = vol.capacity_summary();
                             let used_pct = vol.used_percentage();
                             let p_nav = vol.mount_point.clone();
-                            let p_eject = vol.mount_point.clone();
                             let is_active = current_loc.path() == vol.mount_point;
 
                             div()
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(Self::toggle_drive_details),
+                                )
                                 .p_2()
                                 .rounded_md()
                                 .bg(if is_active {
@@ -657,75 +793,6 @@ impl Render for SidebarView {
                                                         .child(vol.name),
                                                 ),
                                         )
-                                        .when(is_removable && is_mounted, |p| {
-                                            let v_id = vol_id.clone();
-                                            p.child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(1.))
-                                                    .rounded_sm()
-                                                    .bg(theme.surface)
-                                                    .hover(|s| s.bg(theme.selection))
-                                                    .text_size(px(11.))
-                                                    .text_color(theme.text_muted)
-                                                    .cursor_pointer()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(space::S4)
-                                                    .child(
-                                                        icon(IconName::Eject)
-                                                            .text_color(theme.text_muted),
-                                                    )
-                                                    .child("Eject")
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            let loc = this
-                                                                .app_state
-                                                                .read(cx)
-                                                                .current_location
-                                                                .clone();
-                                                            match this.eject_volume(&v_id, &loc) {
-                                                                EjectResult::SafeToRemove {
-                                                                    volume_name,
-                                                                    ..
-                                                                } => {
-                                                                    this.app_state.update(
-                                                                        cx,
-                                                                        |state, _cx| {
-                                                                            if state
-                                                                                .current_location
-                                                                                .path()
-                                                                                .starts_with(
-                                                                                    &p_eject,
-                                                                                )
-                                                                            {
-                                                                                let home = system_home_dir().unwrap_or_else(|| PathBuf::from("/"));
-                                                                                state.navigate_to(Location::Local(home));
-                                                                            }
-                                                                            state.set_status(format!("'{}' is safe to remove", volume_name));
-                                                                        },
-                                                                    );
-                                                                    cx.notify();
-                                                                }
-                                                                EjectResult::Busy {
-                                                                    volume_name,
-                                                                    reason,
-                                                                } => {
-                                                                    this.app_state.update(
-                                                                        cx,
-                                                                        |state, _cx| {
-                                                                            state.set_status(format!("Cannot eject '{}': {}", volume_name, reason));
-                                                                        },
-                                                                    );
-                                                                    cx.notify();
-                                                                }
-                                                                EjectResult::NotFound => {}
-                                                            }
-                                                        }),
-                                                    ),
-                                            )
-                                        })
                                         .when(!is_mounted, |p| {
                                             let v_id = vol_id.clone();
                                             p.child(
@@ -806,6 +873,53 @@ impl Render for SidebarView {
                                             .child("In use by open files"),
                                     )
                                 })
+                                .into_any_element()
+                        })),
+                )
+            })
+            // --- NETWORK SECTION ---
+            .when(!network.is_empty(), |parent| {
+                parent.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .px(space::S8)
+                                .py(space::S4)
+                                .text_label()
+                                .text_color(theme.text_muted)
+                                .child("Network"),
+                        )
+                        .children(network.into_iter().enumerate().map(|(ix, share)| {
+                            let is_active = current_loc.path() == share.mount_point;
+                            let path = share.mount_point.clone();
+
+                            div()
+                                .id(("network-share", ix))
+                                .h(size::SIDEBAR_ROW)
+                                .px(space::S8)
+                                .rounded(radius::CONTROL)
+                                .cursor_pointer()
+                                .when(is_active, |s| s.bg(theme.selection))
+                                .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
+                                .text_body()
+                                .text_color(theme.text)
+                                .flex()
+                                .items_center()
+                                .gap(space::S8)
+                                .child(icon(IconName::Network).text_color(theme.text))
+                                .child(div().ellipsize().child(share.name))
+                                .tooltip(Tooltip::text(
+                                    share.mount_point.to_string_lossy().into_owned(),
+                                ))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.navigate_to_path(&path, cx);
+                                    }),
+                                )
                         })),
                 )
             })
