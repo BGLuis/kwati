@@ -6,6 +6,7 @@ mod ftp;
 mod move_entry;
 pub mod places;
 mod profiles;
+mod remote;
 pub mod remote_poll;
 mod search;
 mod secrets;
@@ -36,6 +37,7 @@ pub use profiles::{
     default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
     PendingSecret, Protocol,
 };
+pub use remote::connect_profile;
 pub use remote_poll::{RemotePoller, MIN_POLL_INTERVAL};
 pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use secrets::{KeyringSecrets, Secrets, SecretsError};
@@ -688,7 +690,12 @@ pub trait Backend: Send + Sync {
     ) -> Result<Listing, BackendError> {
         match location {
             Location::Local(path) => Ok(list_dir_with_options(path, options)?),
-            Location::Remote { .. } => Err(BackendError::Unsupported),
+            Location::Remote { .. } => {
+                let mut entries = self.list(location)?.into_entries();
+                entries.retain(|entry| options.show_hidden || !entry.is_hidden);
+                sort_entries_by(&mut entries, options.sort_column, options.sort_direction);
+                Ok(Listing { entries })
+            }
         }
     }
 

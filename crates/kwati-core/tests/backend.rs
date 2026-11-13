@@ -367,3 +367,35 @@ fn local_backend_operations_round_trip() {
     assert_eq!(read, "data");
     assert!(!dir.path.join("new").exists());
 }
+
+#[test]
+fn a_remote_listing_honours_hidden_files_and_sort_order() {
+    use kwati_core::{ListOptions, SortColumn, SortDirection};
+    let backend = MemBackend::with(&[
+        ("/b.txt", Some("")),
+        ("/.secret", Some("")),
+        ("/a.txt", Some("")),
+        ("/dir", None),
+    ]);
+    let names = |options: ListOptions| -> Vec<String> {
+        backend
+            .list_with_options(&remote("/"), &options)
+            .unwrap()
+            .iter()
+            .map(|e| e.display_name())
+            .collect()
+    };
+    let descending = ListOptions {
+        show_hidden: false,
+        sort_column: SortColumn::Name,
+        sort_direction: SortDirection::Descending,
+    };
+    assert_eq!(names(descending), ["dir", "b.txt", "a.txt"]);
+    assert_eq!(
+        names(ListOptions {
+            show_hidden: true,
+            ..descending
+        }),
+        ["dir", "b.txt", "a.txt", ".secret"]
+    );
+}
