@@ -512,6 +512,18 @@ impl Location {
         self.path().file_name()
     }
 
+    /// The folder holding this location, on the same side (and profile), or `None` at a root.
+    pub fn parent(&self) -> Option<Location> {
+        let parent = self.path().parent()?;
+        Some(match self {
+            Location::Local(_) => Location::Local(parent.to_path_buf()),
+            Location::Remote { profile_id, .. } => Location::Remote {
+                profile_id: profile_id.clone(),
+                path: parent.to_path_buf(),
+            },
+        })
+    }
+
     /// The same location kind (and profile) with `name` appended to the path.
     pub fn join(&self, name: &OsStr) -> Location {
         match self {

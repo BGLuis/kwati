@@ -399,3 +399,13 @@ fn a_remote_listing_honours_hidden_files_and_sort_order() {
         ["dir", "b.txt", "a.txt", ".secret"]
     );
 }
+
+#[test]
+fn a_remote_parent_stays_on_the_same_server() {
+    assert_eq!(remote("/a/b").parent(), Some(remote("/a")));
+    assert_eq!(remote("/").parent(), None);
+    assert_eq!(
+        Location::Local("/a/b".into()).parent(),
+        Some(Location::Local("/a".into()))
+    );
+}
