@@ -7,3 +7,7 @@ members = [
 
 [patch.crates-io]
 xattr = { path = "patches/xattr-0.2.3" }
+# smb 0.12.1 pins sspi =0.21.3, which pins curve25519-dalek =5.0.0-rc.1 and cannot coexist with
+# the 5.0.0 release russh needs. The only change is sspi =0.23.1, whose dependencies accept 5.0.0.
+# Drop this patch once an smb release moves past sspi 0.21.
+smb = { path = "patches/smb-0.12.1" }

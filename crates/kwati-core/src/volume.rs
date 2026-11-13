@@ -180,7 +180,6 @@ fn linux_kind(mountinfo: &str, path: &Path) -> VolumeKind {
 
 /// Decodes the `\ooo` octal escapes that the kernel uses for spaces, tabs, newlines
 /// and backslashes in mountinfo paths.
-#[cfg(any(target_os = "linux", test))]
 pub(crate) fn unescape_octal(field: &str) -> String {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

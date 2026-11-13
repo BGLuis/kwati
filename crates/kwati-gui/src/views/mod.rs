@@ -6,6 +6,7 @@ pub mod network_view;
 pub mod preview_view;
 pub mod remote_dialogs;
 pub mod search_view;
+pub mod settings_view;
 pub mod sidebar_view;
 
 pub use dialogs::{DialogKind, DialogsView};
@@ -16,26 +17,28 @@ pub use network_view::NetworkView;
 pub use preview_view::PreviewView;
 pub use remote_dialogs::{RemoteDialogKind, RemoteDialogsView};
 pub use search_view::SearchView;
+pub use settings_view::SettingsView;
 pub use sidebar_view::SidebarView;
-
-use std::path::PathBuf;
 
 use gpui::{
     div, prelude::*, px, App, Context, CursorStyle, DragMoveEvent, EmptyView, Entity, Pixels,
     SharedString, Window,
 };
-use kwati_core::{volume_kind, ConflictPolicy, Location, VolumeKind};
+use kwati_core::Location;
 
 use crate::actions::operations::{
-    self, check_paste_conflict, copy_to_clipboard, cut_to_clipboard, execute_undo, get_clipboard,
-    start_transfer, Transfer,
+    self, copy_locations_to_clipboard, cut_locations_to_clipboard, execute_undo,
+    get_location_clipboard,
 };
-
-use crate::actions::navigation::TogglePreview;
+use crate::actions::remote_sync::RemotePollerHost;
+use crate::actions::{
+    DisconnectRemote, ManageServers, OpenSettings, ReconnectRemote, RefreshListing, TogglePreview,
+};
 use crate::layout::PanelLayout;
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{size, space, Fonts, TextRole};
+use crate::views::search_view::ToggleSearch;
 
 /// The root shell view of kwati-gui.
 pub struct MainView {
@@ -49,6 +52,8 @@ pub struct MainView {
     pub network: Entity<NetworkView>,
     pub dialogs: Entity<DialogsView>,
     pub remote_dialogs: Entity<RemoteDialogsView>,
+    pub settings: Entity<SettingsView>,
+    pub remote_sync: Entity<RemotePollerHost>,
 }
 
 impl MainView {
@@ -62,22 +67,71 @@ impl MainView {
         let network = cx.new(|cx| NetworkView::new(app_state.clone(), cx));
         let dialogs = cx.new(|cx| DialogsView::new(app_state.clone(), cx));
         let remote_dialogs = cx.new(|cx| RemoteDialogsView::new(app_state.clone(), cx));
+        let settings = cx.new(|cx| SettingsView::new(app_state.clone(), cx));
+        let remote_sync = cx.new(|cx| RemotePollerHost::new(app_state.clone(), cx));
 
         cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
-        // The list owns the keyboard whenever no dialog is open, so the shortcuts work from
-        // the first frame and again after a dialog closes.
-        cx.observe_in(&dialogs, window, |this, dialogs, window, cx| {
-            if dialogs.read(cx).current_dialog == DialogKind::None {
+
+        // The list owns the keyboard whenever no modal or search bar is open; only restore focus
+        // on an actual open -> closed transition so unrelated updates do not steal focus.
+        let mut dialog_was_open = false;
+        cx.observe_in(&dialogs, window, move |this, dialogs, window, cx| {
+            let now_open = dialogs.read(cx).current_dialog != DialogKind::None;
+            if !dialog_was_open && now_open {
+                dialogs.update(cx, |dialogs, cx| dialogs.focus(window, cx));
+            } else if dialog_was_open && !now_open && !this.any_modal_or_search_open(cx) {
                 this.list.read(cx).focus_handle.focus(window);
             }
+            dialog_was_open = now_open;
             cx.notify();
         })
         .detach();
+
+        let mut remote_was_open = false;
+        cx.observe_in(&remote_dialogs, window, move |this, remote, window, cx| {
+            let now_open = remote.read(cx).is_open(cx);
+            if remote_was_open && !now_open && !this.any_modal_or_search_open(cx) {
+                this.list.read(cx).focus_handle.focus(window);
+            }
+            remote_was_open = now_open;
+            cx.notify();
+        })
+        .detach();
+
+        let mut settings_was_open = false;
+        cx.observe_in(&settings, window, move |this, settings, window, cx| {
+            let now_open = settings.read(cx).is_open(cx);
+            if settings_was_open && !now_open && !this.any_modal_or_search_open(cx) {
+                this.list.read(cx).focus_handle.focus(window);
+            }
+            settings_was_open = now_open;
+            cx.notify();
+        })
+        .detach();
+
+        let mut search_was_active = false;
+        cx.observe_in(&search, window, move |this, search, window, cx| {
+            let now_active = search.read(cx).is_active();
+            if search_was_active && !now_active && !this.any_modal_or_search_open(cx) {
+                this.list.read(cx).focus_handle.focus(window);
+            }
+            search_was_active = now_active;
+            cx.notify();
+        })
+        .detach();
+
         list.read(cx).focus_handle.focus(window);
         // Read the appearance from the window: asking the platform (`cx.window_appearance()`)
         // from inside this callback re-borrows gpui's Wayland client and panics.
         cx.observe_window_appearance(window, |_, window, cx| {
             Theme::apply_appearance(window.appearance(), cx)
+        })
+        .detach();
+
+        let remote_sync_for_window = remote_sync.clone();
+        cx.observe_window_activation(window, move |_, window, cx| {
+            let focused = window.is_window_active();
+            remote_sync_for_window.update(cx, |host, cx| host.on_window_activation(focused, cx));
         })
         .detach();
 
@@ -92,32 +146,32 @@ impl MainView {
             network,
             dialogs,
             remote_dialogs,
+            settings,
+            remote_sync,
         }
     }
 }
 
 impl MainView {
+    fn any_modal_or_search_open(&self, cx: &App) -> bool {
+        self.dialogs.read(cx).current_dialog != DialogKind::None
+            || self.remote_dialogs.read(cx).is_open(cx)
+            || self.settings.read(cx).is_open(cx)
+            || self.search.read(cx).is_active()
+    }
+
     // File shortcuts act on the list's selection, so they are ignored while the keyboard is
     // in the address bar, the search field, or a dialog.
     fn list_has_keyboard(&self, window: &Window, cx: &App) -> bool {
         self.list.read(cx).focus_handle.is_focused(window)
     }
 
-    fn selected_paths(&self, cx: &App) -> Vec<PathBuf> {
-        let state = self.app_state.read(cx);
-        state
-            .selection
-            .selected_in_order(&state.entries)
-            .into_iter()
-            .map(|entry| entry.path().to_path_buf())
-            .collect()
+    fn selected_locations(&self, cx: &App) -> Vec<Location> {
+        self.app_state.read(cx).selected_locations()
     }
 
-    fn current_dir(&self, cx: &App) -> Option<PathBuf> {
-        match &self.app_state.read(cx).current_location {
-            Location::Local(path) => Some(path.clone()),
-            Location::Remote { .. } => None,
-        }
+    fn current_location(&self, cx: &App) -> Location {
+        self.app_state.read(cx).current_location().clone()
     }
 
     fn resize_panels(&mut self, cx: &mut Context<Self>, resize: impl FnOnce(&mut PanelLayout)) {
@@ -182,16 +236,16 @@ impl MainView {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
-        let paths = self.selected_paths(cx);
-        if paths.is_empty() {
+        let locations = self.selected_locations(cx);
+        if locations.is_empty() {
             return;
         }
-        let count = paths.len();
+        let count = locations.len();
         if is_cut {
-            cut_to_clipboard(paths);
+            cut_locations_to_clipboard(locations);
             self.set_status(format!("Cut {count} item(s)"), cx);
         } else {
-            copy_to_clipboard(paths);
+            copy_locations_to_clipboard(locations);
             self.set_status(format!("Copied {count} item(s) to the clipboard"), cx);
         }
     }
@@ -200,42 +254,23 @@ impl MainView {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
-        let Some(clipboard) = get_clipboard() else {
+        let Some(clipboard) = get_location_clipboard() else {
             self.set_status("Nothing to paste", cx);
             return;
         };
-        let Some(dest_dir) = self.current_dir(cx) else {
-            return;
-        };
+        let dest_dir = self.current_location(cx);
         let in_place = clipboard
             .sources
             .iter()
-            .all(|src| src.parent() == Some(dest_dir.as_path()));
+            .all(|src| src.parent().as_ref() == Some(&dest_dir));
         if clipboard.is_cut && in_place {
             self.set_status("The items are already in this folder", cx);
             return;
         }
 
-        if let Some(conflict) = check_paste_conflict(&clipboard.sources, &dest_dir) {
-            self.open_dialog(window, cx, |dialogs, cx| {
-                dialogs.open_conflict_resolution(
-                    clipboard.sources,
-                    dest_dir,
-                    clipboard.is_cut,
-                    conflict,
-                    cx,
-                )
-            });
-            return;
-        }
-
-        let transfer = if clipboard.is_cut {
-            Transfer::moving(clipboard.sources, dest_dir, ConflictPolicy::Skip)
-        } else {
-            Transfer::copy(clipboard.sources, dest_dir, ConflictPolicy::Skip)
-        };
-        self.app_state
-            .update(cx, |state, _| start_transfer(state, transfer));
+        self.dialogs.update(cx, |dialogs, cx| {
+            dialogs.begin_paste(clipboard.sources, dest_dir, clipboard.is_cut, cx);
+        });
         cx.notify();
     }
 
@@ -247,25 +282,18 @@ impl MainView {
         self.ask_to_remove(window, cx);
     }
 
-    /// Removal goes to the trash. The permanent-deletion prompt is offered only where the
-    /// trash would refuse the items, which is on network and unidentified volumes.
+    /// Removal goes to the trash on local disks; permanent deletion is offered directly for
+    /// remote servers and non-local volumes where trash is unavailable.
     fn ask_to_remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
-        let paths = self.selected_paths(cx);
-        if paths.is_empty() {
+        let locations = self.selected_locations(cx);
+        if locations.is_empty() {
             return;
         }
-        let trash_available = paths
-            .iter()
-            .all(|path| volume_kind(path) == VolumeKind::Local);
         self.open_dialog(window, cx, |dialogs, cx| {
-            if trash_available {
-                dialogs.open_confirm_trash(paths, cx)
-            } else {
-                dialogs.open_confirm_delete(paths, cx)
-            }
+            dialogs.open_remove_confirmation(locations, cx)
         });
     }
 
@@ -273,10 +301,10 @@ impl MainView {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
-        let Ok([path]) = <[PathBuf; 1]>::try_from(self.selected_paths(cx)) else {
+        let Ok([location]) = <[Location; 1]>::try_from(self.selected_locations(cx)) else {
             return;
         };
-        self.open_dialog(window, cx, |dialogs, cx| dialogs.open_rename(path, cx));
+        self.open_dialog(window, cx, |dialogs, cx| dialogs.open_rename(location, cx));
     }
 
     fn on_new_folder(
@@ -288,9 +316,7 @@ impl MainView {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
-        let Some(parent) = self.current_dir(cx) else {
-            return;
-        };
+        let parent = self.current_location(cx);
         self.open_dialog(window, cx, |dialogs, cx| {
             dialogs.open_new_folder(parent, cx)
         });
@@ -304,6 +330,62 @@ impl MainView {
             let _ = execute_undo(state);
         });
         cx.notify();
+    }
+
+    fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        let is_open = self.settings.read(cx).is_open(cx);
+        self.settings.update(cx, |settings, cx| {
+            if is_open {
+                settings.close(cx);
+            } else {
+                settings.open(cx);
+                settings.focus(window, cx);
+            }
+        });
+    }
+
+    fn on_manage_servers(
+        &mut self,
+        _: &ManageServers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote_dialogs.update(cx, |dialogs, cx| {
+            dialogs.open_profile_manager(cx);
+            dialogs.focus(window, cx);
+        });
+    }
+
+    fn on_toggle_search(&mut self, _: &ToggleSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.update(cx, |search, cx| {
+            search.toggle(window, cx);
+        });
+    }
+
+    fn on_refresh_listing(&mut self, _: &RefreshListing, _: &mut Window, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, cx| {
+            state.refresh_current();
+            cx.notify();
+        });
+    }
+
+    fn on_reconnect_remote(&mut self, _: &ReconnectRemote, _: &mut Window, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, cx| {
+            state.reconnect_current();
+            cx.notify();
+        });
+    }
+
+    fn on_disconnect_remote(
+        &mut self,
+        _: &DisconnectRemote,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.app_state.update(cx, |state, cx| {
+            state.disconnect_current();
+            cx.notify();
+        });
     }
 }
 
@@ -334,6 +416,12 @@ impl Render for MainView {
             .on_action(cx.listener(Self::on_rename))
             .on_action(cx.listener(Self::on_new_folder))
             .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_manage_servers))
+            .on_action(cx.listener(Self::on_toggle_search))
+            .on_action(cx.listener(Self::on_refresh_listing))
+            .on_action(cx.listener(Self::on_reconnect_remote))
+            .on_action(cx.listener(Self::on_disconnect_remote))
             .on_action(cx.listener(|this, _: &TogglePreview, _, cx| {
                 this.resize_panels(cx, PanelLayout::toggle_preview)
             }))
@@ -432,6 +520,7 @@ impl Render for MainView {
             // Dialog overlays
             .child(self.dialogs.clone())
             .child(self.remote_dialogs.clone())
+            .child(self.settings.clone())
     }
 }
 

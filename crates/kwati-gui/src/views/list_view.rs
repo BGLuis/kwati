@@ -15,7 +15,7 @@ use crate::actions::navigation::{
     SelectNext, SelectPrevious, ToggleHidden,
 };
 use crate::components::{icon, Ellipsize, IconName, ScrollbarState};
-use crate::state::AppState;
+use crate::state::{entry_location, AppState};
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole};
 
@@ -128,19 +128,12 @@ impl ListView {
         cx: &mut Context<Self>,
     ) {
         if event.button == MouseButton::Left && event.click_count == 2 {
-            if entry.is_dir() {
-                // Double click on folder enters it and launches no application
-                self.app_state.update(cx, |state, _cx| {
-                    state.navigate_to(entry.location());
-                });
-            } else {
-                // Double click on file opens with system default application
-                cx.open_with_system(entry.path());
-            }
+            self.open_entry(entry, cx);
         } else if event.button == MouseButton::Left {
             // Single click: select entry
             self.app_state.update(cx, |state, _cx| {
-                state.selection.select_only(entry.location());
+                let location = state.location_of(&entry);
+                state.selection.select_only(location);
             });
         }
     }
@@ -202,15 +195,27 @@ impl ListView {
     pub fn open_selected(&mut self, cx: &mut Context<Self>) {
         let entry_opt = self.app_state.read(cx).selected_entry().cloned();
         if let Some(entry) = entry_opt {
-            if entry.is_dir() {
-                self.app_state.update(cx, |state, _cx| {
-                    state.navigate_to(entry.location());
-                });
-            } else {
-                cx.open_with_system(entry.path());
-            }
+            self.open_entry(entry, cx);
         }
         cx.notify();
+    }
+
+    /// Enters a folder, or opens a local file with the system's default application. Remote
+    /// files cannot be opened yet, so they get a notice instead.
+    fn open_entry(&mut self, entry: Entry, cx: &mut Context<Self>) {
+        let is_remote = self.app_state.read(cx).is_remote();
+        if entry.is_dir() {
+            self.app_state.update(cx, |state, _cx| {
+                let location = state.location_of(&entry);
+                state.navigate_to(location);
+            });
+        } else if is_remote {
+            self.app_state.update(cx, |state, _cx| {
+                state.set_status(REMOTE_FILE_NOTICE);
+            });
+        } else {
+            cx.open_with_system(entry.path());
+        }
     }
 
     pub fn go_up(&mut self, cx: &mut Context<Self>) {
@@ -309,6 +314,8 @@ impl ListView {
     }
 }
 
+pub const REMOTE_FILE_NOTICE: &str = "Files on remote locations cannot be opened or previewed yet";
+
 const SIZE_COLUMN: Pixels = px(72.);
 const DATE_COLUMN: Pixels = px(128.);
 const HIDDEN_TOGGLE_COLUMN: Pixels = px(80.);
@@ -321,6 +328,7 @@ impl Render for ListView {
         let state = self.app_state.read(cx);
         let entries = state.entries.clone();
         let selection = state.selection.clone();
+        let current = state.current_location.clone();
         let entry_count = entries.len();
         let sort_column = state.sort_column;
         let sort_direction = state.sort_direction;
@@ -521,7 +529,7 @@ impl Render for ListView {
                                 for ix in range {
                                     if let Some(entry) = entries_clone.get(ix) {
                                         let entry: &Entry = entry;
-                                        let loc: Location = entry.location();
+                                        let loc: Location = entry_location(&current, entry);
                                         let is_selected = selection.contains(&loc);
                                         let is_dir = entry.is_dir();
                                         let is_hidden = entry.is_hidden;

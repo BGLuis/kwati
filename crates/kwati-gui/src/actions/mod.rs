@@ -8,7 +8,18 @@ pub use open_with::*;
 pub use operations::*;
 pub use remote_sync::*;
 
-use gpui::{App, KeyBinding};
+use gpui::{actions, App, KeyBinding};
+
+actions!(
+    kwati,
+    [
+        OpenSettings,
+        ReconnectRemote,
+        DisconnectRemote,
+        RefreshListing,
+        ManageServers,
+    ]
+);
 
 /// Registers key bindings for global explorer navigation and operations.
 pub fn register_keybindings(cx: &mut App) {
@@ -36,5 +47,9 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("f2", operations::Rename, None),
         KeyBinding::new("ctrl-shift-n", operations::NewFolder, None),
         KeyBinding::new("cmd-shift-n", operations::NewFolder, None),
+        // Settings & remote
+        KeyBinding::new("ctrl-,", OpenSettings, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
     ]);
+    crate::views::search_view::register_search_keybindings(cx);
 }

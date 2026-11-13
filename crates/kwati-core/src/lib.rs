@@ -6,11 +6,13 @@ mod ftp;
 mod move_entry;
 pub mod places;
 mod profiles;
+mod remote;
 pub mod remote_poll;
 mod search;
 mod secrets;
 mod settings;
 mod sftp;
+mod smb;
 mod transfer;
 mod trash;
 pub mod volume;
@@ -35,14 +37,17 @@ pub use profiles::{
     default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
     PendingSecret, Protocol,
 };
+pub use remote::connect_profile;
 pub use remote_poll::{RemotePoller, MIN_POLL_INTERVAL};
-pub use search::{SearchHandle, SearchHit, SearchOptions, Searcher};
+pub use search::{RemoteSearchOptions, SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use secrets::{KeyringSecrets, Secrets, SecretsError};
 pub use settings::{
     default_path as settings_path, Settings, SettingsWarning, DEFAULT_REFRESH_INTERVAL_SECS,
-    DEFAULT_REMOTE_POLL_INTERVAL_SECS, MIN_REMOTE_POLL_INTERVAL_SECS,
+    DEFAULT_REMOTE_POLL_INTERVAL_SECS, DEFAULT_REMOTE_SEARCH_DEPTH, DEFAULT_REMOTE_SEARCH_PARALLEL,
+    MIN_REMOTE_POLL_INTERVAL_SECS,
 };
 pub use sftp::{known_hosts_path, HostKeyChanged, HostKeyUnknown, KnownHosts, SftpBackend};
+pub use smb::SmbBackend;
 pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
@@ -75,7 +80,7 @@ pub struct Entry {
 
 impl Entry {
     pub fn new(name: OsString, path: PathBuf, is_dir: bool) -> Self {
-        let is_hidden = is_hidden_entry(&name, None);
+        let is_hidden = is_hidden_entry(&name, None) || name.to_string_lossy().starts_with('.');
         Self {
             name,
             path,
@@ -142,6 +147,7 @@ impl Entry {
 }
 
 /// Determines whether an entry is hidden based on platform conventions.
+#[cfg_attr(windows, allow(unused_variables))]
 pub fn is_hidden_entry(name: &OsStr, _metadata: Option<&fs::Metadata>) -> bool {
     #[cfg(windows)]
     {
@@ -507,6 +513,18 @@ impl Location {
         self.path().file_name()
     }
 
+    /// The folder holding this location, on the same side (and profile), or `None` at a root.
+    pub fn parent(&self) -> Option<Location> {
+        let parent = self.path().parent()?;
+        Some(match self {
+            Location::Local(_) => Location::Local(parent.to_path_buf()),
+            Location::Remote { profile_id, .. } => Location::Remote {
+                profile_id: profile_id.clone(),
+                path: parent.to_path_buf(),
+            },
+        })
+    }
+
     /// The same location kind (and profile) with `name` appended to the path.
     pub fn join(&self, name: &OsStr) -> Location {
         match self {
@@ -611,7 +629,52 @@ impl BackendError {
     pub fn is_trash_unavailable(&self) -> bool {
         matches!(self, BackendError::Io(err) if is_trash_unavailable(err))
     }
+
+    /// The rejection behind this error, if the server refused the user name and credential.
+    pub fn authentication_failed(&self) -> Option<&AuthenticationFailed> {
+        match self {
+            BackendError::Io(err) => err.get_ref()?.downcast_ref(),
+            BackendError::Unsupported => None,
+        }
+    }
 }
+
+/// The server refused the user name and the password, key or passphrase sent with it.
+///
+/// Carried inside an [`io::Error`] of kind [`io::ErrorKind::PermissionDenied`]; detect it with
+/// [`BackendError::authentication_failed`]. Backends never retry it on their own, so a wrong
+/// password does not lock the account; the interface asks the user again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticationFailed {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+}
+
+impl AuthenticationFailed {
+    pub(crate) fn error(profile: &ConnectionProfile) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            Self {
+                host: profile.host.clone(),
+                port: profile.port,
+                user: profile.user.clone(),
+            },
+        )
+    }
+}
+
+impl std::fmt::Display for AuthenticationFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{} rejected the credentials of {}",
+            self.host, self.port, self.user
+        )
+    }
+}
+
+impl std::error::Error for AuthenticationFailed {}
 
 /// What a backend reports about one entry, without following symlinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -641,7 +704,12 @@ pub trait Backend: Send + Sync {
     ) -> Result<Listing, BackendError> {
         match location {
             Location::Local(path) => Ok(list_dir_with_options(path, options)?),
-            Location::Remote { .. } => Err(BackendError::Unsupported),
+            Location::Remote { .. } => {
+                let mut entries = self.list(location)?.into_entries();
+                entries.retain(|entry| options.show_hidden || !entry.is_hidden);
+                sort_entries_by(&mut entries, options.sort_column, options.sort_direction);
+                Ok(Listing { entries })
+            }
         }
     }
 
@@ -809,3 +877,17 @@ pub use preview::*;
 
 pub mod history;
 pub use history::History;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_new_marks_dotfiles_hidden_across_platforms() {
+        let secret = Entry::new(".secret".into(), PathBuf::from("/.secret"), false);
+        assert!(secret.is_hidden);
+
+        let visible = Entry::new("visible.txt".into(), PathBuf::from("/visible.txt"), false);
+        assert!(!visible.is_hidden);
+    }
+}

@@ -8,11 +8,14 @@ use std::time::Duration;
 
 use gpui::{
     div, prelude::*, px, transparent_black, AnyElement, Context, Div, ElementId, Entity,
-    FontWeight, MouseButton, MouseDownEvent, Stateful, Svg, Task, Window,
+    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Stateful, Subscription, Svg, Task,
+    Window,
 };
-use kwati_core::{device_volumes, network_mounts, Location, NetworkMount, Volume};
+use kwati_core::{device_volumes, network_mounts, ConnectionState, Location, NetworkMount, Volume};
 
-use crate::components::{icon, Ellipsize, IconName, Tooltip};
+use crate::actions::ManageServers;
+use crate::components::{icon, Ellipsize, IconName, TextInput, Tooltip};
+use crate::remote::protocol_label;
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, TextRole};
@@ -231,6 +234,66 @@ pub enum MountResult {
     Failed(String),
 }
 
+/// Connection status for a saved remote server profile in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerConnectionStatus {
+    Connected,
+    Connecting,
+    Reconnecting,
+    Disconnected,
+}
+
+impl ServerConnectionStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "Conectado",
+            Self::Connecting => "Conectando",
+            Self::Reconnecting => "Reconectando",
+            Self::Disconnected => "Desconectado",
+        }
+    }
+}
+
+/// Snapshot of a saved remote server profile for sidebar rendering and tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarServerItem {
+    pub id: String,
+    pub name: String,
+    pub protocol: &'static str,
+    pub host: String,
+    pub port: u16,
+    pub status: ServerConnectionStatus,
+}
+
+/// Computes the sidebar connection status of `profile_id` from `AppState`.
+pub fn server_connection_status(state: &AppState, profile_id: &str) -> ServerConnectionStatus {
+    if state.connecting.as_deref() == Some(profile_id) {
+        return ServerConnectionStatus::Connecting;
+    }
+    match state.remote.state(profile_id) {
+        Some(ConnectionState::Connected) => ServerConnectionStatus::Connected,
+        Some(ConnectionState::Reconnecting) => ServerConnectionStatus::Reconnecting,
+        Some(ConnectionState::Disconnected) | None => ServerConnectionStatus::Disconnected,
+    }
+}
+
+/// Returns all saved remote server profiles with protocol and connection status.
+pub fn server_items(state: &AppState) -> Vec<SidebarServerItem> {
+    state
+        .remote
+        .profiles()
+        .iter()
+        .map(|p| SidebarServerItem {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            protocol: protocol_label(p.protocol),
+            host: p.host.clone(),
+            port: p.port,
+            status: server_connection_status(state, &p.id),
+        })
+        .collect()
+}
+
 /// How often drives and shares are listed again, so a plugged-in disk or a newly mounted
 /// share shows up without a restart.
 const DEVICE_POLL: Duration = Duration::from_secs(3);
@@ -243,11 +306,26 @@ pub struct SidebarView {
     pub network: Vec<NetworkMount>,
     /// Drives show as plain rows unless the user asks for capacity cards with a right click.
     pub drive_details: bool,
+    editing_bookmark: Option<usize>,
+    rename_input: Entity<TextInput>,
+    _state_sub: Subscription,
     _device_poll: Task<()>,
 }
 
 impl SidebarView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let initial_bookmarks = app_state
+            .read(cx)
+            .settings
+            .bookmarks
+            .iter()
+            .map(|b| UserBookmark::new(&b.name, b.path.clone()))
+            .collect();
+        let rename_input = cx.new(|cx| TextInput::with_placeholder("Nome do favorito", cx));
+        let state_sub = cx.observe(&app_state, |this, app_state, cx| {
+            this.sync_bookmarks_from_state(app_state.read(cx));
+            cx.notify();
+        });
         let device_poll = cx.spawn(async move |this, cx| loop {
             let (volumes, network) = cx
                 .background_executor()
@@ -262,11 +340,32 @@ impl SidebarView {
         Self {
             app_state,
             places: standard_places(),
-            bookmarks: Vec::new(),
+            bookmarks: initial_bookmarks,
             volumes: Vec::new(),
             network: Vec::new(),
             drive_details: false,
+            editing_bookmark: None,
+            rename_input,
+            _state_sub: state_sub,
             _device_poll: device_poll,
+        }
+    }
+
+    /// Synchronizes `self.bookmarks` with `state.settings.bookmarks`.
+    pub fn sync_bookmarks_from_state(&mut self, state: &AppState) {
+        let synced: Vec<UserBookmark> = state
+            .settings
+            .bookmarks
+            .iter()
+            .map(|b| UserBookmark::new(&b.name, b.path.clone()))
+            .collect();
+        if self.bookmarks != synced {
+            self.bookmarks = synced;
+            if let Some(idx) = self.editing_bookmark {
+                if idx >= self.bookmarks.len() {
+                    self.editing_bookmark = None;
+                }
+            }
         }
     }
 
@@ -305,6 +404,124 @@ impl SidebarView {
         let item = self.bookmarks.remove(from);
         self.bookmarks.insert(to, item);
         true
+    }
+
+    /// Adds a bookmark via `AppState::add_bookmark` and persists/syncs it.
+    pub fn add_bookmark_in_state(
+        &mut self,
+        name: impl Into<String>,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let res = self
+            .app_state
+            .update(cx, |state, _| state.add_bookmark(name, path));
+        if res.is_ok() {
+            let state = self.app_state.read(cx);
+            self.sync_bookmarks_from_state(state);
+        }
+        cx.notify();
+        res
+    }
+
+    /// Removes a bookmark via `AppState::remove_bookmark` and persists/syncs it.
+    pub fn remove_bookmark_in_state(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let res = self
+            .app_state
+            .update(cx, |state, _| state.remove_bookmark(index).map(|_| ()));
+        if res.is_ok() {
+            if self.editing_bookmark == Some(index) {
+                self.editing_bookmark = None;
+            }
+            let state = self.app_state.read(cx);
+            self.sync_bookmarks_from_state(state);
+        }
+        cx.notify();
+        res
+    }
+
+    /// Renames a bookmark via `AppState::rename_bookmark` and persists/syncs it.
+    pub fn rename_bookmark_in_state(
+        &mut self,
+        index: usize,
+        name: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let res = self
+            .app_state
+            .update(cx, |state, _| state.rename_bookmark(index, name));
+        if res.is_ok() {
+            self.editing_bookmark = None;
+            let state = self.app_state.read(cx);
+            self.sync_bookmarks_from_state(state);
+        }
+        cx.notify();
+        res
+    }
+
+    /// Pins the current local folder into `AppState::settings.bookmarks`.
+    pub fn pin_current_location(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let current = self.app_state.read(cx).current_location.clone();
+        let Location::Local(path) = current else {
+            return Err("Apenas pastas locais podem ser fixadas nos favoritos.".into());
+        };
+        if self.bookmarks.iter().any(|b| b.path == path) {
+            return Ok(());
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        self.add_bookmark_in_state(name, path, cx)
+    }
+
+    pub fn begin_rename_bookmark(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bm) = self.bookmarks.get(index) else {
+            return;
+        };
+        let current_name = bm.name.clone();
+        self.editing_bookmark = Some(index);
+        self.rename_input.update(cx, |input, cx| {
+            input.set_text(current_name, cx);
+        });
+        self.rename_input.read(cx).focus_handle.focus(window);
+        cx.notify();
+    }
+
+    pub fn commit_rename_bookmark(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.editing_bookmark else {
+            return;
+        };
+        let new_name = self.rename_input.read(cx).text().trim().to_string();
+        if new_name.is_empty() {
+            self.editing_bookmark = None;
+            cx.notify();
+            return;
+        }
+        let _ = self.rename_bookmark_in_state(index, new_name, cx);
+    }
+
+    pub fn cancel_rename_bookmark(&mut self, cx: &mut Context<Self>) {
+        self.editing_bookmark = None;
+        cx.notify();
+    }
+
+    /// Initiates a connection to the saved server profile `profile_id`.
+    pub fn connect_server(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, _| {
+            state.connect(profile_id, None, false);
+        });
+        cx.notify();
     }
 
     // --- Volumes and Eject management ---
@@ -394,7 +611,7 @@ impl SidebarView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::get(cx);
-        let is_active = current_loc.path() == vol.mount_point;
+        let is_active = matches!(current_loc, Location::Local(p) if p == &vol.mount_point);
         let tooltip = if vol.is_mounted {
             format!("{} — {}", vol.mount_point.display(), vol.capacity_summary())
         } else {
@@ -438,7 +655,10 @@ impl SidebarView {
     /// actions wait for the full sidebar.
     fn render_compact(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx);
-        let current_loc = self.app_state.read(cx).current_location.clone();
+        let (current_loc, servers) = {
+            let state = self.app_state.read(cx);
+            (state.current_location.clone(), server_items(state))
+        };
         let divider = || div().h(px(1.)).mx(space::S4).bg(theme.border);
         let row = |id: ElementId, icon: Svg, label: String, is_active: bool| -> Stateful<Div> {
             div()
@@ -477,7 +697,7 @@ impl SidebarView {
                     ("place", ix).into(),
                     icon(place.icon).text_color(color),
                     place.name.clone(),
-                    current_loc.path() == place.path,
+                    matches!(&current_loc, Location::Local(p) if p == &place.path),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
@@ -502,7 +722,7 @@ impl SidebarView {
                     ("bookmark", ix).into(),
                     glyph,
                     label,
-                    current_loc.path() == bm.path,
+                    matches!(&current_loc, Location::Local(p) if p == &bm.path),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
@@ -529,7 +749,7 @@ impl SidebarView {
                     ("drive", ix).into(),
                     icon(IconName::Drive).text_color(color),
                     label,
-                    current_loc.path() == vol.mount_point,
+                    matches!(&current_loc, Location::Local(p) if p == &vol.mount_point),
                 )
                 .when(is_mounted, |s| {
                     s.on_mouse_down(
@@ -545,13 +765,55 @@ impl SidebarView {
                     ("share", ix).into(),
                     icon(IconName::Network).text_color(theme.text),
                     share.name.clone(),
-                    current_loc.path() == share.mount_point,
+                    matches!(&current_loc, Location::Local(p) if p == &share.mount_point),
                 )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
                 )
             }))
+            .child(divider())
+            .children(servers.into_iter().enumerate().map(|(ix, server)| {
+                let server_id = server.id.clone();
+                let is_active = matches!(
+                    &current_loc,
+                    Location::Remote { profile_id, .. } if profile_id == &server.id
+                );
+                let color = match server.status {
+                    ServerConnectionStatus::Connected => theme.secondary,
+                    ServerConnectionStatus::Connecting | ServerConnectionStatus::Reconnecting => {
+                        theme.warning
+                    }
+                    ServerConnectionStatus::Disconnected => theme.text,
+                };
+                let tooltip = format!(
+                    "{} ({}) — {}",
+                    server.name,
+                    server.protocol,
+                    server.status.label()
+                );
+                row(
+                    ("server", ix).into(),
+                    icon(IconName::Network).text_color(color),
+                    tooltip,
+                    is_active,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.connect_server(&server_id, cx);
+                    }),
+                )
+            }))
+            .child(
+                row(
+                    "compact-manage-servers".into(),
+                    icon(IconName::Plus).text_color(theme.text_muted),
+                    "Gerenciar servidores".into(),
+                    false,
+                )
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(ManageServers), cx)),
+            )
             .into_any_element()
     }
 }
@@ -574,7 +836,13 @@ impl Render for SidebarView {
         let volumes = self.volumes.clone();
         let network = self.network.clone();
         let drive_details = self.drive_details;
-        let current_loc = self.app_state.read(cx).current_location.clone();
+        let editing_bookmark = self.editing_bookmark;
+        let (current_loc, servers) = {
+            let state = self.app_state.read(cx);
+            (state.current_location.clone(), server_items(state))
+        };
+        let can_pin_current =
+            matches!(&current_loc, Location::Local(p) if !bookmarks.iter().any(|b| &b.path == p));
 
         div()
             .size_full()
@@ -601,7 +869,7 @@ impl Render for SidebarView {
                             .child("Places"),
                     )
                     .children(places.into_iter().map(|place| {
-                        let is_active = current_loc.path() == place.path;
+                        let is_active = matches!(&current_loc, Location::Local(p) if p == &place.path);
                         let p_clone = place.path.clone();
 
                         div()
@@ -633,7 +901,7 @@ impl Render for SidebarView {
                     })),
             )
             // --- BOOKMARKS SECTION ---
-            .when(!bookmarks.is_empty(), |parent| {
+            .when(!bookmarks.is_empty() || can_pin_current, |parent| {
                 parent.child(
                     div()
                         .flex()
@@ -643,16 +911,74 @@ impl Render for SidebarView {
                             div()
                                 .px(space::S8)
                                 .py(space::S4)
-                                .text_label()
-                                .text_color(theme.text_muted)
-                                .child("Bookmarks"),
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_label()
+                                        .text_color(theme.text_muted)
+                                        .child("Bookmarks"),
+                                )
+                                .when(can_pin_current, |hdr| {
+                                    hdr.child(
+                                        div()
+                                            .id("sidebar-add-bookmark")
+                                            .p(space::S2)
+                                            .rounded(radius::CONTROL)
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(theme.border))
+                                            .tooltip(Tooltip::text(
+                                                "Adicionar pasta atual aos favoritos",
+                                            ))
+                                            .child(
+                                                icon(IconName::Plus).text_color(theme.text_muted),
+                                            )
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    let _ = this.pin_current_location(cx);
+                                                }),
+                                            ),
+                                    )
+                                }),
                         )
                         .children(bookmarks.into_iter().enumerate().map(|(idx, bm)| {
                             let is_missing = bm.is_missing();
-                            let is_active = current_loc.path() == bm.path;
+                            let is_active =
+                                matches!(&current_loc, Location::Local(p) if p == &bm.path);
                             let p_clone = bm.path.clone();
 
+                            if editing_bookmark == Some(idx) {
+                                return div()
+                                    .id(("bookmark-edit", idx))
+                                    .h(size::SIDEBAR_ROW)
+                                    .px(space::S4)
+                                    .rounded(radius::CONTROL)
+                                    .bg(theme.surface)
+                                    .border_1()
+                                    .border_color(theme.accent)
+                                    .flex()
+                                    .items_center()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                                        if ev.keystroke.key == "enter" {
+                                            cx.stop_propagation();
+                                            this.commit_rename_bookmark(cx);
+                                        } else if ev.keystroke.key == "escape" {
+                                            cx.stop_propagation();
+                                            this.cancel_rename_bookmark(cx);
+                                        }
+                                    }))
+                                    .child(self.rename_input.clone())
+                                    .into_any_element();
+                            }
+
                             div()
+                                .id(("bookmark-row", idx))
                                 .h(size::SIDEBAR_ROW)
                                 .px(space::S8)
                                 .rounded(radius::CONTROL)
@@ -663,6 +989,7 @@ impl Render for SidebarView {
                                 .flex()
                                 .items_center()
                                 .justify_between()
+                                .gap(space::S4)
                                 .child(
                                     div()
                                         .flex()
@@ -688,15 +1015,47 @@ impl Render for SidebarView {
                                 )
                                 .child(
                                     div()
-                                        .rounded(radius::CONTROL)
-                                        .hover(|s| s.bg(theme.surface_raised))
-                                        .child(icon(IconName::Close).text_color(theme.text_muted))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.remove_bookmark(idx);
-                                                cx.notify();
-                                            }),
+                                        .flex()
+                                        .items_center()
+                                        .gap(space::S2)
+                                        .child(
+                                            div()
+                                                .id(("bookmark-rename", idx))
+                                                .px(space::S4)
+                                                .rounded(radius::CONTROL)
+                                                .hover(|s| s.bg(theme.surface_raised))
+                                                .text_label()
+                                                .text_color(theme.text_muted)
+                                                .tooltip(Tooltip::text("Renomear favorito"))
+                                                .child("Aa")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.begin_rename_bookmark(
+                                                            idx, window, cx,
+                                                        );
+                                                    }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("bookmark-remove", idx))
+                                                .rounded(radius::CONTROL)
+                                                .hover(|s| s.bg(theme.surface_raised))
+                                                .tooltip(Tooltip::text("Remover favorito"))
+                                                .child(
+                                                    icon(IconName::Close)
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        let _ =
+                                                            this.remove_bookmark_in_state(idx, cx);
+                                                    }),
+                                                ),
                                         ),
                                 )
                                 .on_mouse_down(
@@ -705,9 +1064,141 @@ impl Render for SidebarView {
                                         this.navigate_to_path(&p_clone, cx);
                                     }),
                                 )
+                                .into_any_element()
                         })),
                 )
             })
+            // --- SERVERS SECTION ---
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .px(space::S8)
+                            .py(space::S4)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_label()
+                                    .text_color(theme.text_muted)
+                                    .child("Servidores"),
+                            )
+                            .child(
+                                div()
+                                    .id("sidebar-manage-servers")
+                                    .px(space::S4)
+                                    .py(space::S2)
+                                    .rounded(radius::CONTROL)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme.border))
+                                    .flex()
+                                    .items_center()
+                                    .gap(space::S4)
+                                    .text_label()
+                                    .text_color(theme.text_muted)
+                                    .tooltip(Tooltip::text("Gerenciar servidores"))
+                                    .child(icon(IconName::Settings).text_color(theme.text_muted))
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(ManageServers), cx);
+                                    }),
+                            ),
+                    )
+                    .when(servers.is_empty(), |sec| {
+                        sec.child(
+                            div()
+                                .id("sidebar-add-server")
+                                .h(size::SIDEBAR_ROW)
+                                .px(space::S8)
+                                .rounded(radius::CONTROL)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.border))
+                                .flex()
+                                .items_center()
+                                .gap(space::S8)
+                                .text_body()
+                                .text_color(theme.text_muted)
+                                .child(icon(IconName::Plus).text_color(theme.text_muted))
+                                .child("Adicionar servidor…")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(ManageServers), cx);
+                                }),
+                        )
+                    })
+                    .children(servers.into_iter().enumerate().map(|(ix, server)| {
+                        let server_id = server.id.clone();
+                        let is_active = matches!(
+                            &current_loc,
+                            Location::Remote { profile_id, .. } if profile_id == &server.id
+                        );
+                        let dot_color = match server.status {
+                            ServerConnectionStatus::Connected => theme.secondary,
+                            ServerConnectionStatus::Connecting
+                            | ServerConnectionStatus::Reconnecting => theme.warning,
+                            ServerConnectionStatus::Disconnected => theme.border_strong,
+                        };
+                        let tooltip = format!(
+                            "{} ({}://{}:{}) — {}",
+                            server.name,
+                            server.protocol.to_ascii_lowercase(),
+                            server.host,
+                            server.port,
+                            server.status.label()
+                        );
+
+                        div()
+                            .id(("server-row", ix))
+                            .h(size::SIDEBAR_ROW)
+                            .px(space::S8)
+                            .rounded(radius::CONTROL)
+                            .cursor_pointer()
+                            .when(is_active, |s| s.bg(theme.selection))
+                            .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
+                            .text_body()
+                            .text_color(theme.text)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(space::S8)
+                            .tooltip(Tooltip::text(tooltip))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap(space::S8)
+                                    .child(
+                                        div()
+                                            .w(px(7.))
+                                            .h(px(7.))
+                                            .rounded_full()
+                                            .flex_none()
+                                            .bg(dot_color),
+                                    )
+                                    .child(icon(IconName::Network).text_color(theme.text))
+                                    .child(div().ellipsize().child(server.name)),
+                            )
+                            .child(
+                                div()
+                                    .px(space::S4)
+                                    .rounded(radius::CONTROL)
+                                    .bg(theme.surface)
+                                    .text_label()
+                                    .text_color(theme.text_muted)
+                                    .child(server.protocol),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.connect_server(&server_id, cx);
+                                }),
+                            )
+                    })),
+            )
             // --- VOLUMES & DRIVES SECTION ---
             .when(!volumes.is_empty(), |parent| {
                 parent.child(
@@ -893,7 +1384,8 @@ impl Render for SidebarView {
                                 .child("Network"),
                         )
                         .children(network.into_iter().enumerate().map(|(ix, share)| {
-                            let is_active = current_loc.path() == share.mount_point;
+                            let is_active =
+                                matches!(&current_loc, Location::Local(p) if p == &share.mount_point);
                             let path = share.mount_point.clone();
 
                             div()

@@ -49,3 +49,47 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --workspace --locked
+
+  smb-remote-tests:
+    name: smb remote tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # checkout
+    env:
+      KWATI_SMB_TEST_HOST: 127.0.0.1
+      KWATI_SMB_TEST_PORT: "1445"
+      KWATI_SMB_TEST_SMB1_PORT: "1446"
+      KWATI_SMB_TEST_USER: kwati
+      KWATI_SMB_TEST_PASSWORD: kwati-ci-password
+      KWATI_SMB_TEST_SHARE: share
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # One server limited to SMB2+ for the tests, one limited to SMB1 for smb_refuses_smb1.
+      - name: Start Samba servers
+        run: |
+          start() {
+            docker run -d --name "$1" -p "$2:445" alpine:3.20 sh -c "
+              apk add --no-cache samba >/dev/null &&
+              adduser -D -H $KWATI_SMB_TEST_USER &&
+              printf '%s\n%s\n' '$KWATI_SMB_TEST_PASSWORD' '$KWATI_SMB_TEST_PASSWORD' | smbpasswd -a -s $KWATI_SMB_TEST_USER &&
+              mkdir -p /share && chown $KWATI_SMB_TEST_USER /share &&
+              printf '[global]\n server role = standalone server\n map to guest = never\n $3\n[share]\n path = /share\n read only = no\n valid users = $KWATI_SMB_TEST_USER\n' > /etc/samba/smb.conf &&
+              exec smbd --foreground --no-process-group --debug-stdout"
+          }
+          start samba "$KWATI_SMB_TEST_PORT" "server min protocol = SMB2_02"
+          start samba1 "$KWATI_SMB_TEST_SMB1_PORT" "server min protocol = NT1\n server max protocol = NT1"
+          # The published port accepts connections before smbd listens, so wait inside.
+          for name in samba samba1; do
+            timeout 180 sh -c "until docker exec $name netstat -ltn 2>/dev/null | grep -q ':445 '; do sleep 1; done"
+          done
+
+      - name: Run SMB tests
+        run: cargo test -p kwati-core --features remote-tests --locked --test smb

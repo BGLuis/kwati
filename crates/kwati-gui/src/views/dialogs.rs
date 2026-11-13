@@ -1,22 +1,25 @@
-//! Operation dialogs view (owned by guiops-worker for #17, #19, #35).
+//! Operation dialogs view (#17, #19, #35, #48).
 //!
 //! Provides modals and inline prompts for rename, new folder, trash confirmation,
-//! and permanent delete warnings.
+//! permanent delete warnings, conflict resolution, and open-with selection.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::{
-    div, prelude::*, px, transparent_black, Context, Entity, FocusHandle, KeyDownEvent,
+    div, prelude::*, px, transparent_black, App, Context, Entity, FocusHandle, KeyDownEvent,
     MouseButton, Window,
 };
-use kwati_core::ConflictPolicy;
+use kwati_core::{volume_kind, Backend, Confirmed, ConflictPolicy, Location, VolumeKind};
 
 use crate::actions::open_with::{
     applications_for, launch_application, launch_custom_command, AppInfo,
 };
 use crate::actions::operations::{
-    execute_create_folder, execute_permanent_delete, execute_rename, execute_trash, start_transfer,
-    Transfer,
+    apply_create_folder_result, apply_delete_report, apply_rename_result, apply_trash_report,
+    check_paste_conflict_at, create_folder_on_backend, delete_locations_permanently_with_backends,
+    location_display_name, rename_location_on_backend, start_transfer, trash_locations_on_backends,
+    validate_entry_name, Transfer, TrashOutcome,
 };
 use crate::components::TextInput;
 use crate::state::AppState;
@@ -26,23 +29,23 @@ use crate::theme::Theme;
 pub enum DialogKind {
     None,
     NewFolder {
-        parent_path: PathBuf,
+        parent: Location,
         error: Option<String>,
     },
     Rename {
-        source_path: PathBuf,
+        source: Location,
         current_name: String,
         error: Option<String>,
     },
     ConfirmTrash {
-        paths: Vec<PathBuf>,
+        locations: Vec<Location>,
     },
     ConfirmDelete {
-        paths: Vec<PathBuf>,
+        locations: Vec<Location>,
     },
     ConflictResolution {
-        sources: Vec<PathBuf>,
-        dest_dir: PathBuf,
+        sources: Vec<Location>,
+        dest_dir: Location,
         is_cut: bool,
         conflict_name: String,
     },
@@ -59,6 +62,36 @@ pub struct DialogsView {
     pub input: Entity<TextInput>,
     pub current_dialog: DialogKind,
     focus_handle: FocusHandle,
+    pending_op: bool,
+    op_generation: u64,
+}
+
+fn format_item_names(locations: &[Location]) -> String {
+    match locations {
+        [] => "0 items".to_string(),
+        [single] => format!("'{}'", location_display_name(single)),
+        many => {
+            let shown: Vec<String> = many.iter().take(5).map(location_display_name).collect();
+            if many.len() <= 5 {
+                format!("{} selected items ({})", many.len(), shown.join(", "))
+            } else {
+                format!(
+                    "{} selected items ({}, and {} more)",
+                    many.len(),
+                    shown.join(", "),
+                    many.len() - 5
+                )
+            }
+        }
+    }
+}
+
+/// Formats the permanent-deletion prompt naming the target items and warning it cannot be undone.
+pub fn confirm_delete_message(locations: &[Location]) -> String {
+    format!(
+        "Permanently delete {}? This action is irreversible and cannot be undone.",
+        format_item_names(locations)
+    )
 }
 
 impl DialogsView {
@@ -69,6 +102,8 @@ impl DialogsView {
             input,
             current_dialog: DialogKind::None,
             focus_handle: cx.focus_handle(),
+            pending_op: false,
+            op_generation: 0,
         }
     }
 
@@ -107,73 +142,165 @@ impl DialogsView {
     }
 
     pub fn show(&mut self, dialog: DialogKind, cx: &mut Context<Self>) {
+        self.pending_op = false;
+        self.op_generation = self.op_generation.wrapping_add(1);
         self.current_dialog = dialog;
         cx.notify();
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.pending_op = false;
+        self.op_generation = self.op_generation.wrapping_add(1);
         self.current_dialog = DialogKind::None;
         cx.notify();
     }
 
-    /// Opens the New Folder dialog with a default or cleared name.
-    pub fn open_new_folder(&mut self, parent: PathBuf, cx: &mut Context<Self>) {
+    /// Opens the New Folder dialog under `parent` (local or remote).
+    pub fn open_new_folder(&mut self, parent: impl Into<Location>, cx: &mut Context<Self>) {
         self.input.update(cx, |input, cx| {
             input.set_text("New Folder", cx);
         });
-        self.current_dialog = DialogKind::NewFolder {
-            parent_path: parent,
-            error: None,
-        };
-        cx.notify();
+        self.show(
+            DialogKind::NewFolder {
+                parent: parent.into(),
+                error: None,
+            },
+            cx,
+        );
     }
 
-    /// Opens the Rename dialog for a given source entry.
-    pub fn open_rename(&mut self, source: PathBuf, cx: &mut Context<Self>) {
-        let current_name = source
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+    /// Opens the Rename dialog for a local or remote `source` location.
+    pub fn open_rename(&mut self, source: impl Into<Location>, cx: &mut Context<Self>) {
+        let source = source.into();
+        let current_name = location_display_name(&source);
         let name_clone = current_name.clone();
         self.input.update(cx, |input, cx| {
             input.set_text(name_clone, cx);
         });
-        self.current_dialog = DialogKind::Rename {
-            source_path: source,
-            current_name,
-            error: None,
-        };
-        cx.notify();
+        self.show(
+            DialogKind::Rename {
+                source,
+                current_name,
+                error: None,
+            },
+            cx,
+        );
     }
 
     /// Opens the Move to Trash confirmation prompt.
-    pub fn open_confirm_trash(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        self.current_dialog = DialogKind::ConfirmTrash { paths };
-        cx.notify();
+    pub fn open_confirm_trash(
+        &mut self,
+        targets: impl IntoIterator<Item = impl Into<Location>>,
+        cx: &mut Context<Self>,
+    ) {
+        let locations: Vec<Location> = targets.into_iter().map(Into::into).collect();
+        self.show(DialogKind::ConfirmTrash { locations }, cx);
     }
 
     /// Opens the permanent deletion confirmation modal with irreversible warning.
-    pub fn open_confirm_delete(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        self.current_dialog = DialogKind::ConfirmDelete { paths };
-        cx.notify();
+    pub fn open_confirm_delete(
+        &mut self,
+        targets: impl IntoIterator<Item = impl Into<Location>>,
+        cx: &mut Context<Self>,
+    ) {
+        let locations: Vec<Location> = targets.into_iter().map(Into::into).collect();
+        self.show(DialogKind::ConfirmDelete { locations }, cx);
+    }
+
+    /// Chooses the appropriate deletion confirmation prompt: trash for local-disk entries,
+    /// or permanent-delete confirmation when any target is remote or on a non-local volume.
+    pub fn open_remove_confirmation(
+        &mut self,
+        targets: impl IntoIterator<Item = impl Into<Location>>,
+        cx: &mut Context<Self>,
+    ) {
+        let locations: Vec<Location> = targets.into_iter().map(Into::into).collect();
+        if locations.is_empty() {
+            return;
+        }
+        let trash_available = locations.iter().all(
+            |loc| matches!(loc, Location::Local(path) if volume_kind(path) == VolumeKind::Local),
+        );
+        if trash_available {
+            self.open_confirm_trash(locations, cx);
+        } else {
+            self.open_confirm_delete(locations, cx);
+        }
     }
 
     /// Opens the conflict resolution dialog when paste encounters an existing target.
     pub fn open_conflict_resolution(
         &mut self,
-        sources: Vec<PathBuf>,
-        dest_dir: PathBuf,
+        sources: impl IntoIterator<Item = impl Into<Location>>,
+        dest_dir: impl Into<Location>,
         is_cut: bool,
         conflict_name: String,
         cx: &mut Context<Self>,
     ) {
-        self.current_dialog = DialogKind::ConflictResolution {
-            sources,
-            dest_dir,
-            is_cut,
-            conflict_name,
+        self.show(
+            DialogKind::ConflictResolution {
+                sources: sources.into_iter().map(Into::into).collect(),
+                dest_dir: dest_dir.into(),
+                is_cut,
+                conflict_name,
+            },
+            cx,
+        );
+    }
+
+    /// Checks for paste conflicts on the background executor and either opens
+    /// `ConflictResolution` or starts the transfer immediately.
+    pub fn begin_paste(
+        &mut self,
+        sources: impl IntoIterator<Item = impl Into<Location>>,
+        dest_dir: impl Into<Location>,
+        is_cut: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let sources: Vec<Location> = sources.into_iter().map(Into::into).collect();
+        let dest_dir = dest_dir.into();
+        if sources.is_empty() {
+            return;
+        }
+
+        let Some(dest_backend) = self.app_state.read(cx).backend_for(&dest_dir) else {
+            self.app_state.update(cx, |state, _| {
+                state.set_status("Destination server is not connected");
+            });
+            return;
         };
-        cx.notify();
+
+        let sources_check = sources.clone();
+        let dest_check = dest_dir.clone();
+        cx.spawn(async move |this, cx| {
+            let conflict_res = cx
+                .background_executor()
+                .spawn(async move {
+                    check_paste_conflict_at(&sources_check, &dest_check, &*dest_backend)
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| match conflict_res {
+                Ok(Some(conflict)) => {
+                    this.open_conflict_resolution(sources, dest_dir, is_cut, conflict, cx);
+                }
+                Ok(None) => {
+                    let transfer = if is_cut {
+                        Transfer::moving(sources, dest_dir, ConflictPolicy::Skip)
+                    } else {
+                        Transfer::copy(sources, dest_dir, ConflictPolicy::Skip)
+                    };
+                    this.app_state
+                        .update(cx, |state, _| start_transfer(state, transfer));
+                }
+                Err(err) => {
+                    this.app_state.update(cx, |state, _| {
+                        state.set_status(format!("Paste failed: {err}"));
+                    });
+                }
+            });
+        })
+        .detach();
     }
 
     /// Resolves the current conflict with the chosen ConflictPolicy.
@@ -202,13 +329,15 @@ impl DialogsView {
         self.input.update(cx, |input, cx| {
             input.set_text("", cx);
         });
-        self.current_dialog = DialogKind::OpenWith {
-            target_path: target,
-            available_apps: apps,
-            selected_index: Some(0),
-            error: None,
-        };
-        cx.notify();
+        self.show(
+            DialogKind::OpenWith {
+                target_path: target,
+                available_apps: apps,
+                selected_index: Some(0),
+                error: None,
+            },
+            cx,
+        );
     }
 
     /// Selects an application in the Open With dialog.
@@ -223,77 +352,264 @@ impl DialogsView {
         }
     }
 
-    /// Submits the current active dialog (NewFolder or Rename).
+    fn resolve_backend_items(
+        &self,
+        targets: &[Location],
+        cx: &App,
+    ) -> Option<Vec<(Location, Arc<dyn Backend>)>> {
+        let state = self.app_state.read(cx);
+        targets
+            .iter()
+            .map(|loc| state.backend_for(loc).map(|b| (loc.clone(), b)))
+            .collect()
+    }
+
+    /// Runs permanent deletion after the user explicitly clicks the confirmation button.
+    /// This is the only dialog handler that constructs [`Confirmed::user_confirmed`].
+    pub fn confirm_permanent_delete(&mut self, cx: &mut Context<Self>) {
+        if self.pending_op {
+            return;
+        }
+        let DialogKind::ConfirmDelete { locations } = &self.current_dialog else {
+            return;
+        };
+        let targets = locations.clone();
+        if targets.is_empty() {
+            self.close(cx);
+            return;
+        }
+
+        let confirmed = Confirmed::user_confirmed();
+        let Some(items) = self.resolve_backend_items(&targets, cx) else {
+            self.app_state.update(cx, |state, _| {
+                state.set_status("Failed to delete permanently: server is not connected");
+            });
+            self.close(cx);
+            return;
+        };
+
+        self.pending_op = true;
+        self.op_generation = self.op_generation.wrapping_add(1);
+        let gen = self.op_generation;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let report = cx
+                .background_executor()
+                .spawn(async move { delete_locations_permanently_with_backends(&items, confirmed) })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                if this.op_generation != gen {
+                    return;
+                }
+                this.pending_op = false;
+                this.app_state.update(cx, |state, _| {
+                    let _ = apply_delete_report(state, report);
+                });
+                this.close(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Submits the current active dialog (NewFolder, Rename, ConfirmTrash, or OpenWith).
+    /// `ConfirmDelete` is intentionally ignored here and requires [`Self::confirm_permanent_delete`].
     pub fn submit(&mut self, cx: &mut Context<Self>) {
+        if self.pending_op {
+            return;
+        }
         let input_text = self.input.read(cx).text().to_string();
 
         match &self.current_dialog {
-            DialogKind::NewFolder { parent_path, .. } => {
-                let parent = parent_path.clone();
-                let mut error_opt = None;
-                self.app_state.update(cx, |state, _cx| {
-                    match execute_create_folder(state, &parent, &input_text) {
-                        Ok(_) => {}
-                        Err(err) => {
-                            state.set_status(err.clone());
-                            error_opt = Some(err);
-                        }
-                    }
-                });
-
-                if let Some(err) = error_opt {
+            DialogKind::NewFolder { parent, .. } => {
+                let parent = parent.clone();
+                if let Err(err) = validate_entry_name(&input_text) {
+                    self.app_state
+                        .update(cx, |state, _| state.set_status(err.clone()));
                     self.current_dialog = DialogKind::NewFolder {
-                        parent_path: parent,
+                        parent,
                         error: Some(err),
                     };
                     cx.notify();
-                } else {
-                    self.close(cx);
+                    return;
                 }
+
+                let Some(backend) = self.app_state.read(cx).backend_for(&parent) else {
+                    let err = "Server is not connected".to_string();
+                    self.app_state
+                        .update(cx, |state, _| state.set_status(err.clone()));
+                    self.current_dialog = DialogKind::NewFolder {
+                        parent,
+                        error: Some(err),
+                    };
+                    cx.notify();
+                    return;
+                };
+
+                self.pending_op = true;
+                self.op_generation = self.op_generation.wrapping_add(1);
+                let gen = self.op_generation;
+                let parent_bg = parent.clone();
+                cx.notify();
+
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            create_folder_on_backend(&*backend, &parent_bg, &input_text)
+                        })
+                        .await;
+
+                    let _ = this.update(cx, |this, cx| {
+                        if this.op_generation != gen {
+                            return;
+                        }
+                        this.pending_op = false;
+                        match result {
+                            Ok(target) => {
+                                this.app_state.update(cx, |state, _| {
+                                    apply_create_folder_result(state, &parent, &target);
+                                });
+                                this.close(cx);
+                            }
+                            Err(err) => {
+                                this.app_state
+                                    .update(cx, |state, _| state.set_status(err.clone()));
+                                this.current_dialog = DialogKind::NewFolder {
+                                    parent,
+                                    error: Some(err),
+                                };
+                                cx.notify();
+                            }
+                        }
+                    });
+                })
+                .detach();
             }
             DialogKind::Rename {
-                source_path,
+                source,
                 current_name,
                 ..
             } => {
-                let source = source_path.clone();
+                let source = source.clone();
                 let original_name = current_name.clone();
-                let mut error_opt = None;
-
-                self.app_state.update(cx, |state, _cx| {
-                    match execute_rename(state, &source, &input_text) {
-                        Ok(_) => {}
-                        Err(err) => {
-                            state.set_status(err.clone());
-                            error_opt = Some(err);
-                        }
-                    }
-                });
-
-                if let Some(err) = error_opt {
+                if let Err(err) = validate_entry_name(&input_text) {
+                    self.app_state
+                        .update(cx, |state, _| state.set_status(err.clone()));
                     self.current_dialog = DialogKind::Rename {
-                        source_path: source,
+                        source,
                         current_name: original_name,
                         error: Some(err),
                     };
                     cx.notify();
-                } else {
-                    self.close(cx);
+                    return;
                 }
+
+                let Some(backend) = self.app_state.read(cx).backend_for(&source) else {
+                    let err = "Server is not connected".to_string();
+                    self.app_state
+                        .update(cx, |state, _| state.set_status(err.clone()));
+                    self.current_dialog = DialogKind::Rename {
+                        source,
+                        current_name: original_name,
+                        error: Some(err),
+                    };
+                    cx.notify();
+                    return;
+                };
+
+                self.pending_op = true;
+                self.op_generation = self.op_generation.wrapping_add(1);
+                let gen = self.op_generation;
+                let source_bg = source.clone();
+                cx.notify();
+
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            rename_location_on_backend(&*backend, &source_bg, &input_text)
+                        })
+                        .await;
+
+                    let _ = this.update(cx, |this, cx| {
+                        if this.op_generation != gen {
+                            return;
+                        }
+                        this.pending_op = false;
+                        match result {
+                            Ok(target) => {
+                                this.app_state.update(cx, |state, _| {
+                                    apply_rename_result(state, &source, &target);
+                                });
+                                this.close(cx);
+                            }
+                            Err(err) => {
+                                this.app_state
+                                    .update(cx, |state, _| state.set_status(err.clone()));
+                                this.current_dialog = DialogKind::Rename {
+                                    source,
+                                    current_name: original_name,
+                                    error: Some(err),
+                                };
+                                cx.notify();
+                            }
+                        }
+                    });
+                })
+                .detach();
             }
-            DialogKind::ConfirmTrash { paths } => {
-                let targets = paths.clone();
-                self.app_state.update(cx, |state, _cx| {
-                    let _ = execute_trash(state, &targets);
-                });
-                self.close(cx);
+            DialogKind::ConfirmTrash { locations } => {
+                let targets = locations.clone();
+                if targets.is_empty() {
+                    self.close(cx);
+                    return;
+                }
+
+                let Some(items) = self.resolve_backend_items(&targets, cx) else {
+                    self.app_state.update(cx, |state, _| {
+                        state.set_status("Failed to move to trash: server is not connected");
+                    });
+                    self.close(cx);
+                    return;
+                };
+
+                self.pending_op = true;
+                self.op_generation = self.op_generation.wrapping_add(1);
+                let gen = self.op_generation;
+                cx.notify();
+
+                cx.spawn(async move |this, cx| {
+                    let report = cx
+                        .background_executor()
+                        .spawn(async move { trash_locations_on_backends(&items) })
+                        .await;
+
+                    let _ = this.update(cx, |this, cx| {
+                        if this.op_generation != gen {
+                            return;
+                        }
+                        this.pending_op = false;
+                        let outcome = this
+                            .app_state
+                            .update(cx, |state, _| apply_trash_report(state, report));
+                        match outcome {
+                            TrashOutcome::Unavailable(unavailable) => {
+                                // Only TrashUnavailable opens the second ConfirmDelete modal;
+                                // generic trash failures close without offering permanent delete.
+                                this.open_confirm_delete(unavailable, cx);
+                            }
+                            TrashOutcome::Trashed(_) | TrashOutcome::Failed(_) => {
+                                this.close(cx);
+                            }
+                        }
+                    });
+                })
+                .detach();
             }
-            DialogKind::ConfirmDelete { paths } => {
-                let targets = paths.clone();
-                self.app_state.update(cx, |state, _cx| {
-                    let _ = execute_permanent_delete(state, &targets);
-                });
-                self.close(cx);
+            DialogKind::ConfirmDelete { .. } => {
+                // Never confirm permanent deletion via generic submit; requires clicking the button.
             }
             DialogKind::ConflictResolution { .. } => {
                 self.close(cx);
@@ -363,31 +679,16 @@ impl Render for DialogsView {
                 ("Create New Folder", error.as_deref(), true, None)
             }
             DialogKind::Rename { error, .. } => ("Rename Entry", error.as_deref(), true, None),
-            DialogKind::ConfirmTrash { paths } => {
-                let msg = if paths.len() == 1 {
-                    format!(
-                        "Move '{}' to the system trash?",
-                        paths[0].file_name().unwrap_or_default().to_string_lossy()
-                    )
-                } else {
-                    format!("Move {} selected items to the system trash?", paths.len())
-                };
+            DialogKind::ConfirmTrash { locations } => {
+                let msg = format!("Move {} to the system trash?", format_item_names(locations));
                 ("Move to Trash?", None, false, Some(msg))
             }
-            DialogKind::ConfirmDelete { paths } => {
-                let msg = if paths.len() == 1 {
-                    format!(
-                        "Permanently delete '{}'? This action is irreversible and cannot be undone.",
-                        paths[0].file_name().unwrap_or_default().to_string_lossy()
-                    )
-                } else {
-                    format!(
-                        "Permanently delete {} selected items? This action is irreversible and cannot be undone.",
-                        paths.len()
-                    )
-                };
-                ("Permanently Delete?", None, false, Some(msg))
-            }
+            DialogKind::ConfirmDelete { locations } => (
+                "Permanently Delete?",
+                None,
+                false,
+                Some(confirm_delete_message(locations)),
+            ),
             DialogKind::ConflictResolution { conflict_name, .. } => {
                 let msg = format!(
                     "Target '{}' already exists in the destination folder. Choose conflict policy:",
@@ -666,7 +967,13 @@ impl Render for DialogsView {
                                         })
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| this.submit(cx)),
+                                            cx.listener(move |this, _, _, cx| {
+                                                if is_delete_dialog {
+                                                    this.confirm_permanent_delete(cx);
+                                                } else {
+                                                    this.submit(cx);
+                                                }
+                                            }),
                                         ),
                                 ),
                         )
