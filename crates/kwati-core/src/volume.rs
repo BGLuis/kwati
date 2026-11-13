@@ -126,7 +126,6 @@ fn platform_kind(_path: &Path) -> VolumeKind {
     VolumeKind::Unknown
 }
 
-#[cfg(any(target_os = "linux", test))]
 const LINUX_NETWORK_FS: &[&str] = &[
     "cifs",
     "smb3",
@@ -136,8 +135,12 @@ const LINUX_NETWORK_FS: &[&str] = &[
     "fuse.gvfsd-fuse",
 ];
 
-#[cfg(any(target_os = "macos", test))]
 const MACOS_NETWORK_FS: &[&str] = &["smbfs", "nfs", "afpfs", "webdav"];
+
+/// True for the filesystem types Linux and macOS use for network mounts.
+pub(crate) fn is_network_fs(fstype: &str) -> bool {
+    LINUX_NETWORK_FS.contains(&fstype) || MACOS_NETWORK_FS.contains(&fstype)
+}
 
 /// Finds the mount point and filesystem type of `path` (already absolute and symlink-free) in
 /// `/proc/self/mountinfo` content; the longest matching mount point wins, and later entries
@@ -178,7 +181,7 @@ fn linux_kind(mountinfo: &str, path: &Path) -> VolumeKind {
 /// Decodes the `\ooo` octal escapes that the kernel uses for spaces, tabs, newlines
 /// and backslashes in mountinfo paths.
 #[cfg(any(target_os = "linux", test))]
-fn unescape_octal(field: &str) -> String {
+pub(crate) fn unescape_octal(field: &str) -> String {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
