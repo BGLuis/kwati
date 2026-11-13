@@ -14,7 +14,7 @@ use crate::actions::navigation::{
     GoBack, GoForward, GoUp, OpenSelected, PageDown, PageUp, Refresh, SelectFirst, SelectLast,
     SelectNext, SelectPrevious, ToggleHidden,
 };
-use crate::components::{icon, IconName, ScrollbarState};
+use crate::components::{icon, Ellipsize, IconName, ScrollbarState};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole};
@@ -590,7 +590,7 @@ impl Render for ListView {
                                                                 },
                                                             )
                                                         })
-                                                        .child(name),
+                                                        .child(div().ellipsize().child(name)),
                                                 )
                                                 .child(
                                                     div()

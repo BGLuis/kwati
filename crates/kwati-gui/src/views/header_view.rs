@@ -11,8 +11,9 @@ use gpui::{
 
 use kwati_core::Location;
 
+use crate::actions::navigation::TogglePreview;
 use crate::components::TextInput;
-use crate::components::{icon, IconName};
+use crate::components::{icon, IconName, Tooltip};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole};
@@ -145,6 +146,7 @@ impl Render for HeaderView {
         let state = self.app_state.read(cx);
         let can_go_back = state.history.can_go_back();
         let can_go_forward = state.history.can_go_forward();
+        let preview_open = state.panels.preview_open;
         let can_go_up = state
             .current_location
             .path()
@@ -240,6 +242,23 @@ impl Render for HeaderView {
                         }
                     }))
                     .child(self.address_input.clone()),
+            )
+            .child(
+                div()
+                    .id("toggle-preview")
+                    .px(space::S4)
+                    .py(space::S2)
+                    .rounded(radius::CONTROL)
+                    .cursor(CursorStyle::PointingHand)
+                    .when(preview_open, |s| s.bg(theme.selection))
+                    .when(!preview_open, |s| s.hover(|h| h.bg(theme.surface_raised)))
+                    .child(icon(IconName::PanelRight).text_color(theme.text))
+                    .tooltip(Tooltip::text(if preview_open {
+                        "Hide preview (Alt+P)"
+                    } else {
+                        "Show preview (Alt+P)"
+                    }))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(TogglePreview), cx)),
             )
     }
 }

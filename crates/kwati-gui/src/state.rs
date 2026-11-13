@@ -11,6 +11,8 @@ use kwati_core::{
     Selection, Settings, SortColumn, SortDirection,
 };
 
+use crate::layout::PanelLayout;
+
 /// Classification of background file operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobKind {
@@ -169,6 +171,7 @@ pub struct AppState {
     pub sort_column: SortColumn,
     pub sort_direction: SortDirection,
     pub show_hidden: bool,
+    pub panels: PanelLayout,
     pub dir_watcher: Option<DirWatcher>,
     foreground: Option<Foreground>,
     pending_navigation: Option<(Location, Arrival)>,
@@ -197,6 +200,7 @@ impl AppState {
             sort_column: SortColumn::Name,
             sort_direction: SortDirection::Ascending,
             show_hidden: false,
+            panels: PanelLayout::default(),
             dir_watcher: None,
             foreground: None,
             pending_navigation: None,

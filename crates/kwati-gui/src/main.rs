@@ -5,6 +5,7 @@ use gpui::{actions, prelude::*, px, size, App, Application, Bounds, WindowBounds
 use kwati_core::Location;
 use kwati_gui::actions::register_keybindings;
 use kwati_gui::components::{register_text_input_keybindings, Assets};
+use kwati_gui::layout::{WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH};
 use kwati_gui::state::AppState;
 use kwati_gui::theme::Theme;
 use kwati_gui::tokens::Fonts;
@@ -34,6 +35,7 @@ fn main() {
                 .open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_min_size: Some(size(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)),
                         ..Default::default()
                     },
                     |window, cx| {

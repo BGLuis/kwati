@@ -20,7 +20,10 @@ pub use sidebar_view::SidebarView;
 
 use std::path::PathBuf;
 
-use gpui::{div, prelude::*, App, Context, Entity, Window};
+use gpui::{
+    div, prelude::*, px, App, Context, CursorStyle, DragMoveEvent, EmptyView, Entity, Pixels,
+    SharedString, Window,
+};
 use kwati_core::{volume_kind, ConflictPolicy, Location, VolumeKind};
 
 use crate::actions::operations::{
@@ -28,6 +31,8 @@ use crate::actions::operations::{
     start_transfer, Transfer,
 };
 
+use crate::actions::navigation::TogglePreview;
+use crate::layout::PanelLayout;
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{size, space, Fonts, TextRole};
@@ -113,6 +118,38 @@ impl MainView {
             Location::Local(path) => Some(path.clone()),
             Location::Remote { .. } => None,
         }
+    }
+
+    fn resize_panels(&mut self, cx: &mut Context<Self>, resize: impl FnOnce(&mut PanelLayout)) {
+        self.app_state.update(cx, |state, cx| {
+            let before = state.panels;
+            resize(&mut state.panels);
+            if state.panels != before {
+                cx.notify();
+            }
+        });
+    }
+
+    fn on_sidebar_edge_drag(
+        &mut self,
+        event: &DragMoveEvent<SidebarEdge>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pointer = event.event.position.x - event.bounds.left();
+        let width = event.bounds.size.width;
+        self.resize_panels(cx, |panels| panels.drag_sidebar(pointer, width));
+    }
+
+    fn on_preview_edge_drag(
+        &mut self,
+        event: &DragMoveEvent<PreviewEdge>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pointer = event.bounds.right() - event.event.position.x;
+        let width = event.bounds.size.width;
+        self.resize_panels(cx, |panels| panels.drag_preview(pointer, width));
     }
 
     fn set_status(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
@@ -271,10 +308,11 @@ impl MainView {
 }
 
 impl Render for MainView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
         let state = self.app_state.read(cx);
+        let panels = state.panels.resolve(window.viewport_size().width);
         let entry_count = state.entries.len();
         let selected_count = state.selection.len();
         let status_msg = state.status_message.clone();
@@ -296,6 +334,9 @@ impl Render for MainView {
             .on_action(cx.listener(Self::on_rename))
             .on_action(cx.listener(Self::on_new_folder))
             .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(|this, _: &TogglePreview, _, cx| {
+                this.resize_panels(cx, PanelLayout::toggle_preview)
+            }))
             // Top Header (Address Bar + Nav)
             .child(self.header.clone())
             // Network banner (if active)
@@ -310,17 +351,48 @@ impl Render for MainView {
                     .flex_1()
                     .w_full()
                     .overflow_hidden()
-                    .child(self.sidebar.clone())
+                    .on_drag_move(cx.listener(Self::on_sidebar_edge_drag))
+                    .on_drag_move(cx.listener(Self::on_preview_edge_drag))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_shrink_0()
+                            .w(panels.sidebar)
+                            .h_full()
+                            .child(self.sidebar.clone())
+                            .child(resize_handle(
+                                "sidebar-edge",
+                                SidebarEdge,
+                                Edge::Right,
+                                &theme,
+                            )),
+                    )
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .flex_1()
+                            .min_w_0()
                             .h_full()
                             .child(self.list.clone())
                             .child(self.jobs.clone()),
                     )
-                    .child(self.preview.clone()),
+                    .when_some(panels.preview, |row, width| {
+                        row.child(
+                            div()
+                                .relative()
+                                .flex_shrink_0()
+                                .w(width)
+                                .h_full()
+                                .child(self.preview.clone())
+                                .child(resize_handle(
+                                    "preview-edge",
+                                    PreviewEdge,
+                                    Edge::Left,
+                                    &theme,
+                                )),
+                        )
+                    }),
             )
             // Footer: Status Bar
             .child(
@@ -361,4 +433,41 @@ impl Render for MainView {
             .child(self.dialogs.clone())
             .child(self.remote_dialogs.clone())
     }
+}
+
+/// Drag payload of the sidebar's right edge.
+struct SidebarEdge;
+
+/// Drag payload of the preview's left edge.
+struct PreviewEdge;
+
+enum Edge {
+    Left,
+    Right,
+}
+
+const RESIZE_HANDLE_WIDTH: Pixels = px(4.);
+
+/// A strip along one edge of a pane that resizes it when dragged. It lies inside the pane so
+/// it paints over the pane's own content rather than under the neighbouring pane.
+fn resize_handle<T: 'static>(
+    id: impl Into<SharedString>,
+    payload: T,
+    edge: Edge,
+    theme: &Theme,
+) -> impl IntoElement {
+    let hover = theme.border_strong;
+    div()
+        .id(id.into())
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .map(|handle| match edge {
+            Edge::Left => handle.left_0(),
+            Edge::Right => handle.right_0(),
+        })
+        .w(RESIZE_HANDLE_WIDTH)
+        .cursor(CursorStyle::ResizeLeftRight)
+        .hover(move |handle| handle.bg(hover))
+        .on_drag(payload, |_, _, _, cx| cx.new(|_| EmptyView))
 }

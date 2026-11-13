@@ -51,6 +51,7 @@ icons! {
     Home => "home",
     Image => "image",
     Network => "network",
+    PanelRight => "panel-right",
     Plus => "plus",
     Refresh => "refresh",
     Search => "search",

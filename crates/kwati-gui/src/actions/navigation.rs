@@ -22,6 +22,7 @@ actions!(
         PageDown,
         Refresh,
         ToggleHidden,
+        TogglePreview,
     ]
 );
 

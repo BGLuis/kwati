@@ -256,8 +256,7 @@ impl Render for PreviewView {
 
         let Some(preview_data) = preview else {
             return div()
-                .w(px(280.))
-                .h_full()
+                .size_full()
                 .p_4()
                 .bg(theme.surface)
                 .border_l_1()
@@ -293,8 +292,7 @@ impl Render for PreviewView {
             .unwrap_or_else(|| "File".to_string());
 
         div()
-            .w(px(280.))
-            .h_full()
+            .size_full()
             .p_3()
             .bg(theme.surface)
             .border_l_1()

@@ -6,11 +6,12 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    div, prelude::*, px, transparent_black, Context, Entity, FontWeight, MouseButton, Window,
+    div, prelude::*, px, transparent_black, AnyElement, Context, Div, ElementId, Entity,
+    FontWeight, MouseButton, Stateful, Svg, Window,
 };
 use kwati_core::Location;
 
-use crate::components::{icon, IconName};
+use crate::components::{icon, Ellipsize, IconName, Tooltip};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, TextRole};
@@ -328,8 +329,127 @@ impl SidebarView {
     }
 }
 
+impl SidebarView {
+    /// Icons only, each named by its tooltip. Section titles become dividers, and drive
+    /// actions wait for the full sidebar.
+    fn render_compact(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx);
+        let current_loc = self.app_state.read(cx).current_location.clone();
+        let divider = || div().h(px(1.)).mx(space::S4).bg(theme.border);
+        let row = |id: ElementId, icon: Svg, label: String, is_active: bool| -> Stateful<Div> {
+            div()
+                .id(id)
+                .h(size::SIDEBAR_ROW)
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(radius::CONTROL)
+                .cursor_pointer()
+                .when(is_active, |s| s.bg(theme.selection))
+                .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
+                .child(icon)
+                .tooltip(Tooltip::text(label))
+        };
+
+        div()
+            .size_full()
+            .p(space::S8)
+            .bg(theme.surface_raised)
+            .border_r_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .gap_1()
+            .overflow_hidden()
+            .children(self.places.iter().enumerate().map(|(ix, place)| {
+                let path = place.path.clone();
+                let color = if place.icon == IconName::Folder {
+                    theme.accent
+                } else {
+                    theme.text
+                };
+                row(
+                    ("place", ix).into(),
+                    icon(place.icon).text_color(color),
+                    place.name.clone(),
+                    current_loc.path() == place.path,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
+                )
+            }))
+            .when(!self.bookmarks.is_empty(), |s| s.child(divider()))
+            .children(self.bookmarks.iter().enumerate().map(|(ix, bm)| {
+                let path = bm.path.clone();
+                let (glyph, label) = if bm.is_missing() {
+                    (
+                        icon(IconName::Alert).text_color(theme.danger),
+                        format!("{} (missing)", bm.name),
+                    )
+                } else {
+                    (
+                        icon(IconName::Folder).text_color(theme.accent),
+                        bm.name.clone(),
+                    )
+                };
+                row(
+                    ("bookmark", ix).into(),
+                    glyph,
+                    label,
+                    current_loc.path() == bm.path,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
+                )
+            }))
+            .when(!self.volumes.is_empty(), |s| s.child(divider()))
+            .children(self.volumes.iter().enumerate().map(|(ix, vol)| {
+                let path = vol.mount_point.clone();
+                let is_mounted = vol.is_mounted;
+                let label = if is_mounted {
+                    format!("{} — {}", vol.name, vol.capacity_summary())
+                } else {
+                    format!("{} (not mounted)", vol.name)
+                };
+                let color = if vol.is_busy {
+                    theme.warning
+                } else if is_mounted {
+                    theme.text
+                } else {
+                    theme.text_muted
+                };
+                row(
+                    ("drive", ix).into(),
+                    icon(IconName::Drive).text_color(color),
+                    label,
+                    current_loc.path() == vol.mount_point,
+                )
+                .when(is_mounted, |s| {
+                    s.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
+                    )
+                })
+            }))
+            .into_any_element()
+    }
+}
+
 impl Render for SidebarView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let compact = self
+            .app_state
+            .read(cx)
+            .panels
+            .resolve(window.viewport_size().width)
+            .sidebar_compact;
+        if compact {
+            return self.render_compact(cx);
+        }
+
         let theme = Theme::get(cx);
         let places = self.places.clone();
         let bookmarks = self.bookmarks.clone();
@@ -337,8 +457,7 @@ impl Render for SidebarView {
         let current_loc = self.app_state.read(cx).current_location.clone();
 
         div()
-            .w(px(200.))
-            .h_full()
+            .size_full()
             .p(space::S8)
             .bg(theme.surface_raised)
             .border_r_1()
@@ -382,7 +501,9 @@ impl Render for SidebarView {
                             } else {
                                 theme.text
                             }))
-                            .child(place.name)
+                            .child(
+                                div().ellipsize().child(place.name),
+                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
@@ -425,6 +546,8 @@ impl Render for SidebarView {
                                 .child(
                                     div()
                                         .flex()
+                                        .flex_1()
+                                        .min_w_0()
                                         .items_center()
                                         .gap(space::S8)
                                         .child(if is_missing {
@@ -434,6 +557,7 @@ impl Render for SidebarView {
                                         })
                                         .child(
                                             div()
+                                                .ellipsize()
                                                 .text_color(if is_missing {
                                                     theme.danger
                                                 } else {
@@ -685,5 +809,6 @@ impl Render for SidebarView {
                         })),
                 )
             })
+            .into_any_element()
     }
 }
