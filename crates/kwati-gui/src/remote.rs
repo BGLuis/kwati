@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -141,8 +142,12 @@ impl RemoteSessions {
         let Some(profile) = self.profile(id) else {
             return false;
         };
-        profile.auth == AuthMethod::Password
-            && !matches!(self.secrets.get(id), Ok(Some(secret)) if !secret.is_empty())
+        profile.auth == AuthMethod::Password && !self.has_secret(id)
+    }
+
+    /// Whether a non-empty secret (password or key passphrase) is saved for `id`.
+    pub fn has_secret(&self, id: &str) -> bool {
+        matches!(self.secrets.get(id), Ok(Some(secret)) if !secret.is_empty())
     }
 
     /// The work that opens `id`, to run off the interface thread. `typed` is a password the user
@@ -236,10 +241,12 @@ pub fn protocol_label(protocol: Protocol) -> &'static str {
 
 /// A new, unique profile id.
 pub fn new_profile_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    format!("p{nanos:x}")
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("p{nanos:x}-{seq}")
 }
 
 /// Secrets kept in memory for this run only: the fallback when the keychain is unavailable.
