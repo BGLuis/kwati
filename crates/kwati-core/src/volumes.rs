@@ -192,3 +192,227 @@ pub fn list_volumes() -> Vec<Volume> {
 pub fn mounted_volumes() -> Vec<Volume> {
     list_volumes()
 }
+
+/// Filesystems that hold no user data of their own: container layers, snap images, RAM disks
+/// and the desktop's FUSE bridges.
+const HIDDEN_FILE_SYSTEMS: &[&str] = &[
+    "overlay",
+    "squashfs",
+    "tmpfs",
+    "efivarfs",
+    "fuse.portal",
+    "fuse.kio-fuse",
+];
+
+/// Where the operating system mounts volumes for itself (boot partitions, btrfs subvolumes for
+/// logs and caches, macOS system volumes).
+const SYSTEM_MOUNT_PREFIXES: &[&str] = &[
+    "/boot",
+    "/efi",
+    "/var",
+    "/usr",
+    "/snap",
+    "/nix",
+    "/System/Volumes",
+    "/private/var",
+];
+
+/// The disks a user browses: local volumes without system mounts, and one entry per device,
+/// at its shortest mount point.
+pub fn device_volumes() -> Vec<Volume> {
+    let labels = device_labels();
+    user_facing_volumes(list_volumes())
+        .into_iter()
+        .map(|mut volume| {
+            volume.name = display_name(&volume, &labels);
+            volume
+        })
+        .collect()
+}
+
+/// Drops the volumes [`device_volumes`] hides. On Linux a volume's name is its device, so a
+/// device mounted several times (btrfs subvolumes, bind mounts) is kept once, at the mount point
+/// nearest the root.
+pub fn user_facing_volumes(volumes: impl IntoIterator<Item = Volume>) -> Vec<Volume> {
+    let mut shown: Vec<Volume> = Vec::new();
+    for volume in volumes {
+        let fs = volume.file_system.as_str();
+        if HIDDEN_FILE_SYSTEMS.contains(&fs)
+            || crate::volume::is_network_fs(fs)
+            || SYSTEM_MOUNT_PREFIXES
+                .iter()
+                .any(|prefix| volume.mount_point.starts_with(prefix))
+        {
+            continue;
+        }
+        let same_device = volume
+            .name
+            .starts_with("/dev/")
+            .then(|| shown.iter().position(|s| s.name == volume.name))
+            .flatten();
+        match same_device {
+            Some(ix) => {
+                let depth = |v: &Volume| v.mount_point.components().count();
+                if depth(&volume) < depth(&shown[ix]) {
+                    shown[ix] = volume;
+                }
+            }
+            None => shown.push(volume),
+        }
+    }
+    shown
+}
+
+/// The filesystem label of a Linux device, else the mount point's folder name. Other platforms
+/// already name volumes by label.
+fn display_name(volume: &Volume, labels: &[(PathBuf, String)]) -> String {
+    if !volume.name.starts_with("/dev/") {
+        return volume.name.clone();
+    }
+    let device = Path::new(&volume.name)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&volume.name));
+    if let Some((_, label)) = labels.iter().find(|(target, _)| *target == device) {
+        return label.clone();
+    }
+    match volume.mount_point.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => "File System".to_string(),
+    }
+}
+
+/// Devices and their filesystem labels, from the `/dev/disk/by-label` symlinks.
+fn device_labels() -> Vec<(PathBuf, String)> {
+    let Ok(entries) = std::fs::read_dir("/dev/disk/by-label") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let device = entry.path().canonicalize().ok()?;
+            Some((device, unescape_hex(&entry.file_name().to_string_lossy())))
+        })
+        .collect()
+}
+
+/// udev writes characters that are unsafe in file names as `\xHH`, such as `\x20` for a space.
+fn unescape_hex(name: &str) -> String {
+    let mut out = Vec::with_capacity(name.len());
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = bytes
+            .get(i..i + 4)
+            .filter(|chunk| chunk.starts_with(b"\\x"))
+            .and_then(|chunk| std::str::from_utf8(&chunk[2..]).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                out.push(byte);
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A mounted network share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkMount {
+    /// Where the share comes from, such as `//nas/media` or `media on nas`.
+    pub name: String,
+    pub mount_point: PathBuf,
+    pub file_system: String,
+}
+
+/// The mounted network shares. On Linux they come from the mount table alone: asking a CIFS or
+/// NFS mount for its capacity hangs while the server is unreachable.
+pub fn network_mounts() -> Vec<NetworkMount> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return Vec::new();
+        };
+        let mut mounts = Vec::new();
+        for mount in parse_network_mounts(&mountinfo) {
+            if mount.file_system == GVFS_FS {
+                mounts.extend(gvfs_shares(&mount.mount_point));
+            } else {
+                mounts.push(mount);
+            }
+        }
+        mounts
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        list_volumes()
+            .into_iter()
+            .filter(|v| crate::volume::is_network_fs(&v.file_system))
+            .map(|v| NetworkMount {
+                name: v.name,
+                mount_point: v.mount_point,
+                file_system: v.file_system,
+            })
+            .collect()
+    }
+}
+
+/// GNOME mounts every share it opens below one FUSE mount, one folder per share.
+const GVFS_FS: &str = "fuse.gvfsd-fuse";
+
+/// The network mounts listed in `/proc/self/mountinfo` content, named by their source.
+pub fn parse_network_mounts(mountinfo: &str) -> Vec<NetworkMount> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let mount_point = fields.nth(4)?;
+            let mut after_separator = fields.skip_while(|field| *field != "-").skip(1);
+            let fstype = after_separator.next()?;
+            let source = after_separator.next().unwrap_or_default();
+            crate::volume::is_network_fs(fstype).then(|| NetworkMount {
+                name: crate::volume::unescape_octal(source),
+                mount_point: PathBuf::from(crate::volume::unescape_octal(mount_point)),
+                file_system: fstype.to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn gvfs_shares(root: &Path) -> Vec<NetworkMount> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            Some(NetworkMount {
+                name: gvfs_share_name(&entry.file_name().to_string_lossy()),
+                mount_point: entry.path(),
+                file_system: GVFS_FS.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Names a gvfs folder such as `smb-share:server=nas,share=media` as `media on nas`.
+pub fn gvfs_share_name(folder: &str) -> String {
+    let Some((_, params)) = folder.split_once(':') else {
+        return folder.to_string();
+    };
+    let value = |key: &str| {
+        params
+            .split(',')
+            .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
+    };
+    match (value("share"), value("server").or_else(|| value("host"))) {
+        (Some(share), Some(server)) => format!("{share} on {server}"),
+        (None, Some(server)) => server.to_string(),
+        _ => folder.to_string(),
+    }
+}

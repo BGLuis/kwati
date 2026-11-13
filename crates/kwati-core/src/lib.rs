@@ -47,7 +47,9 @@ pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
 pub use volumes::{
-    filter_volumes, is_pseudo_filesystem, list_volumes, mounted_volumes, Volume, VolumeManager,
+    device_volumes, filter_volumes, gvfs_share_name, is_pseudo_filesystem, list_volumes,
+    mounted_volumes, network_mounts, parse_network_mounts, user_facing_volumes, NetworkMount,
+    Volume, VolumeManager,
 };
 pub use watcher::{DirWatcher, WatcherBackend};
 
