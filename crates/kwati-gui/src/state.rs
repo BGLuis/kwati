@@ -10,7 +10,7 @@ use kwati_core::{
     settings_path, sort_entries_by, volume_kind, Backend, BackendError, Bookmark,
     ConnectionProfile, ConnectionState, DirWatcher, Entry, History, HostKeyUnknown, ListOptions,
     LocalBackend, Location, ReconnectingBackend, Selection, Settings, SettingsWarning, SortColumn,
-    SortDirection, VolumeKind,
+    SortDirection, SortOrder, VolumeKind,
 };
 
 use crate::layout::PanelLayout;
@@ -283,8 +283,7 @@ impl AppState {
             state.settings_path = Some(path.clone());
             match Settings::load_from(&path) {
                 Ok((settings, warnings)) => {
-                    state.settings = settings;
-                    state.settings_warnings = warnings;
+                    state.apply_loaded_settings(settings, warnings);
                 }
                 Err(err) => {
                     state.status_message = Some(format!("Cannot load settings: {err}"));
@@ -297,6 +296,14 @@ impl AppState {
             state.status_message = problem;
         }
         state
+    }
+
+    fn apply_loaded_settings(&mut self, settings: Settings, warnings: Vec<SettingsWarning>) {
+        self.show_hidden = settings.show_hidden;
+        self.sort_column = settings.default_sort.column;
+        self.sort_direction = settings.default_sort.direction;
+        self.settings = settings;
+        self.settings_warnings = warnings;
     }
 
     /// Associates a settings file path without touching disk (for tests or deferred saves).
@@ -319,8 +326,7 @@ impl AppState {
     pub fn load_settings_from(&mut self, path: &Path) -> Result<Vec<SettingsWarning>, String> {
         let (settings, warnings) =
             Settings::load_from(path).map_err(|err| format!("Cannot load settings: {err}"))?;
-        self.settings = settings;
-        self.settings_warnings = warnings.clone();
+        self.apply_loaded_settings(settings, warnings.clone());
         self.settings_path = Some(path.to_path_buf());
         Ok(warnings)
     }
@@ -406,11 +412,7 @@ impl AppState {
         })
     }
 
-    pub fn rename_bookmark(
-        &mut self,
-        index: usize,
-        name: impl Into<String>,
-    ) -> Result<(), String> {
+    pub fn rename_bookmark(&mut self, index: usize, name: impl Into<String>) -> Result<(), String> {
         let name = name.into();
         if name.trim().is_empty() {
             return Err("Bookmark name cannot be empty.".into());
@@ -628,7 +630,9 @@ impl AppState {
                     }
                     _ if is_network_location(&target) => {
                         self.network_status = match &target {
-                            Location::Remote { profile_id, .. } => match self.remote.state(profile_id)
+                            Location::Remote { profile_id, .. } => match self
+                                .remote
+                                .state(profile_id)
                             {
                                 Some(ConnectionState::Connected) => NetworkMountStatus::Connected,
                                 Some(ConnectionState::Reconnecting) => {
@@ -761,16 +765,33 @@ impl AppState {
         self.reload_entries();
     }
 
-    /// Sets hidden file visibility and reloads the directory listing if changed.
+    /// Sets hidden file visibility, persists when configured, and reloads the directory listing if changed.
     pub fn set_show_hidden(&mut self, show: bool) {
+        if self.settings.show_hidden != show {
+            if let Err(err) = self.update_settings(|s| {
+                s.show_hidden = show;
+                Ok(())
+            }) {
+                self.set_status(err);
+            }
+        }
         if self.show_hidden != show {
             self.show_hidden = show;
             self.reload_entries();
         }
     }
 
-    /// Sets the sort column and direction and re-sorts the current entries.
+    /// Sets the sort column and direction, persists when configured, and re-sorts the current entries.
     pub fn set_sort(&mut self, column: SortColumn, direction: SortDirection) {
+        let order = SortOrder { column, direction };
+        if self.settings.default_sort != order {
+            if let Err(err) = self.update_settings(|s| {
+                s.default_sort = order;
+                Ok(())
+            }) {
+                self.set_status(err);
+            }
+        }
         self.sort_column = column;
         self.sort_direction = direction;
         let mut entries = (*self.entries).clone();
@@ -824,9 +845,10 @@ impl AppState {
             Location::Local(_) => Some(Arc::new(LocalBackend::with_list_timeout(
                 self.list_timeout(),
             ))),
-            Location::Remote { profile_id, .. } => {
-                self.remote.backend(profile_id).map(|b| b as Arc<dyn Backend>)
-            }
+            Location::Remote { profile_id, .. } => self
+                .remote
+                .backend(profile_id)
+                .map(|b| b as Arc<dyn Backend>),
         }
     }
 

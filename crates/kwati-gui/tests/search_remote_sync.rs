@@ -234,11 +234,11 @@ fn wait_until_app(
     pred(cx)
 }
 
-fn setup_harness<'a>(
-    cx: &'a mut TestAppContext,
+fn setup_harness(
+    cx: &mut TestAppContext,
     initial_location: Location,
     setup_state: impl FnOnce(&mut AppState) + 'static,
-) -> (Entity<SearchHarness>, &'a mut VisualTestContext) {
+) -> (Entity<SearchHarness>, &mut VisualTestContext) {
     cx.update(|cx| {
         register_keybindings(cx);
         register_text_input_keybindings(cx);

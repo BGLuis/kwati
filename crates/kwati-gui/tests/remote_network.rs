@@ -48,15 +48,23 @@ fn test_network_mount_status_transitions_and_timeout() {
     assert_eq!(state.network_status, NetworkMountStatus::Connected);
 }
 
-#[test]
-fn test_network_view_timeout_configuration() {
-    let mut timeout = DEFAULT_NETWORK_TIMEOUT_SECS;
-    assert_eq!(timeout, 10);
+#[gpui::test]
+fn test_network_view_timeout_configuration(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    use kwati_gui::views::network_view::NetworkView;
 
-    // Apply settings timeout without restart
-    let new_timeout_from_settings = 25;
-    timeout = new_timeout_from_settings;
-    assert_eq!(timeout, 25);
+    let state = cx.new(|_| AppState::new(Location::Local(PathBuf::from("/tmp"))));
+    let view = cx.new(|cx| NetworkView::new(state.clone(), cx));
+
+    assert_eq!(DEFAULT_NETWORK_TIMEOUT_SECS, 10);
+    view.read_with(cx, |v, _| assert_eq!(v.timeout_secs, 10));
+
+    state.update(cx, |state, cx| {
+        state.set_list_timeout_secs(25).unwrap();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert_eq!(v.timeout_secs, 25));
 }
 
 #[test]
@@ -93,44 +101,68 @@ fn test_host_key_fingerprint_trust_and_decline() {
     assert!(!trusted.contains(declined_fp));
 }
 
-#[test]
-fn test_host_key_changed_offers_no_connect_button() {
-    use kwati_gui::views::remote_dialogs::RemoteDialogKind;
+#[gpui::test]
+fn test_host_key_changed_offers_no_connect_button(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    use kwati_gui::state::RemotePrompt;
+    use kwati_gui::views::remote_dialogs::{RemoteDialogKind, RemoteDialogsView};
 
-    let changed_dialog = RemoteDialogKind::HostKeyChanged {
-        host: "ssh.company.com".into(),
-        port: 2222,
-        known_fingerprint: "SHA256:known_old_fingerprint_1111111111111111111".into(),
-        presented_fingerprint: "SHA256:new_unauthorized_fingerprint_22222222".into(),
-    };
-
-    let trust_dialog = RemoteDialogKind::TrustFingerprint {
-        host: "ssh.company.com".into(),
-        port: 2222,
-        algorithm: "ssh-ed25519".into(),
-        fingerprint: "SHA256:fingerprint_hash".into(),
-    };
-
-    let password_dialog = RemoteDialogKind::PasswordPrompt {
-        host: "ssh.company.com".into(),
-        username: "root".into(),
-        remember: false,
-        error_message: None,
-    };
-
-    // Helper checking has_connect_button matching RemoteDialogsView logic
-    let has_connect_btn = |d: &RemoteDialogKind| match d {
-        RemoteDialogKind::TrustFingerprint { .. } => true,
-        RemoteDialogKind::PasswordPrompt { .. } => true,
-        RemoteDialogKind::ProfileManager { .. } => true,
-        RemoteDialogKind::HostKeyChanged { .. } => false,
-        RemoteDialogKind::None => false,
-    };
+    let state = cx.new(|_| AppState::new(Location::Local(PathBuf::from("/tmp"))));
+    let view = cx.new(|cx| RemoteDialogsView::new(state.clone(), cx));
 
     // Security rule: Changed host key must NOT offer a connect button
-    assert!(!has_connect_btn(&changed_dialog));
-    assert!(has_connect_btn(&trust_dialog));
-    assert!(has_connect_btn(&password_dialog));
+    state.update(cx, |state, cx| {
+        state.remote_prompt = Some(RemotePrompt::HostKeyChanged {
+            host: "ssh.company.com".into(),
+            port: 2222,
+            presented: "SHA256:new_unauthorized_fingerprint_22222222".into(),
+            stored: vec!["SHA256:known_old_fingerprint_1111111111111111111".into()],
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| assert!(!v.has_connect_button(cx)));
+
+    // CertificateInvalid must NOT offer a connect button
+    state.update(cx, |state, cx| {
+        state.remote_prompt = Some(RemotePrompt::CertificateInvalid {
+            host: "ftps.company.com".into(),
+            port: 990,
+            reason: "unknown issuer".into(),
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| assert!(!v.has_connect_button(cx)));
+
+    // Password prompt DOES offer Connect
+    state.update(cx, |state, cx| {
+        state.remote_prompt = Some(RemotePrompt::Password {
+            profile_id: "srv".into(),
+            error: None,
+        });
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |v, cx| assert!(v.has_connect_button(cx)));
+
+    // First-time TrustFingerprint DOES offer Trust & Connect
+    state.update(cx, |state, cx| {
+        state.remote_prompt = None;
+        cx.notify();
+    });
+    view.update(cx, |v, cx| {
+        v.show(
+            RemoteDialogKind::TrustFingerprint {
+                host: "ssh.company.com".into(),
+                port: 2222,
+                algorithm: "ssh-ed25519".into(),
+                fingerprint: "SHA256:fingerprint_hash".into(),
+            },
+            cx,
+        );
+    });
+    view.read_with(cx, |v, cx| assert!(v.has_connect_button(cx)));
 }
 
 #[test]
@@ -665,4 +697,109 @@ fn test_sidebar_mount_unmounted_drive() {
         unmounted_volume.capacity_summary(),
         "200.0 GB free of 256.0 GB"
     );
+}
+
+#[test]
+fn test_app_state_settings_persistence_and_load_applies_hidden_and_sort() {
+    use kwati_core::{SortColumn, SortDirection, SortOrder};
+
+    let dir = std::env::temp_dir().join(format!(
+        "kwati_remote_network_settings_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let settings_file = dir.join("settings.toml");
+
+    // Isolated default state does not touch disk
+    let isolated = AppState::new(Location::Local(dir.clone()));
+    assert!(isolated.settings_path().is_none());
+
+    let mut state =
+        AppState::new(Location::Local(dir.clone())).with_settings_path(Some(settings_file.clone()));
+    state.set_show_hidden(true);
+    state.set_sort(SortColumn::Size, SortDirection::Descending);
+    assert!(state.show_hidden);
+    assert_eq!(state.sort_column, SortColumn::Size);
+    assert_eq!(state.sort_direction, SortDirection::Descending);
+
+    // Reload into a fresh AppState applies persisted show_hidden and default_sort
+    let mut reloaded = AppState::new(Location::Local(dir.clone()));
+    reloaded.load_settings_from(&settings_file).unwrap();
+    assert!(reloaded.show_hidden);
+    assert_eq!(reloaded.sort_column, SortColumn::Size);
+    assert_eq!(reloaded.sort_direction, SortDirection::Descending);
+    assert_eq!(
+        reloaded.settings.default_sort,
+        SortOrder::new(SortColumn::Size, SortDirection::Descending)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui::test]
+fn test_main_view_wires_modals_search_actions_and_focus_restoration(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    use kwati_gui::actions::{register_keybindings, ManageServers, OpenSettings};
+    use kwati_gui::components::register_text_input_keybindings;
+    use kwati_gui::views::search_view::ToggleSearch;
+    use kwati_gui::views::MainView;
+
+    let dir = std::env::temp_dir().join(format!("kwati_main_wiring_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    cx.update(|app| {
+        register_keybindings(app);
+        register_text_input_keybindings(app);
+    });
+
+    let (main, vcx) = cx.add_window_view(|window, cx| {
+        let state = cx.new(|cx| {
+            let mut st = AppState::new(Location::Local(dir.clone()));
+            st.attach(cx);
+            st.reload_entries();
+            st
+        });
+        MainView::new(state, window, cx)
+    });
+    vcx.run_until_parked();
+
+    let list_focused = |vcx: &mut gpui::VisualTestContext| {
+        let handle = main.read_with(vcx, |m, cx| m.list.read(cx).focus_handle.clone());
+        vcx.update(|window, _| handle.is_focused(window))
+    };
+    assert!(list_focused(vcx));
+
+    // OpenSettings action opens SettingsView; closing restores list focus
+    vcx.dispatch_action(OpenSettings);
+    vcx.run_until_parked();
+    main.read_with(vcx, |m, cx| assert!(m.settings.read(cx).is_open(cx)));
+    let settings = main.read_with(vcx, |m, _| m.settings.clone());
+    settings.update(vcx, |s, cx| s.close(cx));
+    vcx.run_until_parked();
+    main.read_with(vcx, |m, cx| assert!(!m.settings.read(cx).is_open(cx)));
+    assert!(list_focused(vcx));
+
+    // ManageServers action opens RemoteDialogsView profile manager; closing restores list focus
+    vcx.dispatch_action(ManageServers);
+    vcx.run_until_parked();
+    main.read_with(vcx, |m, cx| assert!(m.remote_dialogs.read(cx).is_open(cx)));
+    let remote_dialogs = main.read_with(vcx, |m, _| m.remote_dialogs.clone());
+    remote_dialogs.update(vcx, |d, cx| d.close(cx));
+    vcx.run_until_parked();
+    main.read_with(vcx, |m, cx| assert!(!m.remote_dialogs.read(cx).is_open(cx)));
+    assert!(list_focused(vcx));
+
+    // ToggleSearch action opens SearchView even when collapsed; closing restores list focus
+    vcx.dispatch_action(ToggleSearch);
+    vcx.run_until_parked();
+    main.read_with(vcx, |m, cx| assert!(m.search.read(cx).is_active()));
+    let search = main.read_with(vcx, |m, _| m.search.clone());
+    search.update(vcx, |s, cx| s.close(cx));
+    vcx.run_until_parked();
+    main.read_with(vcx, |m, cx| assert!(!m.search.read(cx).is_active()));
+    assert!(list_focused(vcx));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

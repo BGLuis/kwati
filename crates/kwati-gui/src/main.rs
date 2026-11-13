@@ -40,7 +40,7 @@ fn main() {
                     },
                     |window, cx| {
                         let app_state = cx.new(|cx| {
-                            let mut state = AppState::new(initial_location.clone());
+                            let mut state = AppState::load_native(initial_location.clone());
                             state.attach(cx);
                             state.reload_entries();
                             state

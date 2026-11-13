@@ -33,13 +33,14 @@ struct MemBackend {
     state: Arc<Mutex<MemState>>,
 }
 
+type ReadHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 struct MemState {
     dirs: BTreeSet<PathBuf>,
     files: BTreeMap<PathBuf, Vec<u8>>,
     trash_mode: TrashMode,
     delete_calls: usize,
-    read_pause: Option<Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>>,
-    pause_gate: Option<Arc<AtomicBool>>,
+    on_second_read: Option<ReadHook>,
 }
 
 impl MemBackend {
@@ -52,8 +53,7 @@ impl MemBackend {
                 files: BTreeMap::new(),
                 trash_mode,
                 delete_calls: 0,
-                read_pause: None,
-                pause_gate: None,
+                on_second_read: None,
             })),
         }
     }
@@ -124,8 +124,7 @@ impl Drop for MemWriter {
 struct PausedReader {
     inner: Cursor<Vec<u8>>,
     first_chunk_sent: bool,
-    on_first_chunk: Option<std::sync::mpsc::Sender<()>>,
-    resume_flag: Option<Arc<AtomicBool>>,
+    on_second_read: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Read for PausedReader {
@@ -133,16 +132,10 @@ impl Read for PausedReader {
         if !self.first_chunk_sent {
             self.first_chunk_sent = true;
             let cap = buf.len().min(4096);
-            let n = self.inner.read(&mut buf[..cap])?;
-            if let Some(tx) = self.on_first_chunk.take() {
-                let _ = tx.send(());
-            }
-            return Ok(n);
+            return self.inner.read(&mut buf[..cap]);
         }
-        if let Some(flag) = &self.resume_flag {
-            while !flag.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
+        if let Some(cb) = self.on_second_read.take() {
+            cb();
         }
         self.inner.read(buf)
     }
@@ -201,16 +194,14 @@ impl Backend for MemBackend {
             .get(location.path())
             .cloned()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
-        let tx = st
-            .read_pause
+        let on_second_read = st
+            .on_second_read
             .as_ref()
             .and_then(|slot| slot.lock().unwrap().take());
-        let gate = st.pause_gate.clone();
         Ok(Box::new(PausedReader {
             inner: Cursor::new(data),
             first_chunk_sent: false,
-            on_first_chunk: tx,
-            resume_flag: gate,
+            on_second_read,
         }))
     }
 
@@ -721,15 +712,28 @@ fn cancelling_remote_to_local_copy_leaves_no_partial_file(cx: &mut TestAppContex
     let local_dest = temp_dir("cancel_r2l");
     let remote = MemBackend::new(TrashMode::Unavailable);
     remote.insert_dir("/srv");
-    // Larger than one 64KB chunk so transfer pauses cleanly mid-stream
+    // Larger than one 4KB first read so transfer enters a second read mid-stream
     remote.insert_file("/srv/big.bin", vec![0xAB; 256 * 1024]);
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    let gate = Arc::new(AtomicBool::new(false));
+    let saw_partial = Arc::new(AtomicBool::new(false));
+    let job_slot = Arc::new(Mutex::new(None::<u64>));
     {
+        let saw_partial = saw_partial.clone();
+        let job_slot = job_slot.clone();
+        let local_dest_check = local_dest.clone();
         let mut st = remote.state.lock().unwrap();
-        st.read_pause = Some(Arc::new(Mutex::new(Some(tx))));
-        st.pause_gate = Some(gate.clone());
+        st.on_second_read = Some(Arc::new(Mutex::new(Some(Box::new(move || {
+            let has_partial = fs::read_dir(&local_dest_check)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().contains(".kwati-partial"));
+            saw_partial.store(has_partial, Ordering::Relaxed);
+            if let Some(job_id) = *job_slot.lock().unwrap() {
+                cancel_active_job(job_id);
+            }
+        })))));
     }
 
     let src = Location::Remote {
@@ -745,15 +749,14 @@ fn cancelling_remote_to_local_copy_leaves_no_partial_file(cx: &mut TestAppContex
         assert_eq!(st.active_jobs.len(), 1);
         st.active_jobs[0].id
     });
+    *job_slot.lock().unwrap() = Some(job_id);
 
-    // Wait until background thread has written the first chunk to .big.bin.kwati-partial
-    rx.recv_timeout(std::time::Duration::from_secs(5))
-        .expect("background transfer should start reading");
-
-    // Cancel via the same registry JobsView::cancel_job uses, then let reader wake up
-    cancel_active_job(job_id);
-    gate.store(true, Ordering::Relaxed);
     vcx.run_until_parked();
+
+    assert!(
+        saw_partial.load(Ordering::Relaxed),
+        "transfer should have created a .kwati-partial file before cancellation"
+    );
 
     // Neither the final file nor any .kwati-partial file may remain
     let entries: Vec<String> = fs::read_dir(&local_dest)

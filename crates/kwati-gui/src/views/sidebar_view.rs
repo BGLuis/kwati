@@ -323,7 +323,7 @@ impl SidebarView {
             .collect();
         let rename_input = cx.new(|cx| TextInput::with_placeholder("Nome do favorito", cx));
         let state_sub = cx.observe(&app_state, |this, app_state, cx| {
-            this.sync_bookmarks_from_state(&app_state.read(cx));
+            this.sync_bookmarks_from_state(app_state.read(cx));
             cx.notify();
         });
         let device_poll = cx.spawn(async move |this, cx| loop {

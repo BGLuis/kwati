@@ -309,11 +309,12 @@ fn header_view_remote_and_network_mount_indicators(cx: &mut TestAppContext) {
     });
 
     // Remote location (disconnected): shows protocol + host + Desconectado + Atualizar + Reconectar
-    state.update(cx, |state, _| {
+    state.update(cx, |state, cx| {
         state.current_location = Location::Remote {
             profile_id: "srv-sftp".into(),
             path: PathBuf::from("/srv"),
         };
+        cx.notify();
     });
     cx.run_until_parked();
     header.read_with(cx, |h, cx| {
@@ -370,8 +371,9 @@ fn network_view_reads_timeout_from_state_and_triggers_retry_and_cancel(cx: &mut 
     });
     let network_view = cx.new(|cx| NetworkView::new(state.clone(), cx));
 
-    state.update(cx, |state, _| {
+    state.update(cx, |state, cx| {
         state.set_list_timeout_secs(25).unwrap();
+        cx.notify();
     });
     cx.run_until_parked();
 

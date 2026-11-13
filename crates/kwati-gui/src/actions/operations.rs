@@ -276,11 +276,11 @@ impl Transfer {
         }
         for src in &self.sources {
             let key = backend_key(src);
-            if !self.src_backends.contains_key(&key) {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.src_backends.entry(key) {
                 let backend = state
                     .backend_for(src)
                     .ok_or_else(|| "Source server is not connected".to_string())?;
-                self.src_backends.insert(key, backend);
+                e.insert(backend);
             }
         }
         Ok(())

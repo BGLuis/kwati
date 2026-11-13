@@ -927,7 +927,7 @@ impl RemoteDialogsView {
                 port,
                 presented,
                 stored,
-            } => self.render_host_key_changed(&host, port, &presented, &stored, theme, fonts, cx),
+            } => self.render_host_key_changed(&host, port, &presented, &stored, cx),
             RemotePrompt::TlsUnavailable {
                 host, port, reply, ..
             } => self.render_tls_unavailable(&host, port, &reply, theme, fonts, cx),
@@ -962,15 +962,7 @@ impl RemoteDialogsView {
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned)
                     .collect();
-                self.render_host_key_changed(
-                    host,
-                    *port,
-                    presented_fingerprint,
-                    &stored,
-                    theme,
-                    fonts,
-                    cx,
-                )
+                self.render_host_key_changed(host, *port, presented_fingerprint, &stored, cx)
             }
             RemoteDialogKind::PasswordPrompt {
                 host,
@@ -1149,10 +1141,10 @@ impl RemoteDialogsView {
         port: u16,
         presented: &str,
         stored: &[String],
-        theme: &Theme,
-        fonts: &Fonts,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let theme = &Theme::get(cx);
+        let fonts = &Fonts::get(cx);
         let host_label = format!("{host}:{port}");
         let stored_rows: Vec<AnyElement> = if stored.is_empty() {
             vec![div()
@@ -1888,13 +1880,13 @@ mod tests {
         dir
     }
 
-    fn open_dialog_window<'a>(
-        cx: &'a mut TestAppContext,
+    fn open_dialog_window(
+        cx: &mut TestAppContext,
         state: AppState,
     ) -> (
         Entity<AppState>,
         Entity<RemoteDialogsView>,
-        &'a mut VisualTestContext,
+        &mut VisualTestContext,
     ) {
         cx.update(register_text_input_keybindings);
         let state_entity = cx.new(|_| state);
