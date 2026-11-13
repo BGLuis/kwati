@@ -11,6 +11,7 @@ mod search;
 mod secrets;
 mod settings;
 mod sftp;
+mod smb;
 mod transfer;
 mod trash;
 pub mod volume;
@@ -43,6 +44,7 @@ pub use settings::{
     DEFAULT_REMOTE_POLL_INTERVAL_SECS, MIN_REMOTE_POLL_INTERVAL_SECS,
 };
 pub use sftp::{known_hosts_path, HostKeyChanged, HostKeyUnknown, KnownHosts, SftpBackend};
+pub use smb::SmbBackend;
 pub use transfer::{copy_between, move_between};
 pub use trash::{is_trash_unavailable, trash, trash_with, TrashUnavailable};
 pub use volume::{volume_kind, VolumeKind};
@@ -611,7 +613,52 @@ impl BackendError {
     pub fn is_trash_unavailable(&self) -> bool {
         matches!(self, BackendError::Io(err) if is_trash_unavailable(err))
     }
+
+    /// The rejection behind this error, if the server refused the user name and credential.
+    pub fn authentication_failed(&self) -> Option<&AuthenticationFailed> {
+        match self {
+            BackendError::Io(err) => err.get_ref()?.downcast_ref(),
+            BackendError::Unsupported => None,
+        }
+    }
 }
+
+/// The server refused the user name and the password, key or passphrase sent with it.
+///
+/// Carried inside an [`io::Error`] of kind [`io::ErrorKind::PermissionDenied`]; detect it with
+/// [`BackendError::authentication_failed`]. Backends never retry it on their own, so a wrong
+/// password does not lock the account; the interface asks the user again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticationFailed {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+}
+
+impl AuthenticationFailed {
+    pub(crate) fn error(profile: &ConnectionProfile) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            Self {
+                host: profile.host.clone(),
+                port: profile.port,
+                user: profile.user.clone(),
+            },
+        )
+    }
+}
+
+impl std::fmt::Display for AuthenticationFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{} rejected the credentials of {}",
+            self.host, self.port, self.user
+        )
+    }
+}
+
+impl std::error::Error for AuthenticationFailed {}
 
 /// What a backend reports about one entry, without following symlinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

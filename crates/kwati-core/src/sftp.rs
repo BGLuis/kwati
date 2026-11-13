@@ -13,8 +13,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::{Builder, Runtime};
 
 use crate::{
-    AuthMethod, Backend, BackendError, Confirmed, ConnectionProfile, Entry, EntryKind, EntryMeta,
-    Listing, Location, Protocol, Secrets,
+    AuthMethod, AuthenticationFailed, Backend, BackendError, Confirmed, ConnectionProfile, Entry,
+    EntryKind, EntryMeta, Listing, Location, Protocol, Secrets,
 };
 
 /// The server presented a host key that is not in [`KnownHosts`]; nothing was sent to it.
@@ -428,10 +428,7 @@ async fn open(
         }
     };
     if !auth.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "the server rejected the credentials",
-        ));
+        return Err(AuthenticationFailed::error(profile));
     }
     let channel = session.channel_open_session().await.map_err(ssh_error)?;
     channel

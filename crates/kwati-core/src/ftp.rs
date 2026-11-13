@@ -16,8 +16,8 @@ use suppaftp::{
 };
 
 use crate::{
-    Backend, BackendError, Confirmed, ConnectionProfile, Entry, EntryKind, EntryMeta, Listing,
-    Location, Protocol, Secrets,
+    AuthenticationFailed, Backend, BackendError, Confirmed, ConnectionProfile, Entry, EntryKind,
+    EntryMeta, Listing, Location, Protocol, Secrets,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -123,6 +123,17 @@ fn ftp_error(err: FtpError) -> io::Error {
         err @ (FtpError::BadResponse | FtpError::InvalidAddress(_)) => {
             io::Error::new(InvalidData, err)
         }
+    }
+}
+
+/// A 530 reply to the login means the user name or password was refused; anything else (a lost
+/// connection, a server error) keeps the usual mapping.
+fn login_error(profile: &ConnectionProfile, err: FtpError) -> io::Error {
+    match &err {
+        FtpError::UnexpectedResponse(reply) if reply.status.code() == 530 => {
+            AuthenticationFailed::error(profile)
+        }
+        _ => ftp_error(err),
     }
 }
 
@@ -499,7 +510,9 @@ impl FtpBackend {
                 Session::Plain(dial(profile, FtpStream::connect_timeout)?)
             }
         };
-        session.login(&profile.user, &password).map_err(ftp_error)?;
+        session
+            .login(&profile.user, &password)
+            .map_err(|err| login_error(profile, err))?;
         let mlsd = session.supports_mlsd();
         Ok(Self {
             profile_id: profile.id.clone(),
@@ -720,6 +733,22 @@ mod tests {
 
     fn lines(text: &[&str]) -> Vec<String> {
         text.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_refused_login_is_an_authentication_failure_but_other_errors_are_not() {
+        let refused = BackendError::from(login_error(
+            &profile(Protocol::Ftp),
+            reply(530, "Login incorrect."),
+        ));
+        let failure = refused.authentication_failed().unwrap();
+        assert_eq!((failure.host.as_str(), failure.user.as_str()), ("h", "u"));
+
+        let dropped = BackendError::from(login_error(
+            &profile(Protocol::Ftp),
+            reply(421, "Service not available"),
+        ));
+        assert!(dropped.authentication_failed().is_none());
     }
 
     #[test]
