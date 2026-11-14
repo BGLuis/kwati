@@ -18,11 +18,14 @@ actions!(
         SelectPrevious,
         SelectFirst,
         SelectLast,
+        SelectAll,
+        ClearSelection,
         PageUp,
         PageDown,
         Refresh,
         ToggleHidden,
         TogglePreview,
+        OpenContextMenu,
     ]
 );
 

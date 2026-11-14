@@ -3,16 +3,18 @@
 //! Uses `uniform_list` to render only visible rows, with support for columns
 //! (name, size, date), sort headers, and scrollbar synchronization.
 
+use std::collections::HashSet;
+
 use gpui::{
-    div, prelude::*, px, relative, transparent_black, uniform_list, Context, CursorStyle, Entity,
-    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, ScrollStrategy, UniformListScrollHandle, Window,
+    div, point, prelude::*, px, relative, transparent_black, uniform_list, Context, CursorStyle,
+    Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, UniformListScrollHandle, Window,
 };
 use kwati_core::{Entry, Location, SortColumn, SortDirection};
 
 use crate::actions::navigation::{
-    GoBack, GoForward, GoUp, OpenSelected, PageDown, PageUp, Refresh, SelectFirst, SelectLast,
-    SelectNext, SelectPrevious, ToggleHidden,
+    ClearSelection, GoBack, GoForward, GoUp, OpenContextMenu, OpenSelected, PageDown, PageUp,
+    Refresh, SelectAll, SelectFirst, SelectLast, SelectNext, SelectPrevious, ToggleHidden,
 };
 use crate::components::{icon, Ellipsize, IconName, ScrollbarState};
 use crate::state::{entry_location, AppState};
@@ -74,6 +76,35 @@ pub fn format_modified(time: Option<std::time::SystemTime>) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hours, minutes)
 }
 
+/// Active rubber-band drag rectangle in window coordinates.
+#[derive(Clone, Debug)]
+struct RubberBand {
+    start: Point<Pixels>,
+    current: Point<Pixels>,
+    base_selection: Option<HashSet<Location>>,
+}
+
+impl RubberBand {
+    fn rect(&self) -> (Pixels, Pixels, Pixels, Pixels) {
+        let left = self.start.x.min(self.current.x);
+        let top = self.start.y.min(self.current.y);
+        let right = self.start.x.max(self.current.x);
+        let bottom = self.start.y.max(self.current.y);
+        (left, top, right, bottom)
+    }
+
+    fn is_drag(&self) -> bool {
+        let (left, top, right, bottom) = self.rect();
+        (right - left) > px(2.) || (bottom - top) > px(2.)
+    }
+}
+
+/// Events emitted by [`ListView`] to [`super::MainView`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ListViewEvent {
+    OpenContextMenu { position: Point<Pixels> },
+}
+
 /// View rendering directory entries in a windowed list with a draggable scrollbar.
 pub struct ListView {
     pub app_state: Entity<AppState>,
@@ -81,7 +112,10 @@ pub struct ListView {
     pub scroll_handle: UniformListScrollHandle,
     pub scrollbar_state: ScrollbarState,
     pub row_height: Pixels,
+    rubber_band: Option<RubberBand>,
 }
+
+impl EventEmitter<ListViewEvent> for ListView {}
 
 impl Focusable for ListView {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
@@ -96,8 +130,22 @@ impl ListView {
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             scrollbar_state: ScrollbarState::default(),
-            row_height: px(26.),
+            row_height: size::ROW,
+            rubber_band: None,
         }
+    }
+
+    fn effective_row_height(&self, entry_count: usize) -> Pixels {
+        if entry_count == 0 {
+            return self.row_height;
+        }
+        self.scroll_handle
+            .0
+            .borrow()
+            .last_item_size
+            .map(|s| s.contents.height / (entry_count as f32))
+            .filter(|h| *h > px(0.))
+            .unwrap_or(self.row_height)
     }
 
     /// Scrolls to bring the item at index `ix` into view.
@@ -142,22 +190,236 @@ impl ListView {
 
     pub fn on_entry_click(
         &mut self,
+        ix: usize,
         entry: Entry,
         event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.button == MouseButton::Left && event.click_count == 2 {
+        self.focus_handle.focus(window);
+        cx.stop_propagation();
+
+        if event.button != MouseButton::Left {
+            return;
+        }
+
+        if event.click_count == 2 && !event.modifiers.shift && !event.modifiers.secondary() {
             self.open_entry(entry, cx);
-        } else if event.button == MouseButton::Left {
-            // Single click: select entry
+            return;
+        }
+
+        self.app_state.update(cx, |state, cx| {
+            let location = state.location_of(&entry);
+            if event.modifiers.shift {
+                state.select_range_to(ix, event.modifiers.secondary());
+                cx.notify();
+            } else if event.modifiers.secondary() {
+                state.toggle_select_location(location);
+                cx.notify();
+            } else if state.selection.len() != 1 || !state.selection.contains(&location) {
+                state.selection.select_only(location);
+                cx.notify();
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn on_entry_right_click(
+        &mut self,
+        entry: Entry,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window);
+        cx.stop_propagation();
+
+        self.app_state.update(cx, |state, cx| {
+            let location = state.location_of(&entry);
+            if !state.selection.contains(&location) {
+                state.selection.select_only(location);
+                cx.notify();
+            }
+        });
+        cx.emit(ListViewEvent::OpenContextMenu {
+            position: event.position,
+        });
+    }
+
+    fn on_list_right_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window);
+        let entry_count = self.app_state.read(cx).entries.len();
+        if let Some(ix) = self.row_index_at(event.position, entry_count) {
+            if let Some(entry) = self.app_state.read(cx).entries.get(ix).cloned() {
+                self.on_entry_right_click(entry, event, window, cx);
+                return;
+            }
+        }
+        self.app_state.update(cx, |state, cx| {
+            if !state.selection.is_empty() {
+                state.clear_selection();
+                cx.notify();
+            }
+        });
+        cx.emit(ListViewEvent::OpenContextMenu {
+            position: event.position,
+        });
+    }
+
+    pub fn open_context_menu_from_keyboard(&mut self, cx: &mut Context<Self>) {
+        let (entry_count, selected_ix) = {
+            let state = self.app_state.read(cx);
+            (state.entries.len(), state.selected_index())
+        };
+        let row_h = self.effective_row_height(entry_count);
+        let (list_bounds, scroll_offset) = {
+            let scroll = self.scroll_handle.0.borrow();
+            (scroll.base_handle.bounds(), scroll.base_handle.offset())
+        };
+        let position = if list_bounds.size.width > px(0.) && list_bounds.size.height > px(0.) {
+            match selected_ix {
+                Some(ix) => point(
+                    list_bounds.left() + px(120.),
+                    (list_bounds.top() + row_h * ((ix + 1) as f32) + scroll_offset.y)
+                        .clamp(list_bounds.top(), list_bounds.bottom()),
+                ),
+                None => point(list_bounds.left() + px(16.), list_bounds.top() + px(16.)),
+            }
+        } else {
+            point(px(120.), px(120.))
+        };
+        cx.emit(ListViewEvent::OpenContextMenu { position });
+    }
+
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, cx| {
+            state.select_all_entries();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, cx| {
+            if !state.selection.is_empty() {
+                state.clear_selection();
+                cx.notify();
+            }
+        });
+        cx.notify();
+    }
+
+    fn row_index_at(&self, position: Point<Pixels>, entry_count: usize) -> Option<usize> {
+        let state = self.scroll_handle.0.borrow();
+        let list_bounds = state.base_handle.bounds();
+        let scroll_offset = state.base_handle.offset();
+        drop(state);
+        let row_h = self.effective_row_height(entry_count);
+        if position.x < list_bounds.left()
+            || position.x > list_bounds.right()
+            || position.y < list_bounds.top()
+            || position.y > list_bounds.bottom()
+        {
+            return None;
+        }
+        let rel_y = position.y - list_bounds.top() - scroll_offset.y;
+        if rel_y < px(0.) || row_h <= px(0.) {
+            return None;
+        }
+        let ix = (rel_y / row_h).floor() as usize;
+        (ix < entry_count).then_some(ix)
+    }
+
+    fn on_list_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        let entry_count = self.app_state.read(cx).entries.len();
+        if self.row_index_at(event.position, entry_count).is_some() {
+            return;
+        }
+        self.focus_handle.focus(window);
+        let base_selection = if event.modifiers.secondary() {
+            Some(self.app_state.read(cx).selection.locations().clone())
+        } else {
             self.app_state.update(cx, |state, cx| {
-                let location = state.location_of(&entry);
-                if state.selection.len() != 1 || !state.selection.contains(&location) {
-                    state.selection.select_only(location);
+                if !state.selection.is_empty() {
+                    state.clear_selection();
                     cx.notify();
                 }
             });
+            None
+        };
+        self.rubber_band = Some(RubberBand {
+            start: event.position,
+            current: event.position,
+            base_selection,
+        });
+        cx.notify();
+    }
+
+    fn on_list_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ref mut rb) = self.rubber_band else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.rubber_band = None;
+            cx.notify();
+            return;
+        }
+        rb.current = event.position;
+        if !rb.is_drag() {
+            return;
+        }
+
+        let (left, top, right, bottom) = rb.rect();
+        let base_selection = rb.base_selection.clone();
+        let (list_bounds, scroll_offset) = {
+            let state = self.scroll_handle.0.borrow();
+            (state.base_handle.bounds(), state.base_handle.offset())
+        };
+        let entry_count = self.app_state.read(cx).entries.len();
+        let row_h = self.effective_row_height(entry_count);
+
+        if list_bounds.size.width > px(0.)
+            && right > list_bounds.left()
+            && left < list_bounds.right()
+        {
+            self.app_state.update(cx, |state, cx| {
+                let touched = (0..state.entries.len()).filter(|&ix| {
+                    let row_top = list_bounds.top() + row_h * (ix as f32) + scroll_offset.y;
+                    let row_bottom = row_top + row_h;
+                    row_bottom > top && row_top < bottom
+                });
+                state.select_indices(touched, base_selection.as_ref());
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    fn on_list_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rubber_band.take().is_some() {
             cx.notify();
         }
     }
@@ -369,7 +631,15 @@ impl Render for ListView {
             .flex_col()
             .size_full()
             .bg(theme.surface)
+            .key_context("ListView")
             .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(|this, _: &SelectAll, _window, cx| this.select_all(cx)))
+            .on_action(
+                cx.listener(|this, _: &ClearSelection, _window, cx| this.clear_selection(cx)),
+            )
+            .on_action(cx.listener(|this, _: &OpenContextMenu, _window, cx| {
+                this.open_context_menu_from_keyboard(cx)
+            }))
             .on_action(cx.listener(|this, _: &SelectNext, _window, cx| this.select_next(cx)))
             .on_action(
                 cx.listener(|this, _: &SelectPrevious, _window, cx| this.select_previous(cx)),
@@ -519,112 +789,189 @@ impl Render for ListView {
                     .size_full()
                     .overflow_hidden()
                     .child(
-                        uniform_list(
-                            "directory_entries",
-                            entry_count,
-                            cx.processor(move |_this: &mut ListView, range, _window, cx| {
-                                let mut items: Vec<gpui::AnyElement> = Vec::new();
-                                for ix in range {
-                                    if let Some(entry) = entries_clone.get(ix) {
-                                        let entry: &Entry = entry;
-                                        let loc: Location = entry_location(&current, entry);
-                                        let is_selected = selection.contains(&loc);
-                                        let is_dir = entry.is_dir();
-                                        let is_hidden = entry.is_hidden;
-                                        let name = entry.display_name();
-                                        let size_str = format_size(entry.size, is_dir);
-                                        let date_str = format_modified(entry.modified);
-                                        let entry_for_click = entry.clone();
+                        div()
+                            .relative()
+                            .flex_1()
+                            .h_full()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::on_list_mouse_down),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(Self::on_list_right_click),
+                            )
+                            .on_mouse_move(cx.listener(Self::on_list_mouse_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_list_mouse_up))
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(Self::on_list_mouse_up),
+                            )
+                            .child(
+                                uniform_list(
+                                    "directory_entries",
+                                    entry_count,
+                                    cx.processor(move |_this: &mut ListView, range, _window, cx| {
+                                        let mut items: Vec<gpui::AnyElement> = Vec::new();
+                                        for ix in range {
+                                            if let Some(entry) = entries_clone.get(ix) {
+                                                let entry: &Entry = entry;
+                                                let loc: Location =
+                                                    entry_location(&current, entry);
+                                                let is_selected = selection.contains(&loc);
+                                                let is_dir = entry.is_dir();
+                                                let is_hidden = entry.is_hidden;
+                                                let name = entry.display_name();
+                                                let size_str = format_size(entry.size, is_dir);
+                                                let date_str = format_modified(entry.modified);
+                                                let entry_for_click = entry.clone();
+                                                let entry_for_rclick = entry.clone();
 
-                                        items.push(
-                                            div()
-                                                .id(ix)
-                                                .flex()
-                                                .flex_row()
-                                                .w_full()
-                                                .h(size::ROW)
-                                                .px(space::S8)
-                                                .gap(space::S8)
-                                                .rounded(radius::CONTROL)
-                                                .items_center()
-                                                .cursor_pointer()
-                                                .when(is_selected, |s| s.bg(row_selected))
-                                                .when(!is_selected, |s| {
-                                                    s.hover(|s| s.bg(row_hover))
-                                                })
-                                                .text_body()
-                                                .text_color(if is_hidden && !is_selected {
-                                                    row_muted
-                                                } else {
-                                                    row_text
-                                                })
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(
-                                                        move |this,
-                                                              event: &MouseDownEvent,
-                                                              window,
-                                                              cx| {
-                                                            this.on_entry_click(
-                                                                entry_for_click.clone(),
-                                                                event,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        },
-                                                    ),
-                                                )
-                                                .child(
+                                                items.push(
                                                     div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
+                                                        .id(ix)
                                                         .flex()
-                                                        .items_center()
+                                                        .flex_row()
+                                                        .w_full()
+                                                        .h(size::ROW)
+                                                        .px(space::S8)
                                                         .gap(space::S8)
-                                                        .child(if is_dir {
-                                                            icon(IconName::Folder)
-                                                                .text_color(row_accent)
-                                                        } else {
-                                                            icon(IconName::File).text_color(
-                                                                if is_hidden && !is_selected {
-                                                                    row_muted
-                                                                } else {
-                                                                    row_text
-                                                                },
-                                                            )
+                                                        .rounded(radius::CONTROL)
+                                                        .items_center()
+                                                        .cursor_pointer()
+                                                        .when(is_selected, |s| s.bg(row_selected))
+                                                        .when(!is_selected, |s| {
+                                                            s.hover(|s| s.bg(row_hover))
                                                         })
-                                                        .child(div().ellipsize().child(name)),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .w(SIZE_COLUMN)
-                                                        .flex()
-                                                        .justify_end()
-                                                        .text_data(&row_fonts)
-                                                        .text_color(if is_selected { row_text } else { row_muted })
-                                                        .child(size_str),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .w(DATE_COLUMN)
-                                                        .text_data(&row_fonts)
-                                                        .text_color(if is_selected { row_text } else { row_muted })
-                                                        .child(date_str),
-                                                )
-                                                .child(div().w(HIDDEN_TOGGLE_COLUMN))
-                                                .into_any_element(),
-                                        );
-                                    }
-                                }
-                                items
-                            }),
-                        )
-                        .track_scroll(self.scroll_handle.clone())
-                        .flex_1()
-                        .h_full(),
+                                                        .text_body()
+                                                        .text_color(if is_hidden && !is_selected {
+                                                            row_muted
+                                                        } else {
+                                                            row_text
+                                                        })
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(
+                                                                move |this,
+                                                                      event: &MouseDownEvent,
+                                                                      window,
+                                                                      cx| {
+                                                                    this.on_entry_click(
+                                                                        ix,
+                                                                        entry_for_click.clone(),
+                                                                        event,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            ),
+                                                        )
+                                                        .on_mouse_down(
+                                                            MouseButton::Right,
+                                                            cx.listener(
+                                                                move |this,
+                                                                      event: &MouseDownEvent,
+                                                                      window,
+                                                                      cx| {
+                                                                    this.on_entry_right_click(
+                                                                        entry_for_rclick.clone(),
+                                                                        event,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_w_0()
+                                                                .overflow_hidden()
+                                                                .whitespace_nowrap()
+                                                                .text_ellipsis()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap(space::S8)
+                                                                .child(if is_dir {
+                                                                    icon(IconName::Folder)
+                                                                        .text_color(row_accent)
+                                                                } else {
+                                                                    icon(IconName::File).text_color(
+                                                                        if is_hidden && !is_selected
+                                                                        {
+                                                                            row_muted
+                                                                        } else {
+                                                                            row_text
+                                                                        },
+                                                                    )
+                                                                })
+                                                                .child(div().ellipsize().child(name)),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w(SIZE_COLUMN)
+                                                                .flex()
+                                                                .justify_end()
+                                                                .text_data(&row_fonts)
+                                                                .text_color(if is_selected {
+                                                                    row_text
+                                                                } else {
+                                                                    row_muted
+                                                                })
+                                                                .child(size_str),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w(DATE_COLUMN)
+                                                                .text_data(&row_fonts)
+                                                                .text_color(if is_selected {
+                                                                    row_text
+                                                                } else {
+                                                                    row_muted
+                                                                })
+                                                                .child(date_str),
+                                                        )
+                                                        .child(div().w(HIDDEN_TOGGLE_COLUMN))
+                                                        .into_any_element(),
+                                                );
+                                            }
+                                        }
+                                        items
+                                    }),
+                                )
+                                .track_scroll(self.scroll_handle.clone())
+                                .size_full(),
+                            )
+                            .when_some(
+                                self.rubber_band.as_ref().filter(|rb| rb.is_drag()),
+                                |container, rb| {
+                                    let list_bounds =
+                                        self.scroll_handle.0.borrow().base_handle.bounds();
+                                    let (left, top, right, bottom) = rb.rect();
+                                    let rel_left = (left - list_bounds.left()).max(px(0.));
+                                    let rel_top = (top - list_bounds.top()).max(px(0.));
+                                    let rel_right =
+                                        (right - list_bounds.left()).min(list_bounds.size.width);
+                                    let rel_bottom = (bottom - list_bounds.top())
+                                        .min(list_bounds.size.height);
+                                    let w = (rel_right - rel_left).max(px(0.));
+                                    let h = (rel_bottom - rel_top).max(px(0.));
+                                    let mut fill = theme.accent;
+                                    fill.a = 0.16;
+                                    container.child(
+                                        div()
+                                            .absolute()
+                                            .left(rel_left)
+                                            .top(rel_top)
+                                            .w(w)
+                                            .h(h)
+                                            .border_1()
+                                            .border_color(theme.accent)
+                                            .bg(fill)
+                                            .rounded(px(2.)),
+                                    )
+                                },
+                            ),
                     )
                     .child(
                         // Scrollbar track & thumb
