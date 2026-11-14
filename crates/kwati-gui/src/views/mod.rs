@@ -1,3 +1,4 @@
+pub mod context_menu;
 pub mod dialogs;
 pub mod header_view;
 pub mod jobs_view;
@@ -9,10 +10,11 @@ pub mod search_view;
 pub mod settings_view;
 pub mod sidebar_view;
 
+pub use context_menu::{ContextMenuAction, ContextMenuEntry, ContextMenuEvent, ContextMenuView};
 pub use dialogs::{DialogKind, DialogsView};
 pub use header_view::HeaderView;
 pub use jobs_view::JobsView;
-pub use list_view::ListView;
+pub use list_view::{ListView, ListViewEvent};
 pub use network_view::NetworkView;
 pub use preview_view::PreviewView;
 pub use remote_dialogs::{RemoteDialogKind, RemoteDialogsView};
@@ -54,6 +56,7 @@ pub struct MainView {
     pub dialogs: Entity<DialogsView>,
     pub remote_dialogs: Entity<RemoteDialogsView>,
     pub settings: Entity<SettingsView>,
+    pub context_menu: Entity<ContextMenuView>,
     pub remote_sync: Entity<RemotePollerHost>,
 }
 
@@ -69,6 +72,7 @@ impl MainView {
         let dialogs = cx.new(|cx| DialogsView::new(app_state.clone(), cx));
         let remote_dialogs = cx.new(|cx| RemoteDialogsView::new(app_state.clone(), cx));
         let settings = cx.new(|cx| SettingsView::new(app_state.clone(), cx));
+        let context_menu = cx.new(|cx| ContextMenuView::new(app_state.clone(), cx));
         let remote_sync = cx.new(|cx| RemotePollerHost::new(app_state.clone(), cx));
 
         cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
@@ -136,6 +140,31 @@ impl MainView {
         })
         .detach();
 
+        cx.subscribe_in(&list, window, |this, _, event, window, cx| {
+            let ListViewEvent::OpenContextMenu { position } = *event;
+            if !this.any_blocking_modal_open(cx) {
+                this.context_menu
+                    .update(cx, |menu, cx| menu.open_at(position, window, cx));
+                cx.notify();
+            }
+        })
+        .detach();
+
+        cx.subscribe_in(&context_menu, window, |this, _, event, window, cx| {
+            match *event {
+                ContextMenuEvent::Closed => {
+                    if !this.any_modal_or_search_open(cx) {
+                        this.list.read(cx).focus_handle.focus(window);
+                    }
+                }
+                ContextMenuEvent::Execute(action) => {
+                    this.execute_context_menu_action(action, window, cx);
+                }
+            }
+            cx.notify();
+        })
+        .detach();
+
         Self {
             app_state,
             header,
@@ -148,17 +177,23 @@ impl MainView {
             dialogs,
             remote_dialogs,
             settings,
+            context_menu,
             remote_sync,
         }
     }
 }
 
 impl MainView {
-    fn any_modal_or_search_open(&self, cx: &App) -> bool {
+    fn any_blocking_modal_open(&self, cx: &App) -> bool {
         self.dialogs.read(cx).current_dialog != DialogKind::None
             || self.remote_dialogs.read(cx).is_open(cx)
             || self.settings.read(cx).is_open(cx)
+    }
+
+    fn any_modal_or_search_open(&self, cx: &App) -> bool {
+        self.any_blocking_modal_open(cx)
             || self.search.read(cx).is_active()
+            || self.context_menu.read(cx).is_open()
     }
 
     // File shortcuts act on the list's selection, so they are ignored while the keyboard is
@@ -237,6 +272,10 @@ impl MainView {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
+        self.copy_selection_to_clipboard(is_cut, cx);
+    }
+
+    fn copy_selection_to_clipboard(&mut self, is_cut: bool, cx: &mut Context<Self>) {
         let locations = self.selected_locations(cx);
         if locations.is_empty() {
             return;
@@ -255,6 +294,10 @@ impl MainView {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
+        self.paste_into_current(cx);
+    }
+
+    fn paste_into_current(&mut self, cx: &mut Context<Self>) {
         let Some(clipboard) = get_location_clipboard() else {
             self.set_status("Nothing to paste", cx);
             return;
@@ -289,6 +332,10 @@ impl MainView {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
+        self.ask_to_remove_selection(window, cx);
+    }
+
+    fn ask_to_remove_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let locations = self.selected_locations(cx);
         if locations.is_empty() {
             return;
@@ -302,6 +349,10 @@ impl MainView {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
+        self.open_rename_for_selection(window, cx);
+    }
+
+    fn open_rename_for_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Ok([location]) = <[Location; 1]>::try_from(self.selected_locations(cx)) else {
             return;
         };
@@ -317,10 +368,52 @@ impl MainView {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
+        self.open_new_folder_in_current(window, cx);
+    }
+
+    fn open_new_folder_in_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let parent = self.current_location(cx);
         self.open_dialog(window, cx, |dialogs, cx| {
             dialogs.open_new_folder(parent, cx)
         });
+    }
+
+    fn execute_context_menu_action(
+        &mut self,
+        action: ContextMenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            ContextMenuAction::Open => {
+                self.list.update(cx, |list, cx| list.open_selected(cx));
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::Rename => self.open_rename_for_selection(window, cx),
+            ContextMenuAction::Copy => {
+                self.copy_selection_to_clipboard(false, cx);
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::Cut => {
+                self.copy_selection_to_clipboard(true, cx);
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::Paste => {
+                self.paste_into_current(cx);
+                if !self.any_modal_or_search_open(cx) {
+                    self.list.read(cx).focus_handle.focus(window);
+                }
+            }
+            ContextMenuAction::Remove => self.ask_to_remove_selection(window, cx),
+            ContextMenuAction::NewFolder => self.open_new_folder_in_current(window, cx),
+            ContextMenuAction::Refresh => {
+                self.app_state.update(cx, |state, cx| {
+                    state.refresh_current();
+                    cx.notify();
+                });
+                self.list.read(cx).focus_handle.focus(window);
+            }
+        }
     }
 
     fn on_undo(&mut self, _: &operations::Undo, window: &mut Window, cx: &mut Context<Self>) {
@@ -519,6 +612,7 @@ impl Render for MainView {
             .child(self.dialogs.clone())
             .child(self.remote_dialogs.clone())
             .child(self.settings.clone())
+            .child(self.context_menu.clone())
     }
 }
 

@@ -34,6 +34,8 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-a", navigation::SelectAll, Some("ListView")),
         KeyBinding::new("cmd-a", navigation::SelectAll, Some("ListView")),
         KeyBinding::new("escape", navigation::ClearSelection, Some("ListView")),
+        KeyBinding::new("shift-f10", navigation::OpenContextMenu, Some("ListView")),
+        KeyBinding::new("menu", navigation::OpenContextMenu, Some("ListView")),
         KeyBinding::new("f5", navigation::Refresh, None),
         KeyBinding::new("alt-p", navigation::TogglePreview, None),
         // File operations

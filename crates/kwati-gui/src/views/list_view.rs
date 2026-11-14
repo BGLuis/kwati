@@ -6,15 +6,15 @@
 use std::collections::HashSet;
 
 use gpui::{
-    div, prelude::*, px, relative, transparent_black, uniform_list, Context, CursorStyle, Entity,
-    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, ScrollStrategy, UniformListScrollHandle, Window,
+    div, point, prelude::*, px, relative, transparent_black, uniform_list, Context, CursorStyle,
+    Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, UniformListScrollHandle, Window,
 };
 use kwati_core::{Entry, Location, SortColumn, SortDirection};
 
 use crate::actions::navigation::{
-    ClearSelection, GoBack, GoForward, GoUp, OpenSelected, PageDown, PageUp, Refresh, SelectAll,
-    SelectFirst, SelectLast, SelectNext, SelectPrevious, ToggleHidden,
+    ClearSelection, GoBack, GoForward, GoUp, OpenContextMenu, OpenSelected, PageDown, PageUp,
+    Refresh, SelectAll, SelectFirst, SelectLast, SelectNext, SelectPrevious, ToggleHidden,
 };
 use crate::components::{icon, Ellipsize, IconName, ScrollbarState};
 use crate::state::{entry_location, AppState};
@@ -99,6 +99,12 @@ impl RubberBand {
     }
 }
 
+/// Events emitted by [`ListView`] to [`super::MainView`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ListViewEvent {
+    OpenContextMenu { position: Point<Pixels> },
+}
+
 /// View rendering directory entries in a windowed list with a draggable scrollbar.
 pub struct ListView {
     pub app_state: Entity<AppState>,
@@ -108,6 +114,8 @@ pub struct ListView {
     pub row_height: Pixels,
     rubber_band: Option<RubberBand>,
 }
+
+impl EventEmitter<ListViewEvent> for ListView {}
 
 impl Focusable for ListView {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
@@ -214,6 +222,78 @@ impl ListView {
             }
         });
         cx.notify();
+    }
+
+    pub fn on_entry_right_click(
+        &mut self,
+        entry: Entry,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window);
+        cx.stop_propagation();
+
+        self.app_state.update(cx, |state, cx| {
+            let location = state.location_of(&entry);
+            if !state.selection.contains(&location) {
+                state.selection.select_only(location);
+                cx.notify();
+            }
+        });
+        cx.emit(ListViewEvent::OpenContextMenu {
+            position: event.position,
+        });
+    }
+
+    fn on_list_right_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window);
+        let entry_count = self.app_state.read(cx).entries.len();
+        if let Some(ix) = self.row_index_at(event.position, entry_count) {
+            if let Some(entry) = self.app_state.read(cx).entries.get(ix).cloned() {
+                self.on_entry_right_click(entry, event, window, cx);
+                return;
+            }
+        }
+        self.app_state.update(cx, |state, cx| {
+            if !state.selection.is_empty() {
+                state.clear_selection();
+                cx.notify();
+            }
+        });
+        cx.emit(ListViewEvent::OpenContextMenu {
+            position: event.position,
+        });
+    }
+
+    pub fn open_context_menu_from_keyboard(&mut self, cx: &mut Context<Self>) {
+        let (entry_count, selected_ix) = {
+            let state = self.app_state.read(cx);
+            (state.entries.len(), state.selected_index())
+        };
+        let row_h = self.effective_row_height(entry_count);
+        let (list_bounds, scroll_offset) = {
+            let scroll = self.scroll_handle.0.borrow();
+            (scroll.base_handle.bounds(), scroll.base_handle.offset())
+        };
+        let position = if list_bounds.size.width > px(0.) && list_bounds.size.height > px(0.) {
+            match selected_ix {
+                Some(ix) => point(
+                    list_bounds.left() + px(120.),
+                    (list_bounds.top() + row_h * ((ix + 1) as f32) + scroll_offset.y)
+                        .clamp(list_bounds.top(), list_bounds.bottom()),
+                ),
+                None => point(list_bounds.left() + px(16.), list_bounds.top() + px(16.)),
+            }
+        } else {
+            point(px(120.), px(120.))
+        };
+        cx.emit(ListViewEvent::OpenContextMenu { position });
     }
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
@@ -553,6 +633,9 @@ impl Render for ListView {
             .on_action(
                 cx.listener(|this, _: &ClearSelection, _window, cx| this.clear_selection(cx)),
             )
+            .on_action(cx.listener(|this, _: &OpenContextMenu, _window, cx| {
+                this.open_context_menu_from_keyboard(cx)
+            }))
             .on_action(cx.listener(|this, _: &SelectNext, _window, cx| this.select_next(cx)))
             .on_action(
                 cx.listener(|this, _: &SelectPrevious, _window, cx| this.select_previous(cx)),
@@ -710,6 +793,10 @@ impl Render for ListView {
                                 MouseButton::Left,
                                 cx.listener(Self::on_list_mouse_down),
                             )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(Self::on_list_right_click),
+                            )
                             .on_mouse_move(cx.listener(Self::on_list_mouse_move))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_list_mouse_up))
                             .on_mouse_up_out(
@@ -734,6 +821,7 @@ impl Render for ListView {
                                                 let size_str = format_size(entry.size, is_dir);
                                                 let date_str = format_modified(entry.modified);
                                                 let entry_for_click = entry.clone();
+                                                let entry_for_rclick = entry.clone();
 
                                                 items.push(
                                                     div()
@@ -767,6 +855,22 @@ impl Render for ListView {
                                                                     this.on_entry_click(
                                                                         ix,
                                                                         entry_for_click.clone(),
+                                                                        event,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            ),
+                                                        )
+                                                        .on_mouse_down(
+                                                            MouseButton::Right,
+                                                            cx.listener(
+                                                                move |this,
+                                                                      event: &MouseDownEvent,
+                                                                      window,
+                                                                      cx| {
+                                                                    this.on_entry_right_click(
+                                                                        entry_for_rclick.clone(),
                                                                         event,
                                                                         window,
                                                                         cx,

@@ -25,6 +25,7 @@ actions!(
         Refresh,
         ToggleHidden,
         TogglePreview,
+        OpenContextMenu,
     ]
 );
 
