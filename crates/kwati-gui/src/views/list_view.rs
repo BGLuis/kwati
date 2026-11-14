@@ -208,7 +208,11 @@ impl ListView {
                 state.set_status(REMOTE_FILE_NOTICE);
             });
         } else {
-            cx.open_with_system(entry.path());
+            if let Err(err) = crate::actions::open_with_system(entry.path()) {
+                self.app_state.update(cx, |state, _cx| {
+                    state.set_status(format!("Cannot open {}: {err}", entry.path().display()));
+                });
+            }
         }
     }
 

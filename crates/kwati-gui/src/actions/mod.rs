@@ -53,3 +53,15 @@ pub fn register_keybindings(cx: &mut App) {
     ]);
     crate::views::search_view::register_search_keybindings(cx);
 }
+
+/// Spawns an external application detached from Kwati's stdio and reaps it on exit.
+pub(crate) fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<()> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}

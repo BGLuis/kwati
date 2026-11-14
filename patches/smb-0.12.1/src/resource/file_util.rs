@@ -1,3 +1,4 @@
+#[cfg(feature = "std-fs-impls")]
 use crate::sync_helpers::*;
 use maybe_async::*;
 

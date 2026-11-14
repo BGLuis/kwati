@@ -33,20 +33,21 @@ actions!(
 pub fn open_with_system(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(path).spawn()?;
-        Ok(())
+        let mut cmd = std::process::Command::new("open");
+        cmd.arg(path);
+        crate::actions::spawn_detached(&mut cmd)
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &path.to_string_lossy()])
-            .spawn()?;
-        Ok(())
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", "", &path.to_string_lossy()]);
+        crate::actions::spawn_detached(&mut cmd)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        std::process::Command::new("xdg-open").arg(path).spawn()?;
-        Ok(())
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(path);
+        crate::actions::spawn_detached(&mut cmd)
     }
 }
 

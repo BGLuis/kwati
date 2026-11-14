@@ -272,8 +272,7 @@ pub fn launch_application(app: &AppInfo, path: &Path) -> std::io::Result<()> {
         cmd.arg(path);
     }
 
-    cmd.spawn()?;
-    Ok(())
+    crate::actions::spawn_detached(&mut cmd)
 }
 
 /// Launches a file with a custom command line or executable path.
@@ -309,6 +308,5 @@ pub fn launch_custom_command(command_line: &str, path: &Path) -> std::io::Result
         cmd.arg(path);
     }
 
-    cmd.spawn()?;
-    Ok(())
+    crate::actions::spawn_detached(&mut cmd)
 }

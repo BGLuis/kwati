@@ -11,3 +11,7 @@ xattr = { path = "patches/xattr-0.2.3" }
 # the 5.0.0 release russh needs. The only change is sspi =0.23.1, whose dependencies accept 5.0.0.
 # Drop this patch once an smb release moves past sspi 0.21.
 smb = { path = "patches/smb-0.12.1" }
+# proc-macro-error2 2.0.1 (pulled in by gpui -> stacksafe 0.1.4) re-exports a private
+# `extern crate proc_macro`, triggering a future-incompatibility warning (E0365).
+# Drop this patch once proc-macro-error2 releases a fix or gpui updates stacksafe.
+proc-macro-error2 = { path = "patches/proc-macro-error2-2.0.1" }
