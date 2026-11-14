@@ -18,6 +18,8 @@ actions!(
         SelectPrevious,
         SelectFirst,
         SelectLast,
+        SelectAll,
+        ClearSelection,
         PageUp,
         PageDown,
         Refresh,

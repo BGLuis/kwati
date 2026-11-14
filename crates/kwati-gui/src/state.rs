@@ -1160,6 +1160,15 @@ impl AppState {
         self.selection.len()
     }
 
+    /// Total byte size of selected files (directories contribute 0 bytes).
+    pub fn selected_total_size(&self) -> u64 {
+        self.selected_entries()
+            .into_iter()
+            .filter(|entry| !entry.is_dir())
+            .filter_map(|entry| entry.size)
+            .sum()
+    }
+
     /// Selects only `location`.
     pub fn select_location(&mut self, location: Location) {
         self.selection.select_only(location);
@@ -1168,6 +1177,84 @@ impl AppState {
     /// Toggles selection of `location`.
     pub fn toggle_select_location(&mut self, location: Location) {
         self.selection.toggle(location);
+    }
+
+    /// Selects every listed entry using `location_of` so both local and remote entries work.
+    pub fn select_all_entries(&mut self) {
+        let first = self.entries.first().map(|e| self.location_of(e));
+        for entry in self.entries.iter() {
+            self.selection.select(self.location_of(entry));
+        }
+        if self.selection.anchor().is_none() {
+            if let Some(first) = first {
+                self.selection.set_anchor(Some(first));
+            }
+        }
+    }
+
+    /// Clears the selection and anchor.
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+    }
+
+    /// Selects the range between the current anchor and `target_index`, preserving the anchor.
+    /// When `keep_existing` is false, replaces the prior selection with that range.
+    pub fn select_range_to(&mut self, target_index: usize, keep_existing: bool) {
+        let Some(target_entry) = self.entries.get(target_index) else {
+            return;
+        };
+        let target_loc = self.location_of(target_entry);
+        let anchor_idx = self.selection.anchor().and_then(|anchor| {
+            self.entries
+                .iter()
+                .position(|e| &self.location_of(e) == anchor)
+        });
+        let (start, end, preserved_anchor) = match anchor_idx {
+            Some(a_idx) => {
+                let anchor_loc = self.location_of(&self.entries[a_idx]);
+                if a_idx <= target_index {
+                    (a_idx, target_index, anchor_loc)
+                } else {
+                    (target_index, a_idx, anchor_loc)
+                }
+            }
+            None => (target_index, target_index, target_loc),
+        };
+
+        if !keep_existing {
+            self.selection.clear();
+        }
+        for entry in &self.entries[start..=end] {
+            self.selection.select(self.location_of(entry));
+        }
+        self.selection.set_anchor(Some(preserved_anchor));
+    }
+
+    /// Replaces (or merges into `base_locations`) the selection with the listed entries at `indices`.
+    pub fn select_indices(
+        &mut self,
+        indices: impl IntoIterator<Item = usize>,
+        base_locations: Option<&std::collections::HashSet<Location>>,
+    ) {
+        self.selection.clear();
+        if let Some(base) = base_locations {
+            for loc in base {
+                self.selection.select(loc.clone());
+            }
+        }
+        let mut first_touched = None;
+        for ix in indices {
+            if let Some(entry) = self.entries.get(ix) {
+                let loc = self.location_of(entry);
+                if first_touched.is_none() {
+                    first_touched = Some(loc.clone());
+                }
+                self.selection.select(loc);
+            }
+        }
+        if let Some(first) = first_touched {
+            self.selection.set_anchor(Some(first));
+        }
     }
 
     /// Returns whether `entry` (under `current_location`) is selected.

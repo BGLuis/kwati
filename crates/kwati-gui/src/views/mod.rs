@@ -38,6 +38,7 @@ use crate::layout::PanelLayout;
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{size, space, Fonts, TextRole};
+use crate::views::list_view::format_size;
 use crate::views::search_view::ToggleSearch;
 
 /// The root shell view of kwati-gui.
@@ -397,6 +398,7 @@ impl Render for MainView {
         let panels = state.panels.resolve(window.viewport_size().width);
         let entry_count = state.entries.len();
         let selected_count = state.selection.len();
+        let selected_bytes = state.selected_total_size();
         let status_msg = state.status_message.clone();
 
         div()
@@ -501,11 +503,7 @@ impl Render for MainView {
                             .flex()
                             .gap_4()
                             .child(format!("{} items", entry_count))
-                            .child(if selected_count > 0 {
-                                format!("{} selected", selected_count)
-                            } else {
-                                "".to_string()
-                            }),
+                            .child(format_selection_summary(selected_count, selected_bytes)),
                     )
                     .child(
                         div()
@@ -521,6 +519,18 @@ impl Render for MainView {
             .child(self.dialogs.clone())
             .child(self.remote_dialogs.clone())
             .child(self.settings.clone())
+    }
+}
+
+/// Formats the selection count and total byte size shown in the status bar.
+pub fn format_selection_summary(count: usize, total_bytes: u64) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!(
+            "{count} selected ({})",
+            format_size(Some(total_bytes), false)
+        )
     }
 }
 
