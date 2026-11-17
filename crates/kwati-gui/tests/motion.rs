@@ -2,12 +2,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use gpui::{point, px, size, AppContext as _, TestAppContext};
+use gpui::{
+    point, px, size, AppContext as _, Modifiers, Pixels, Point, TestAppContext, VisualTestContext,
+};
 use kwati_core::{Location, MotionPreference, Settings};
 use kwati_gui::actions::register_keybindings;
 use kwati_gui::components::{register_text_input_keybindings, TextInput};
 use kwati_gui::motion::{
-    is_reduced_motion, shake_decay, JOB_COMPLETE_HOLD, MOUNT_INDETERMINATE_DELAY, QUICK,
+    is_reduced_motion, shake_decay, INSTANT, JOB_COMPLETE_HOLD, MOUNT_INDETERMINATE_DELAY, QUICK,
+    SETTLE,
 };
 use kwati_gui::state::{
     AppState, EntryChangeOrigin, JobKind, JobStatus, NavigationDirection, NetworkMountStatus,
@@ -219,4 +222,183 @@ fn main_window_and_context_menu_render_under_full_and_reduced_motion(cx: &mut Te
         });
     });
     cx.run_until_parked();
+}
+
+fn list_row_center(
+    main: &gpui::Entity<MainView>,
+    cx: &mut VisualTestContext,
+    ix: usize,
+) -> Point<Pixels> {
+    main.read_with(cx, |main, cx| {
+        let list = main.list.read(cx);
+        let entry_count = main.app_state.read(cx).entries.len().max(1);
+        let state = list.scroll_handle.0.borrow();
+        let bounds = state.base_handle.bounds();
+        let offset = state.base_handle.offset();
+        let row_h = state
+            .last_item_size
+            .map(|s| s.contents.height / (entry_count as f32))
+            .filter(|h| *h > px(0.))
+            .unwrap_or(list.row_height);
+        assert!(
+            bounds.size.width > px(0.) && bounds.size.height > px(0.),
+            "list bounds must be laid out"
+        );
+        point(
+            bounds.left() + px(40.),
+            bounds.top() + row_h * (ix as f32 + 0.5) + offset.y,
+        )
+    })
+}
+
+fn pump_next_animation_frame(
+    list: &gpui::Entity<kwati_gui::views::ListView>,
+    cx: &mut VisualTestContext,
+) {
+    list.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn list_view_row_hover_and_selection_schedule_frames_and_settle_to_idle(cx: &mut TestAppContext) {
+    let dir = temp_dir("list_uniform_motion");
+    let alpha = dir.join("alpha.txt");
+    let bravo = dir.join("bravo.txt");
+    fs::write(&alpha, "alpha").unwrap();
+    fs::write(&bravo, "bravo").unwrap();
+    let loc_alpha = Location::Local(alpha);
+    let loc_bravo = Location::Local(bravo);
+
+    cx.update(|cx| {
+        register_keybindings(cx);
+        register_text_input_keybindings(cx);
+    });
+    let dir_clone = dir.clone();
+    let (main, cx) = cx.add_window_view(|window, cx| {
+        let state = cx.new(|cx| {
+            let mut s = AppState::new(Location::Local(dir_clone));
+            s.attach(cx);
+            s.reload_entries();
+            s
+        });
+        MainView::new(state, window, cx)
+    });
+    cx.simulate_resize(size(px(1024.), px(700.)));
+    cx.run_until_parked();
+
+    let list = main.read_with(cx, |m, _| m.list.clone());
+    let list_id = list.entity_id();
+
+    // Let initial listing insert animations settle before testing idle/hover/selection transitions.
+    std::thread::sleep(SETTLE + Duration::from_millis(20));
+    pump_next_animation_frame(&list, cx);
+
+    // Idle frame must not request animation frames once settled.
+    let idle_before = list.read_with(cx, |l, _| l.animation_frame_requests());
+    pump_next_animation_frame(&list, cx);
+    let idle_after = list.read_with(cx, |l, _| l.animation_frame_requests());
+    assert_eq!(
+        idle_after, idle_before,
+        "idle ListView must not call request_animation_frame"
+    );
+
+    // Hovering a settled row inside uniform_list must immediately request the next frame
+    // targeting ListView itself, and advance Hover across frames without more input events.
+    let row0_pos = list_row_center(&main, cx, 0);
+    cx.simulate_mouse_move(row0_pos, None, Modifiers::none());
+    cx.run_until_parked();
+
+    let after_hover_reqs = list.read_with(cx, |l, _| l.animation_frame_requests());
+    assert!(
+        after_hover_reqs > idle_after,
+        "hovering a settled row inside uniform_list must call request_animation_frame"
+    );
+    assert_eq!(
+        list.read_with(cx, |l, _| l.last_frame_requested_view()),
+        Some(list_id),
+        "uniform_list prepaint request_animation_frame must target ListView"
+    );
+
+    std::thread::sleep(Duration::from_millis(45));
+    pump_next_animation_frame(&list, cx);
+    let mid_hover = list.read_with(cx, |l, _| {
+        l.row_hover_value(&loc_alpha, Instant::now(), false)
+    });
+    assert!(
+        mid_hover > 0.05 && mid_hover < 0.99,
+        "expected mid-flight hover progress in (0.05, 0.99), got {mid_hover}"
+    );
+    assert!(
+        list.read_with(cx, |l, _| l.animation_frame_requests()) > after_hover_reqs,
+        "mid-flight hover frame must keep requesting animation frames"
+    );
+
+    // Wait past INSTANT (160 ms) and pump the final settling frame, then confirm idle stops requesting.
+    std::thread::sleep(INSTANT + Duration::from_millis(20));
+    pump_next_animation_frame(&list, cx);
+    let settled_hover = list.read_with(cx, |l, _| {
+        l.row_hover_value(&loc_alpha, Instant::now(), false)
+    });
+    assert!(
+        (settled_hover - 1.0).abs() < 1e-3,
+        "hover should settle at 1.0, got {settled_hover}"
+    );
+    let settled_reqs = list.read_with(cx, |l, _| l.animation_frame_requests());
+    pump_next_animation_frame(&list, cx);
+    assert_eq!(
+        list.read_with(cx, |l, _| l.animation_frame_requests()),
+        settled_reqs,
+        "settled hover must stop calling request_animation_frame on idle frames"
+    );
+
+    // Changing selection from alpha.txt to bravo.txt must animate SelectBg on bravo.txt
+    // across frames and stop requesting once settled.
+    list.update(cx, |l, cx| l.select_next(cx));
+    cx.run_until_parked();
+    std::thread::sleep(INSTANT + Duration::from_millis(20));
+    pump_next_animation_frame(&list, cx);
+
+    let before_select_change = list.read_with(cx, |l, _| l.animation_frame_requests());
+    list.update(cx, |l, cx| l.select_next(cx));
+    cx.run_until_parked();
+
+    let after_select_change = list.read_with(cx, |l, _| l.animation_frame_requests());
+    assert!(
+        after_select_change > before_select_change,
+        "changing selection in ListView must call request_animation_frame"
+    );
+
+    std::thread::sleep(Duration::from_millis(45));
+    pump_next_animation_frame(&list, cx);
+    let mid_select_bravo = list.read_with(cx, |l, _| {
+        l.row_select_value(&loc_bravo, Instant::now(), false)
+    });
+    let mid_select_alpha = list.read_with(cx, |l, _| {
+        l.row_select_value(&loc_alpha, Instant::now(), false)
+    });
+    assert!(
+        mid_select_bravo > 0.05 && mid_select_bravo < 0.99,
+        "bravo SelectBg should animate across frames, got {mid_select_bravo}"
+    );
+    assert!(
+        mid_select_alpha > 0.01 && mid_select_alpha < 0.95,
+        "alpha SelectBg should fade out across frames, got {mid_select_alpha}"
+    );
+
+    std::thread::sleep(INSTANT + Duration::from_millis(20));
+    pump_next_animation_frame(&list, cx);
+    let settled_select = list.read_with(cx, |l, _| {
+        l.row_select_value(&loc_bravo, Instant::now(), false)
+    });
+    assert!(
+        (settled_select - 1.0).abs() < 1e-3,
+        "bravo SelectBg should settle at 1.0, got {settled_select}"
+    );
+    let select_settled_reqs = list.read_with(cx, |l, _| l.animation_frame_requests());
+    pump_next_animation_frame(&list, cx);
+    assert_eq!(
+        list.read_with(cx, |l, _| l.animation_frame_requests()),
+        select_settled_reqs,
+        "settled selection transition must stop calling request_animation_frame on idle frames"
+    );
 }

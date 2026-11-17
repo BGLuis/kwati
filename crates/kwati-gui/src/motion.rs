@@ -488,11 +488,14 @@ impl<K: Eq + Hash + Clone> MotionTracker<K> {
     }
 }
 
-/// Schedules another frame redraw only when `active` is `true`.
+/// Schedules another frame redraw only when `active` is `true`, returning whether a frame was requested.
 #[inline]
-pub fn request_frame_if_active(active: bool, window: &mut Window) {
+pub fn request_frame_if_active(active: bool, window: &mut Window) -> bool {
     if active {
         window.request_animation_frame();
+        true
+    } else {
+        false
     }
 }
 
