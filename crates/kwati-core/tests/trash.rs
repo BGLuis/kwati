@@ -6,6 +6,21 @@ use kwati_core::{
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+fn normalize_test_dir(raw: PathBuf) -> PathBuf {
+    let canon = raw.canonicalize().unwrap_or(raw);
+    #[cfg(windows)]
+    {
+        let s = canon.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    canon
+}
+
 struct TestDir {
     path: PathBuf,
 }
@@ -15,8 +30,9 @@ impl TestDir {
         let raw = std::env::temp_dir().join(format!("kwati_test_{}_{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&raw);
         std::fs::create_dir_all(&raw).expect("failed to create test dir");
-        // trash::delete canonicalizes parent directories, so canonicalize here for exact matching.
-        let path = raw.canonicalize().unwrap_or(raw);
+        // trash::delete canonicalizes parent directories (and strips \\?\ on Windows), so match
+        // the exact form stored in the system trash.
+        let path = normalize_test_dir(raw);
         Self { path }
     }
 }

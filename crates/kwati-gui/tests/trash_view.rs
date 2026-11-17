@@ -16,6 +16,21 @@ use kwati_gui::state::{AppState, TrashSortColumn};
 use kwati_gui::views::dialogs::confirm_empty_trash_message;
 use kwati_gui::views::{DialogKind, MainView};
 
+fn normalize_test_dir(raw: PathBuf) -> PathBuf {
+    let canon = raw.canonicalize().unwrap_or(raw);
+    #[cfg(windows)]
+    {
+        let s = canon.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    canon
+}
+
 struct TrashFixture {
     root: PathBuf,
 }
@@ -26,7 +41,7 @@ impl TrashFixture {
             std::env::temp_dir().join(format!("kwati_gui_trash_{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&raw);
         fs::create_dir_all(&raw).unwrap();
-        let root = raw.canonicalize().unwrap_or(raw);
+        let root = normalize_test_dir(raw);
         Self { root }
     }
 }
