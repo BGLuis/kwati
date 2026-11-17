@@ -41,12 +41,22 @@ pub enum MotionPreference {
     Reduced,
 }
 
+/// Listing layout mode for directory entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    #[default]
+    Details,
+    CompactList,
+    Grid,
+}
+
 /// User settings. Features add their own options here, each with a default.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub version: u32,
     pub show_hidden: bool,
     pub default_sort: SortOrder,
+    pub view_mode: ViewMode,
     pub refresh_interval_secs: u32,
     /// Seconds a directory listing may take before it is abandoned (see `list_dir_bounded`).
     pub list_timeout_secs: u32,
@@ -68,6 +78,7 @@ impl Default for Settings {
             version: CURRENT_VERSION,
             show_hidden: DEFAULT_SHOW_HIDDEN,
             default_sort: SortOrder::default(),
+            view_mode: ViewMode::default(),
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
             list_timeout_secs: DEFAULT_LIST_TIMEOUT_SECS,
             remote_poll_enabled: false,
@@ -206,6 +217,52 @@ fn motion_preference_str(pref: MotionPreference) -> &'static str {
         MotionPreference::System => "system",
         MotionPreference::Full => "full",
         MotionPreference::Reduced => "reduced",
+    }
+}
+
+fn parse_view_mode(raw: &str) -> Option<ViewMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "details" | "list" => Some(ViewMode::Details),
+        "compact_list" | "compact-list" | "compact" => Some(ViewMode::CompactList),
+        "grid" => Some(ViewMode::Grid),
+        _ => None,
+    }
+}
+
+fn view_mode_str(mode: ViewMode) -> &'static str {
+    match mode {
+        ViewMode::Details => "details",
+        ViewMode::CompactList => "compact_list",
+        ViewMode::Grid => "grid",
+    }
+}
+
+fn take_view_mode_or_default(
+    table: &mut Table,
+    default: ViewMode,
+    warnings: &mut Vec<SettingsWarning>,
+) -> ViewMode {
+    let Some(value) = table.remove("view_mode") else {
+        return default;
+    };
+    match value {
+        Value::String(raw) => match parse_view_mode(&raw) {
+            Some(mode) => mode,
+            None => {
+                warnings.push(SettingsWarning {
+                    key: "view_mode",
+                    message: format!("unknown view_mode '{raw}'"),
+                });
+                default
+            }
+        },
+        _ => {
+            warnings.push(SettingsWarning {
+                key: "view_mode",
+                message: "view_mode must be a string".into(),
+            });
+            default
+        }
     }
 }
 
@@ -429,6 +486,7 @@ impl Settings {
         );
         let default_sort =
             take_default_sort_or_default(&mut table, defaults.default_sort, &mut warnings);
+        let view_mode = take_view_mode_or_default(&mut table, defaults.view_mode, &mut warnings);
         let refresh_interval_secs = take_bounded_u32_or_default(
             &mut table,
             "refresh_interval_secs",
@@ -528,6 +586,7 @@ impl Settings {
             version,
             show_hidden,
             default_sort,
+            view_mode,
             refresh_interval_secs,
             list_timeout_secs,
             remote_poll_enabled,
@@ -618,6 +677,10 @@ impl Settings {
             Value::String(sort_direction_str(self.default_sort.direction).into()),
         );
         table.insert("default_sort".into(), Value::Table(sort_table));
+        table.insert(
+            "view_mode".into(),
+            Value::String(view_mode_str(self.view_mode).into()),
+        );
         table.insert(
             "refresh_interval_secs".into(),
             Value::Integer(self.refresh_interval_secs.into()),
@@ -953,5 +1016,47 @@ mod tests {
         assert_eq!(fallback.motion_preference, MotionPreference::System);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].key, "motion_preference");
+    }
+
+    #[test]
+    fn settings_view_mode_roundtrip_and_invalid_warning() {
+        let dir = TestDir::new("settings_view_mode");
+        let path = dir.path.join("settings.toml");
+
+        let mut s = Settings::default();
+        assert_eq!(s.view_mode, ViewMode::Details);
+
+        for mode in [ViewMode::Details, ViewMode::CompactList, ViewMode::Grid] {
+            s.view_mode = mode;
+            s.save_to(&path).unwrap();
+            let (loaded, warnings) = Settings::load_from(&path).unwrap();
+            assert!(warnings.is_empty());
+            assert_eq!(loaded.view_mode, mode);
+        }
+
+        // Backward compatibility: missing view_mode yields Details with no warning.
+        fs::write(&path, "version = 1\n").unwrap();
+        let (compat, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(compat.view_mode, ViewMode::Details);
+
+        // Aliases and case-insensitivity.
+        fs::write(&path, "view_mode = \"compact\"\n").unwrap();
+        let (alias, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(alias.view_mode, ViewMode::CompactList);
+
+        // Invalid string and non-string values warn and fall back to Details.
+        fs::write(&path, "view_mode = \"carousel\"\n").unwrap();
+        let (fallback, warnings) = Settings::load_from(&path).unwrap();
+        assert_eq!(fallback.view_mode, ViewMode::Details);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].key, "view_mode");
+
+        fs::write(&path, "view_mode = 42\n").unwrap();
+        let (fallback, warnings) = Settings::load_from(&path).unwrap();
+        assert_eq!(fallback.view_mode, ViewMode::Details);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].key, "view_mode");
     }
 }
