@@ -1,5 +1,10 @@
-use kwati_core::{is_trash_unavailable, trash, trash_with, VolumeKind};
-use std::path::PathBuf;
+use kwati_core::{
+    is_restore_conflict, is_trash_browsing_supported, is_trash_unavailable, list_trash,
+    purge_trash_items, restore_conflict, restore_trash_items, trash, trash_with, Confirmed,
+    TrashItem, VolumeKind,
+};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 struct TestDir {
     path: PathBuf,
@@ -7,17 +12,46 @@ struct TestDir {
 
 impl TestDir {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("kwati_test_{}_{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("failed to create test dir");
+        let raw = std::env::temp_dir().join(format!("kwati_test_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&raw);
+        std::fs::create_dir_all(&raw).expect("failed to create test dir");
+        // trash::delete canonicalizes parent directories, so canonicalize here for exact matching.
+        let path = raw.canonicalize().unwrap_or(raw);
         Self { path }
     }
 }
 
 impl Drop for TestDir {
     fn drop(&mut self) {
+        if is_trash_browsing_supported() {
+            if let Ok(items) = list_trash() {
+                let leftovers: Vec<TrashItem> = items
+                    .into_iter()
+                    .filter(|item| item.original_parent == self.path)
+                    .collect();
+                if !leftovers.is_empty() {
+                    let _ = purge_trash_items(&leftovers, Confirmed::user_confirmed());
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+fn find_trashed(path: &Path) -> Option<TrashItem> {
+    list_trash()
+        .expect("list_trash should succeed")
+        .into_iter()
+        .find(|item| item.original_path() == path)
 }
 
 #[test]
@@ -39,7 +73,7 @@ fn trash_missing_path() {
 
     let err = trash(&missing).unwrap_err();
 
-    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(err.kind(), ErrorKind::NotFound);
     assert!(
         err.to_string().contains(&missing.display().to_string()),
         "error should name the path, got: {err}"
@@ -68,4 +102,138 @@ fn trash_refuses_unknown() {
 
     assert!(is_trash_unavailable(&err), "got: {err}");
     assert!(file.exists());
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[test]
+fn trash_restore() {
+    let dir = TestDir::new("trash_restore");
+    let file = dir.path.join("restore_me.txt");
+    std::fs::write(&file, b"preserved payload").unwrap();
+
+    trash(&file).unwrap();
+    assert!(!file.exists());
+
+    let item = find_trashed(&file).expect("trashed item should appear in list_trash");
+    assert_eq!(item.name, "restore_me.txt");
+    assert_eq!(item.original_parent, dir.path);
+    assert!(item.deleted_at().is_some());
+
+    restore_trash_items(std::slice::from_ref(&item)).unwrap();
+
+    assert_eq!(std::fs::read(&file).unwrap(), b"preserved payload");
+    assert!(
+        !list_trash()
+            .unwrap()
+            .into_iter()
+            .any(|listed| listed.id == item.id),
+        "restored item should leave the trash"
+    );
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[test]
+fn trash_restore_conflict() {
+    let dir = TestDir::new("trash_restore_conflict");
+    let file = dir.path.join("conflict.txt");
+    std::fs::write(&file, b"trashed version").unwrap();
+
+    trash(&file).unwrap();
+    let item = find_trashed(&file).expect("trashed item should appear in list_trash");
+
+    std::fs::write(&file, b"existing version").unwrap();
+
+    let err = restore_trash_items(std::slice::from_ref(&item)).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    assert!(is_restore_conflict(&err), "got: {err}");
+    let conflict = restore_conflict(&err).expect("RestoreConflict should be attached");
+    assert_eq!(conflict.item_name, "conflict.txt");
+    assert_eq!(conflict.destination, file);
+
+    // Existing file and trashed item must both stay untouched.
+    assert_eq!(std::fs::read(&file).unwrap(), b"existing version");
+    assert!(
+        list_trash()
+            .unwrap()
+            .into_iter()
+            .any(|listed| listed.id == item.id),
+        "conflicting item should stay in the trash"
+    );
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[test]
+fn trash_purge() {
+    let dir = TestDir::new("trash_purge");
+    let doomed = dir.path.join("purge_me.txt");
+    let spared = dir.path.join("keep_me.txt");
+    std::fs::write(&doomed, b"bye").unwrap();
+    std::fs::write(&spared, b"stay").unwrap();
+
+    trash(&doomed).unwrap();
+    trash(&spared).unwrap();
+
+    let doomed_item = find_trashed(&doomed).expect("doomed item should be in trash");
+    let spared_item = find_trashed(&spared).expect("spared item should be in trash");
+
+    purge_trash_items(
+        std::slice::from_ref(&doomed_item),
+        Confirmed::user_confirmed(),
+    )
+    .unwrap();
+
+    let remaining = list_trash().unwrap();
+    assert!(!remaining.iter().any(|item| item.id == doomed_item.id));
+    assert!(remaining.iter().any(|item| item.id == spared_item.id));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn trash_list_macos() {
+    assert!(!is_trash_browsing_supported());
+    let err = list_trash().unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+
+    let dummy = TrashItem {
+        id: "dummy".into(),
+        name: "dummy.txt".into(),
+        original_parent: PathBuf::from("/tmp"),
+        time_deleted: 0,
+    };
+    assert_eq!(
+        restore_trash_items(std::slice::from_ref(&dummy))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    assert_eq!(
+        purge_trash_items(&[dummy], Confirmed::user_confirmed())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Unsupported
+    );
 }
