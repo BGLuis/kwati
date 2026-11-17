@@ -99,27 +99,35 @@ pub fn animated_toggle_switch(
         )
 }
 
+/// Resolves the checkmark icon motion for a checkbox at normalized progress `check_t`.
+#[inline]
+pub fn checkbox_check_motion(check_t: f32, reduced: bool) -> Option<IconMotion> {
+    let t = check_t.clamp(0.0, 1.0);
+    if t > 0.02 {
+        Some(if reduced {
+            IconMotion::Rest
+        } else {
+            IconMotion::Draw(t)
+        })
+    } else {
+        None
+    }
+}
+
 /// Renders an animated `16 px` checkbox row with smooth fill and checkmark stroke draw-in.
 pub fn animated_checkbox_row(
     id: impl Into<gpui::ElementId>,
     check_t: f32,
     label: &str,
     theme: &Theme,
+    reduced: bool,
 ) -> Stateful<Div> {
     let t = check_t.clamp(0.0, 1.0);
     let border_col = color_lerp(theme.border_strong, theme.accent, t);
     let box_bg = color_lerp(theme.surface_raised, theme.accent, t);
 
-    let check_child: Option<AnyElement> = if t > 0.02 {
-        Some(animated_icon_sized(
-            IconName::Check,
-            IconMotion::Draw(t),
-            size::ICON,
-            theme.on_accent,
-        ))
-    } else {
-        None
-    };
+    let check_child: Option<AnyElement> = checkbox_check_motion(t, reduced)
+        .map(|motion| animated_icon_sized(IconName::Check, motion, size::ICON, theme.on_accent));
 
     div()
         .id(id)

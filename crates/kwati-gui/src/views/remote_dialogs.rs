@@ -482,6 +482,32 @@ impl RemoteDialogsView {
         self.remember_password = !self.remember_password;
     }
 
+    /// Returns `(progress, is_active)` for the "Save password" checkbox transition.
+    pub fn remember_checkbox_motion(&self, now: Instant, reduced: bool) -> (f32, bool) {
+        let default = if self.remember_password { 1.0 } else { 0.0 };
+        (
+            self.motion
+                .scalar_or(&RemoteMotionKey::RememberCheckbox, default, now, reduced),
+            self.motion
+                .is_scalar_active(&RemoteMotionKey::RememberCheckbox, now, reduced),
+        )
+    }
+
+    /// Returns `(progress, is_active)` for the "Allow insecure FTP" checkbox transition.
+    pub fn insecure_ftp_checkbox_motion(&self, now: Instant, reduced: bool) -> (f32, bool) {
+        let default = if self.profile_form.as_ref().is_some_and(|f| f.allow_insecure) {
+            1.0
+        } else {
+            0.0
+        };
+        (
+            self.motion
+                .scalar_or(&RemoteMotionKey::InsecureFtpCheckbox, default, now, reduced),
+            self.motion
+                .is_scalar_active(&RemoteMotionKey::InsecureFtpCheckbox, now, reduced),
+        )
+    }
+
     /// Submits the active password prompt to [`AppState::submit_password`].
     pub fn submit_active_password(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(RemotePrompt::Password { profile_id, .. }) =
@@ -935,7 +961,7 @@ impl Render for RemoteDialogsView {
             if self.remember_password { 1.0 } else { 0.0 },
             QUICK,
             Curve::Spring,
-            MotionKind::MovementOrScale,
+            MotionKind::OpacityOrColor,
             now,
             reduced,
         );
@@ -946,7 +972,7 @@ impl Render for RemoteDialogsView {
             if insecure_checked { 1.0 } else { 0.0 },
             QUICK,
             Curve::Spring,
-            MotionKind::MovementOrScale,
+            MotionKind::OpacityOrColor,
             now,
             reduced,
         );
@@ -1117,6 +1143,7 @@ impl RemoteDialogsView {
                     check_t,
                     "Save password",
                     theme,
+                    reduced,
                 )
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1754,6 +1781,7 @@ impl RemoteDialogsView {
                         check_t,
                         "Allow unencrypted plain FTP fallback when TLS is unavailable",
                         theme,
+                        reduced,
                     )
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1914,7 +1942,7 @@ fn checkbox_row(
     label: &str,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    animated_checkbox_row(id, if checked { 1.0 } else { 0.0 }, label, theme)
+    animated_checkbox_row(id, if checked { 1.0 } else { 0.0 }, label, theme, false)
 }
 
 fn action_button(label: &str, tone: ButtonTone, theme: &Theme) -> gpui::Div {

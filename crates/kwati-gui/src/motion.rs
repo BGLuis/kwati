@@ -444,6 +444,13 @@ impl<K: Eq + Hash + Clone> MotionTracker<K> {
             .map_or(default, |t| t.value_at(now, reduced))
     }
 
+    /// Returns `true` if the scalar for `key` is currently animating at `now`.
+    pub fn is_scalar_active(&self, key: &K, now: Instant, reduced: bool) -> bool {
+        self.scalars
+            .get(key)
+            .is_some_and(|t| t.is_active_at(now, reduced))
+    }
+
     /// Forces a scalar to an explicit value without animating.
     pub fn set_immediate(&mut self, key: K, value: f32, kind: MotionKind) {
         self.scalars

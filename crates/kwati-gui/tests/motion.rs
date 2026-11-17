@@ -7,18 +7,20 @@ use gpui::{
 };
 use kwati_core::{Location, MotionPreference, Settings};
 use kwati_gui::actions::register_keybindings;
-use kwati_gui::components::{register_text_input_keybindings, TextInput};
+use kwati_gui::components::interactive::checkbox_check_motion;
+use kwati_gui::components::{register_text_input_keybindings, IconMotion, TextInput};
 use kwati_gui::motion::{
     is_reduced_motion, shake_decay, INSTANT, JOB_COMPLETE_HOLD, MOUNT_INDETERMINATE_DELAY, QUICK,
     SETTLE,
 };
 use kwati_gui::state::{
     AppState, EntryChangeOrigin, JobKind, JobStatus, NavigationDirection, NetworkMountStatus,
+    RemotePrompt,
 };
 use kwati_gui::views::jobs_view::JobsView;
 use kwati_gui::views::network_view::NetworkView;
 use kwati_gui::views::settings_view::{SettingKey, SettingsView};
-use kwati_gui::views::MainView;
+use kwati_gui::views::{MainView, RemoteDialogsView};
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("kwati_motion_{name}_{}", std::process::id()));
@@ -259,6 +261,11 @@ fn pump_next_animation_frame(
     cx.run_until_parked();
 }
 
+fn pump_next_dialogs_frame(view: &gpui::Entity<RemoteDialogsView>, cx: &mut VisualTestContext) {
+    view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+}
+
 #[gpui::test]
 fn list_view_row_hover_and_selection_schedule_frames_and_settle_to_idle(cx: &mut TestAppContext) {
     let dir = temp_dir("list_uniform_motion");
@@ -400,5 +407,108 @@ fn list_view_row_hover_and_selection_schedule_frames_and_settle_to_idle(cx: &mut
         list.read_with(cx, |l, _| l.animation_frame_requests()),
         select_settled_reqs,
         "settled selection transition must stop calling request_animation_frame on idle frames"
+    );
+}
+
+#[gpui::test]
+fn remote_dialog_checkboxes_keep_instant_fade_under_reduced_motion(cx: &mut TestAppContext) {
+    cx.update(register_text_input_keybindings);
+
+    // 1. Reduced motion: RememberCheckbox & InsecureFtpCheckbox must fade over INSTANT (160 ms).
+    let mut reduced_state = AppState::new(Location::Local(PathBuf::from("/tmp")));
+    reduced_state.settings.motion_preference = MotionPreference::Reduced;
+    reduced_state.remote_prompt = Some(RemotePrompt::Password {
+        profile_id: "sftp-1".into(),
+        error: None,
+    });
+    let state_entity = cx.new(|_| reduced_state);
+    let state_for_view = state_entity.clone();
+    let (view, vcx) = cx.add_window_view(|_, cx| RemoteDialogsView::new(state_for_view, cx));
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        v.toggle_remember_password();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    let t_toggle = Instant::now();
+    let (mid_val, mid_active) = view.read_with(vcx, |v, _| {
+        v.remember_checkbox_motion(t_toggle + Duration::from_millis(80), true)
+    });
+    assert!(
+        mid_active && mid_val > 0.05 && mid_val < 0.99,
+        "RememberCheckbox under Reduced motion must fade over INSTANT (160 ms), got active={mid_active}, val={mid_val}"
+    );
+    let (end_val, end_active) = view.read_with(vcx, |v, _| {
+        v.remember_checkbox_motion(t_toggle + INSTANT + Duration::from_millis(10), true)
+    });
+    assert!(!end_active && (end_val - 1.0).abs() < 1e-3);
+
+    // Switch to ProfileManager add-profile form (FTP) and toggle InsecureFtpCheckbox under Reduced.
+    state_entity.update(vcx, |s, cx| {
+        s.remote_prompt = None;
+        cx.notify();
+    });
+    view.update(vcx, |v, cx| {
+        v.open_profile_manager(cx);
+        v.open_add_profile(cx);
+        v.set_form_protocol(kwati_core::Protocol::Ftp, cx);
+    });
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| v.toggle_form_allow_insecure(cx));
+    vcx.run_until_parked();
+
+    let t_ftp = Instant::now();
+    let (ftp_mid_val, ftp_mid_active) = view.read_with(vcx, |v, _| {
+        v.insecure_ftp_checkbox_motion(t_ftp + Duration::from_millis(80), true)
+    });
+    assert!(
+        ftp_mid_active && ftp_mid_val > 0.05 && ftp_mid_val < 0.99,
+        "InsecureFtpCheckbox under Reduced motion must fade over INSTANT (160 ms), got active={ftp_mid_active}, val={ftp_mid_val}"
+    );
+    let (ftp_end_val, ftp_end_active) = view.read_with(vcx, |v, _| {
+        v.insecure_ftp_checkbox_motion(t_ftp + INSTANT + Duration::from_millis(10), true)
+    });
+    assert!(!ftp_end_active && (ftp_end_val - 1.0).abs() < 1e-3);
+
+    // 2. Full motion: checkboxes still animate over QUICK (300 ms) with Curve::Spring.
+    std::thread::sleep(INSTANT + Duration::from_millis(20));
+    pump_next_dialogs_frame(&view, vcx);
+    state_entity.update(vcx, |s, cx| {
+        s.settings.motion_preference = MotionPreference::Full;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| v.toggle_form_allow_insecure(cx));
+    vcx.run_until_parked();
+
+    let t_full = Instant::now();
+    let (full_early_val, full_early_active) = view.read_with(vcx, |v, _| {
+        v.insecure_ftp_checkbox_motion(t_full + Duration::from_millis(60), false)
+    });
+    assert!(
+        full_early_active && full_early_val > 0.05 && full_early_val < 0.99,
+        "InsecureFtpCheckbox under Full motion should be mid-flight at 60 ms, got active={full_early_active}, val={full_early_val}"
+    );
+    let (_, full_past_instant_active) = view.read_with(vcx, |v, _| {
+        v.insecure_ftp_checkbox_motion(t_full + INSTANT + Duration::from_millis(20), false)
+    });
+    assert!(
+        full_past_instant_active,
+        "InsecureFtpCheckbox under Full motion must remain active past INSTANT (160 ms) during QUICK (300 ms)"
+    );
+    let (full_end_val, full_end_active) = view.read_with(vcx, |v, _| {
+        v.insecure_ftp_checkbox_motion(t_full + QUICK + Duration::from_millis(10), false)
+    });
+    assert!(!full_end_active && full_end_val.abs() < 1e-3);
+
+    // 3. Checkmark icon snaps to completed Rest state under reduced motion, and draws under Full.
+    assert_eq!(checkbox_check_motion(mid_val, true), Some(IconMotion::Rest));
+    assert_eq!(
+        checkbox_check_motion(full_early_val, false),
+        Some(IconMotion::Draw(full_early_val))
     );
 }
