@@ -1637,6 +1637,7 @@ impl Render for ListView {
                                                 window,
                                             )
                                         {
+                                            this.requested_frame_in_render = true;
                                             this.animation_frame_requests += 1;
                                             this.last_frame_requested_view =
                                                 Some(window.current_view());

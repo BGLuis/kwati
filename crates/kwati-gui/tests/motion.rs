@@ -316,9 +316,10 @@ fn list_view_row_hover_and_selection_schedule_frames_and_settle_to_idle(cx: &mut
     cx.run_until_parked();
 
     let after_hover_reqs = list.read_with(cx, |l, _| l.animation_frame_requests());
-    assert!(
-        after_hover_reqs > idle_after,
-        "hovering a settled row inside uniform_list must call request_animation_frame"
+    assert_eq!(
+        after_hover_reqs,
+        idle_after + 1,
+        "hovering row 0 from idle must schedule exactly one animation frame across measure_item and prepaint"
     );
     assert_eq!(
         list.read_with(cx, |l, _| l.last_frame_requested_view()),
