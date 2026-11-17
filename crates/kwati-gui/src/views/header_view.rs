@@ -13,7 +13,7 @@ use gpui::{
 
 use kwati_core::{ConnectionState, Location, ViewMode};
 
-use crate::actions::navigation::{SetViewCompact, SetViewDetails, SetViewGrid, TogglePreview};
+use crate::actions::navigation::TogglePreview;
 use crate::actions::{DisconnectRemote, OpenSettings, ReconnectRemote, RefreshListing};
 use crate::components::interactive::hover_bg;
 use crate::components::{animated_icon_sized, IconMotion, IconName, TextInput, Tooltip};
@@ -380,6 +380,7 @@ impl HeaderView {
 
         div()
             .id(id)
+            .debug_selector(move || format!("#{id}"))
             .w(gpui::px(26.))
             .h(gpui::px(20.))
             .flex()
@@ -411,14 +412,9 @@ impl HeaderView {
                     this.set_press(ctrl, false, cx);
                 }),
             )
-            .on_click(move |_, window, cx| {
-                let action: Box<dyn gpui::Action> = match mode {
-                    ViewMode::Details => Box::new(SetViewDetails),
-                    ViewMode::Grid => Box::new(SetViewGrid),
-                    ViewMode::CompactList => Box::new(SetViewCompact),
-                };
-                window.dispatch_action(action, cx);
-            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_view_mode(mode, cx);
+            }))
             .child(animated_icon_sized(
                 icon_name,
                 IconMotion::Rest,

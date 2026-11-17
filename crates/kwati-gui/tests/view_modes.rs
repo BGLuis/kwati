@@ -274,14 +274,32 @@ fn shortcuts_and_header_switcher_switch_view_modes(cx: &mut TestAppContext) {
         assert_eq!(main.list.read(cx).row_height, token_size::ROW);
     });
 
-    // HeaderView switcher helper also updates AppState and ListView
-    main.update(cx, |main, cx| {
-        main.header
-            .update(cx, |header, cx| header.set_view_mode(ViewMode::Grid, cx));
-    });
-    cx.run_until_parked();
+    // Clicking HeaderView switcher segments updates AppState and ListView
+    let grid_btn = cx
+        .debug_bounds("#view-mode-grid")
+        .expect("#view-mode-grid bounds");
+    click_at(cx, grid_btn.center(), Modifiers::none());
     main.read_with(cx, |main, cx| {
         assert_eq!(main.app_state.read(cx).view_mode, ViewMode::Grid);
+        assert_eq!(main.list.read(cx).row_height, GRID_ROW_HEIGHT);
+    });
+
+    let compact_btn = cx
+        .debug_bounds("#view-mode-compact")
+        .expect("#view-mode-compact bounds");
+    click_at(cx, compact_btn.center(), Modifiers::none());
+    main.read_with(cx, |main, cx| {
+        assert_eq!(main.app_state.read(cx).view_mode, ViewMode::CompactList);
+        assert_eq!(main.list.read(cx).row_height, COMPACT_ROW_HEIGHT);
+    });
+
+    let details_btn = cx
+        .debug_bounds("#view-mode-details")
+        .expect("#view-mode-details bounds");
+    click_at(cx, details_btn.center(), Modifiers::none());
+    main.read_with(cx, |main, cx| {
+        assert_eq!(main.app_state.read(cx).view_mode, ViewMode::Details);
+        assert_eq!(main.list.read(cx).row_height, token_size::ROW);
     });
 
     let _ = fs::remove_dir_all(&dir);
