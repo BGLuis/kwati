@@ -41,37 +41,50 @@ pub fn icon_for(path: &Path, is_dir: bool) -> IconName {
 
 /// Returns the built-in [`IconName`] for `path` using a precomputed [`SpecialFolders`] table.
 pub fn icon_for_with(path: &Path, is_dir: bool, specials: &SpecialFolders) -> IconName {
-    if is_dir {
-        return folder_icon_for(path, specials);
-    }
-    file_icon_for(path)
+    icon_for_entry(path, is_dir, false, specials)
 }
 
-fn folder_icon_for(path: &Path, specials: &SpecialFolders) -> IconName {
-    // Check home before other XDG dirs in case an unconfigured XDG dir aliases $HOME.
-    if specials.home.as_deref() == Some(path) {
-        return IconName::FolderHome;
+/// Returns the built-in [`IconName`] for `path`, skipping local `stat` probes and local
+/// special-folder path matching when `is_remote` is `true`.
+pub fn icon_for_entry(
+    path: &Path,
+    is_dir: bool,
+    is_remote: bool,
+    specials: &SpecialFolders,
+) -> IconName {
+    if is_dir {
+        return folder_icon_for(path, is_remote, specials);
     }
-    if specials.desktop.as_deref() == Some(path) {
-        return IconName::FolderDesktop;
-    }
-    if specials.documents.as_deref() == Some(path) {
-        return IconName::FolderDocuments;
-    }
-    if specials.downloads.as_deref() == Some(path) {
-        return IconName::FolderDownloads;
-    }
-    if specials.pictures.as_deref() == Some(path) {
-        return IconName::FolderPictures;
-    }
-    if specials.music.as_deref() == Some(path) {
-        return IconName::FolderMusic;
-    }
-    if specials.videos.as_deref() == Some(path) {
-        return IconName::FolderVideos;
-    }
-    if specials.public.as_deref() == Some(path) {
-        return IconName::FolderPublic;
+    file_icon_for(path, is_remote)
+}
+
+fn folder_icon_for(path: &Path, is_remote: bool, specials: &SpecialFolders) -> IconName {
+    if !is_remote {
+        // Check home before other XDG dirs in case an unconfigured XDG dir aliases $HOME.
+        if specials.home.as_deref() == Some(path) {
+            return IconName::FolderHome;
+        }
+        if specials.desktop.as_deref() == Some(path) {
+            return IconName::FolderDesktop;
+        }
+        if specials.documents.as_deref() == Some(path) {
+            return IconName::FolderDocuments;
+        }
+        if specials.downloads.as_deref() == Some(path) {
+            return IconName::FolderDownloads;
+        }
+        if specials.pictures.as_deref() == Some(path) {
+            return IconName::FolderPictures;
+        }
+        if specials.music.as_deref() == Some(path) {
+            return IconName::FolderMusic;
+        }
+        if specials.videos.as_deref() == Some(path) {
+            return IconName::FolderVideos;
+        }
+        if specials.public.as_deref() == Some(path) {
+            return IconName::FolderPublic;
+        }
     }
 
     let raw = path.to_string_lossy();
@@ -88,14 +101,14 @@ fn folder_icon_for(path: &Path, specials: &SpecialFolders) -> IconName {
         }
     }
 
-    if path.join(".git").symlink_metadata().is_ok() {
+    if !is_remote && path.join(".git").symlink_metadata().is_ok() {
         return IconName::FolderProjects;
     }
 
     IconName::Folder
 }
 
-fn file_icon_for(path: &Path) -> IconName {
+fn file_icon_for(path: &Path, is_remote: bool) -> IconName {
     let file_name = path.file_name().and_then(|n| n.to_str());
     if let Some(name) = file_name {
         if matches!(name, "id_rsa" | "id_ed25519") {
@@ -116,7 +129,7 @@ fn file_icon_for(path: &Path) -> IconName {
         }
     }
 
-    if path.extension().is_none() && is_executable_file(path) {
+    if !is_remote && path.extension().is_none() && is_executable_file(path) {
         return IconName::FileBinary;
     }
 
@@ -240,6 +253,11 @@ mod tests {
             icon_for_with(&git_repo, true, &specials),
             IconName::FolderProjects
         );
+        // Remote entries skip local .git and executable stat probes.
+        assert_eq!(
+            icon_for_entry(&git_repo, true, true, &specials),
+            IconName::Folder
+        );
 
         let exec_file = root.join("tool");
         fs::write(&exec_file, b"#!/bin/sh\n").unwrap();
@@ -250,6 +268,10 @@ mod tests {
             perms.set_mode(0o755);
             fs::set_permissions(&exec_file, perms).unwrap();
             assert_eq!(icon_for(&exec_file, false), IconName::FileBinary);
+            assert_eq!(
+                icon_for_entry(&exec_file, false, true, &specials),
+                IconName::File
+            );
         }
 
         let _ = fs::remove_dir_all(&root);

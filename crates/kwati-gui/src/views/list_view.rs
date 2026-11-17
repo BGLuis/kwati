@@ -20,7 +20,7 @@ use crate::actions::navigation::{
 use crate::actions::operations::get_location_clipboard;
 use crate::components::interactive::focus_ring_color;
 use crate::components::{
-    icon_for_with, resolved_icon, Ellipsize, IconMotion, IconName, ScrollbarState, SpecialFolders,
+    icon_for_entry, resolved_icon, Ellipsize, IconMotion, IconName, ScrollbarState, SpecialFolders,
 };
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
@@ -738,6 +738,8 @@ impl ListView {
             }
 
             if !del_set.is_empty() {
+                let is_remote = matches!(state.current_location, Location::Remote { .. });
+                let specials = SpecialFolders::from_system();
                 self.exiting_scroll_top = scroll_top;
                 for (old_ix, (loc, entry)) in self.prev_entries.iter().enumerate() {
                     if del_set.contains(loc)
@@ -747,7 +749,7 @@ impl ListView {
                     {
                         self.exiting_rows.push(ExitingRow {
                             name: entry.display_name(),
-                            icon: crate::components::icon_for(&entry.path, entry.is_dir()),
+                            icon: icon_for_entry(&entry.path, entry.is_dir(), is_remote, &specials),
                             is_dir: entry.is_dir(),
                             is_hidden: entry.is_hidden,
                             size_str: format_size(entry.size, entry.is_dir()),
@@ -938,6 +940,7 @@ impl Render for ListView {
             ),
         ];
 
+        let is_remote = matches!(current, Location::Remote { .. });
         let entries_clone = entries;
         let special_folders = SpecialFolders::from_system();
         let (row_selected, row_hover, row_text, row_muted, row_accent) = (
@@ -1569,9 +1572,10 @@ impl Render for ListView {
                                                                 .items_center()
                                                                 .gap(space::S8)
                                                                 .child(resolved_icon(
-                                                                    icon_for_with(
+                                                                    icon_for_entry(
                                                                         &entry.path,
                                                                         is_dir,
+                                                                        is_remote,
                                                                         &special_folders,
                                                                     ),
                                                                     icon_motion,

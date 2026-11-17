@@ -29,7 +29,9 @@ use kwati_core::{Location, RemoteSearchOptions, SearchHandle, SearchHit, SearchO
 
 use crate::components::interactive::hover_bg;
 use crate::components::TextInput;
-use crate::components::{animated_icon_sized, icon, icon_for, resolved_icon, IconMotion, IconName};
+use crate::components::{
+    animated_icon_sized, icon, icon_for_entry, resolved_icon, IconMotion, IconName, SpecialFolders,
+};
 use crate::motion::{
     color_lerp, is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker,
     INSTANT, QUICK,
@@ -575,6 +577,7 @@ impl Render for SearchView {
 
         let selected_idx = self.selected_index;
         let root_path = self.current_root.clone();
+        let no_specials = SpecialFolders::default();
 
         let mut results_elements = Vec::new();
         for (ix, hit) in self.results.iter().take(100).enumerate() {
@@ -609,7 +612,7 @@ impl Render for SearchView {
                 .and_then(|r| hit_path.strip_prefix(r).ok())
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| hit_path.to_string_lossy().to_string());
-            let hit_icon = icon_for(&hit_path, false);
+            let hit_icon = icon_for_entry(&hit_path, false, is_remote, &no_specials);
 
             results_elements.push(
                 div()

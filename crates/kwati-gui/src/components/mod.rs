@@ -7,7 +7,7 @@ pub mod text_input;
 pub mod tooltip;
 
 pub use ellipsize::Ellipsize;
-pub use file_icons::{icon_for, icon_for_with, SpecialFolders};
+pub use file_icons::{icon_for, icon_for_entry, icon_for_with, SpecialFolders};
 pub use icon::{
     animated_icon, animated_icon_sized, icon, resolved_icon, Assets, IconMotion, IconName, IconPart,
 };
