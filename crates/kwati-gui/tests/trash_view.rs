@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{px, size, AppContext as _, Entity, TestAppContext, VisualTestContext};
 use kwati_core::{
@@ -10,6 +11,7 @@ use kwati_core::{
 };
 use kwati_gui::actions::register_keybindings;
 use kwati_gui::components::register_text_input_keybindings;
+use kwati_gui::motion::INSTANT;
 use kwati_gui::state::{AppState, TrashSortColumn};
 use kwati_gui::views::dialogs::confirm_empty_trash_message;
 use kwati_gui::views::{DialogKind, MainView};
@@ -404,4 +406,90 @@ fn trash_sorting_and_selection_work_in_app_state() {
 
     state.clear_trash_selection();
     assert!(state.trash_selection.is_empty());
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[gpui::test]
+fn trash_view_selection_animates_uniform_list_and_enter_restores(cx: &mut TestAppContext) {
+    let fixture = TrashFixture::new("gui_motion_enter");
+    let file = fixture.root.join("enter_restore.txt");
+    fs::write(&file, b"keyboard restore").unwrap();
+    trash(&file).unwrap();
+
+    let (main, cx) = open_window(cx, &fixture.root);
+    main.update(cx, |main, cx| {
+        main.sidebar
+            .update(cx, |sidebar, cx| sidebar.open_trash(cx));
+    });
+    cx.run_until_parked();
+
+    let trash_view = main.read_with(cx, |m, _| m.trash.clone());
+    let item = main
+        .read_with(cx, |main, cx| {
+            main.app_state
+                .read(cx)
+                .trash_items
+                .iter()
+                .find(|i| i.original_path() == file)
+                .cloned()
+        })
+        .expect("trashed item should appear in TrashView");
+
+    // Idle frame must not schedule animation frames.
+    let idle_before = trash_view.read_with(cx, |v, _| v.animation_frame_requests());
+    trash_view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    let idle_after = trash_view.read_with(cx, |v, _| v.animation_frame_requests());
+    assert_eq!(
+        idle_after, idle_before,
+        "idle TrashView must not call request_animation_frame"
+    );
+
+    // Selecting a row starts SelectBg from 0.0 and schedules animation frames from inside uniform_list.
+    main.update(cx, |main, cx| {
+        main.app_state.update(cx, |state, cx| {
+            state.select_trash_only(item.id.clone());
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
+    let reqs_after_select = trash_view.read_with(cx, |v, _| v.animation_frame_requests());
+    assert!(
+        reqs_after_select > idle_after,
+        "selecting a row in uniform_list must schedule an animation frame"
+    );
+    let mid_val = trash_view.read_with(cx, |v, _| {
+        v.row_select_value(&item.id, Instant::now(), false)
+    });
+    assert!(
+        mid_val < 0.99,
+        "SelectBg must fade from 0.0 instead of snapping to 1.0, got {mid_val}"
+    );
+
+    // Once INSTANT has elapsed and one pump runs, settled selection stops requesting frames.
+    std::thread::sleep(INSTANT + Duration::from_millis(20));
+    trash_view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    let settled_reqs = trash_view.read_with(cx, |v, _| v.animation_frame_requests());
+    trash_view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    assert_eq!(
+        trash_view.read_with(cx, |v, _| v.animation_frame_requests()),
+        settled_reqs,
+        "settled TrashView must stop requesting animation frames"
+    );
+
+    // Pressing Enter while TrashView is focused restores the selected item.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(fs::read(&file).unwrap(), b"keyboard restore");
 }

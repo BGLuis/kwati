@@ -5,7 +5,7 @@
 //! offers Empty Trash behind a destructive confirmation dialog.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -70,6 +70,8 @@ pub struct TrashView {
     pending_restore: bool,
     op_generation: u64,
     motion: MotionTracker<TrashMotionKey>,
+    requested_frame_in_render: bool,
+    animation_frame_requests: usize,
 }
 
 impl EventEmitter<TrashViewEvent> for TrashView {}
@@ -93,7 +95,22 @@ impl TrashView {
             pending_restore: false,
             op_generation: 0,
             motion: MotionTracker::new(),
+            requested_frame_in_render: false,
+            animation_frame_requests: 0,
         }
+    }
+
+    pub fn animation_frame_requests(&self) -> usize {
+        self.animation_frame_requests
+    }
+
+    pub fn row_select_value(&self, id: &OsStr, now: Instant, reduced: bool) -> f32 {
+        self.motion.scalar_or(
+            &TrashMotionKey::SelectBg(id.to_os_string()),
+            0.0,
+            now,
+            reduced,
+        )
     }
 
     pub fn scroll_to_item(&self, ix: usize) {
@@ -364,16 +381,7 @@ impl Render for TrashView {
             .logical_scroll_top()
             .0;
 
-        let (
-            items,
-            selection,
-            anchor_id,
-            sort_column,
-            sort_direction,
-            trash_loading,
-            reduced,
-            focused_id,
-        ) = {
+        let (items, selection, sort_column, sort_direction, trash_loading, reduced, focused_id) = {
             let state = self.app_state.read(cx);
             let focused_id = state.trash_selection_anchor.clone().or_else(|| {
                 state
@@ -384,7 +392,6 @@ impl Render for TrashView {
             (
                 state.trash_items.clone(),
                 state.trash_selection.clone(),
-                state.trash_selection_anchor.clone(),
                 state.trash_sort_column,
                 state.trash_sort_direction,
                 state.trash_loading,
@@ -392,7 +399,6 @@ impl Render for TrashView {
                 focused_id,
             )
         };
-        let _ = anchor_id;
 
         let item_count = items.len();
         let selected_count = selection.len();
@@ -509,7 +515,7 @@ impl Render for TrashView {
                             cx.processor(
                                 move |this: &mut TrashView,
                                       range: std::ops::Range<usize>,
-                                      _window,
+                                      window,
                                       cx| {
                                     let mut rows: Vec<gpui::AnyElement> = Vec::new();
                                     for ix in range {
@@ -547,7 +553,7 @@ impl Render for TrashView {
                                             );
                                             let select_t = this.motion.step_scalar(
                                                 TrashMotionKey::SelectBg(id.clone()),
-                                                if is_selected { 1.0 } else { 0.0 },
+                                                0.0,
                                                 if is_selected { 1.0 } else { 0.0 },
                                                 INSTANT,
                                                 Curve::EaseOut,
@@ -696,6 +702,12 @@ impl Render for TrashView {
                                             );
                                         }
                                     }
+                                    let row_active = this.motion.has_active(now, reduced);
+                                    if !this.requested_frame_in_render && row_active {
+                                        request_frame_if_active(true, window);
+                                        this.requested_frame_in_render = true;
+                                        this.animation_frame_requests += 1;
+                                    }
                                     rows
                                 },
                             ),
@@ -743,7 +755,11 @@ impl Render for TrashView {
         };
 
         self.motion.prune_settled(now, reduced);
-        request_frame_if_active(self.motion.has_active(now, reduced), window);
+        self.requested_frame_in_render = self.motion.has_active(now, reduced);
+        if self.requested_frame_in_render {
+            request_frame_if_active(true, window);
+            self.animation_frame_requests += 1;
+        }
 
         div()
             .flex()
@@ -784,6 +800,7 @@ impl Render for TrashView {
                     "end" => this.select_last(cx),
                     "pageup" => this.select_page_up(cx),
                     "pagedown" => this.select_page_down(cx),
+                    "enter" => this.restore_selected(cx),
                     "backspace" => {
                         this.app_state.update(cx, |state, _| state.exit_trash());
                         cx.notify();
