@@ -11,9 +11,12 @@ use gpui::{
     div, prelude::*, px, transparent_black, AnyElement, Context, Div, Entity, FontWeight,
     KeyDownEvent, MouseButton, MouseDownEvent, Stateful, Subscription, Task, Window,
 };
-use kwati_core::{device_volumes, network_mounts, ConnectionState, Location, NetworkMount, Volume};
+use kwati_core::{
+    device_volumes, is_trash_browsing_supported, network_mounts, ConnectionState, Location,
+    NetworkMount, Volume,
+};
 
-use crate::actions::ManageServers;
+use crate::actions::{open_system_trash, ManageServers};
 use crate::components::{
     animated_icon_sized, icon, Ellipsize, IconMotion, IconName, TextInput, Tooltip,
 };
@@ -307,6 +310,7 @@ const DEVICE_POLL: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SidebarKey {
     Place(usize),
+    Trash,
     Bookmark(usize),
     AddBookmark,
     ManageServers,
@@ -629,6 +633,29 @@ impl SidebarView {
             state.navigate_to(location);
         });
     }
+
+    /// Opens the in-app trash view on supported platforms, or the OS trash on macOS.
+    pub fn open_trash(&mut self, cx: &mut Context<Self>) {
+        self.open_trash_with(is_trash_browsing_supported(), open_system_trash, cx);
+    }
+
+    pub fn open_trash_with(
+        &mut self,
+        browsing_supported: bool,
+        open_system: impl FnOnce() -> std::io::Result<()>,
+        cx: &mut Context<Self>,
+    ) {
+        if browsing_supported {
+            self.app_state.update(cx, |state, _| {
+                state.open_trash();
+            });
+        } else if let Err(err) = open_system() {
+            self.app_state.update(cx, |state, _| {
+                state.set_status(format!("Cannot open system trash: {err}"));
+            });
+        }
+        cx.notify();
+    }
 }
 
 impl SidebarView {
@@ -718,17 +745,20 @@ impl SidebarView {
     }
 
     /// A drive as one row, like a place; its capacity waits in the tooltip.
+    #[allow(clippy::too_many_arguments)]
     fn drive_row(
         &mut self,
         ix: usize,
         vol: SidebarVolume,
         current_loc: &Location,
+        trash_active: bool,
         now: Instant,
         reduced: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::get(cx);
-        let is_active = matches!(current_loc, Location::Local(p) if p == &vol.mount_point);
+        let is_active =
+            !trash_active && matches!(current_loc, Location::Local(p) if p == &vol.mount_point);
         let tooltip = if vol.is_mounted {
             format!("{} — {}", vol.mount_point.display(), vol.capacity_summary())
         } else {
@@ -919,10 +949,11 @@ impl SidebarView {
     fn render_compact(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx);
         let now = Instant::now();
-        let (current_loc, servers, reduced) = {
+        let (current_loc, trash_active, servers, reduced) = {
             let state = self.app_state.read(cx);
             (
                 state.current_location.clone(),
+                state.trash_active,
                 server_items(state),
                 is_reduced_motion(state.settings.motion_preference),
             )
@@ -941,7 +972,8 @@ impl SidebarView {
                 let key = SidebarKey::Place(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let path = place.path.clone();
-                let is_active = matches!(&current_loc, Location::Local(p) if p == &place.path);
+                let is_active =
+                    !trash_active && matches!(&current_loc, Location::Local(p) if p == &place.path);
                 let row_bg = if is_active {
                     theme.selection.into()
                 } else {
@@ -1010,7 +1042,8 @@ impl SidebarView {
                 let key = SidebarKey::Bookmark(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let path = bm.path.clone();
-                let is_active = matches!(&current_loc, Location::Local(p) if p == &bm.path);
+                let is_active =
+                    !trash_active && matches!(&current_loc, Location::Local(p) if p == &bm.path);
                 let row_bg = if is_active {
                     theme.selection.into()
                 } else {
@@ -1084,7 +1117,8 @@ impl SidebarView {
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let path = vol.mount_point.clone();
                 let is_mounted = vol.is_mounted;
-                let is_active = matches!(&current_loc, Location::Local(p) if p == &vol.mount_point);
+                let is_active = !trash_active
+                    && matches!(&current_loc, Location::Local(p) if p == &vol.mount_point);
                 let row_bg = if is_active {
                     theme.selection.into()
                 } else {
@@ -1154,8 +1188,8 @@ impl SidebarView {
                 let key = SidebarKey::NetworkShare(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let path = share.mount_point.clone();
-                let is_active =
-                    matches!(&current_loc, Location::Local(p) if p == &share.mount_point);
+                let is_active = !trash_active
+                    && matches!(&current_loc, Location::Local(p) if p == &share.mount_point);
                 let row_bg = if is_active {
                     theme.selection.into()
                 } else {
@@ -1211,10 +1245,11 @@ impl SidebarView {
                 let key = SidebarKey::Server(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let server_id = server.id.clone();
-                let is_active = matches!(
-                    &current_loc,
-                    Location::Remote { profile_id, .. } if profile_id == &server.id
-                );
+                let is_active = !trash_active
+                    && matches!(
+                        &current_loc,
+                        Location::Remote { profile_id, .. } if profile_id == &server.id
+                    );
                 let row_bg = if is_active {
                     theme.selection.into()
                 } else {
@@ -1282,6 +1317,60 @@ impl SidebarView {
             })
             .collect();
 
+        let (trash_hover, trash_press) = self.step_row_factors(SidebarKey::Trash, now, reduced);
+        let compact_trash_row = {
+            let row_bg = if trash_active {
+                theme.selection.into()
+            } else {
+                color_lerp(transparent_black(), theme.border, trash_hover)
+            };
+            let scale = if reduced {
+                1.0
+            } else {
+                lerp_f32(1.0, PRESS_SCALE, trash_press)
+            };
+            let trash_motion = if !reduced && (trash_active || trash_hover > 0.01) {
+                IconMotion::State(if trash_active { 1.0 } else { trash_hover })
+            } else {
+                IconMotion::Rest
+            };
+            div()
+                .id("compact-trash")
+                .h(size::SIDEBAR_ROW)
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(radius::CONTROL)
+                .cursor_pointer()
+                .bg(row_bg)
+                .tooltip(Tooltip::text("Trash"))
+                .on_hover(cx.listener(|this, hovered, _, cx| {
+                    this.set_hover(SidebarKey::Trash, *hovered, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_press(SidebarKey::Trash, true, cx);
+                        this.open_trash(cx);
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.set_press(SidebarKey::Trash, false, cx)),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.set_press(SidebarKey::Trash, false, cx)),
+                )
+                .child(animated_icon_sized(
+                    IconName::Trash,
+                    trash_motion,
+                    size::ICON * scale,
+                    theme.text,
+                ))
+        };
+
         let (manage_hover, manage_press) =
             self.step_row_factors(SidebarKey::ManageServers, now, reduced);
         let manage_scale = if reduced {
@@ -1306,6 +1395,7 @@ impl SidebarView {
             .gap_1()
             .overflow_hidden()
             .children(place_rows)
+            .child(compact_trash_row)
             .when(!bookmarks.is_empty(), |s| s.child(divider()))
             .children(bookmark_rows)
             .when(!volumes.is_empty(), |s| s.child(divider()))
@@ -1379,17 +1469,18 @@ impl Render for SidebarView {
         let network = self.network.clone();
         let drive_details = self.drive_details;
         let editing_bookmark = self.editing_bookmark;
-        let (current_loc, servers, reduced) = {
+        let (current_loc, trash_active, servers, reduced) = {
             let state = self.app_state.read(cx);
             (
                 state.current_location.clone(),
+                state.trash_active,
                 server_items(state),
                 is_reduced_motion(state.settings.motion_preference),
             )
         };
         self.sync_server_draws(&servers, now);
-        let can_pin_current =
-            matches!(&current_loc, Location::Local(p) if !bookmarks.iter().any(|b| &b.path == p));
+        let can_pin_current = !trash_active
+            && matches!(&current_loc, Location::Local(p) if !bookmarks.iter().any(|b| &b.path == p));
 
         let place_rows: Vec<_> = places
             .into_iter()
@@ -1397,7 +1488,8 @@ impl Render for SidebarView {
             .map(|(ix, place)| {
                 let key = SidebarKey::Place(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
-                let is_active = matches!(&current_loc, Location::Local(p) if p == &place.path);
+                let is_active =
+                    !trash_active && matches!(&current_loc, Location::Local(p) if p == &place.path);
                 let row_bg = if is_active {
                     theme.selection.into()
                 } else {
@@ -1476,7 +1568,8 @@ impl Render for SidebarView {
             .enumerate()
             .map(|(idx, bm)| {
                 let is_missing = bm.is_missing();
-                let is_active = matches!(&current_loc, Location::Local(p) if p == &bm.path);
+                let is_active =
+                    !trash_active && matches!(&current_loc, Location::Local(p) if p == &bm.path);
                 let p_clone = bm.path.clone();
 
                 if editing_bookmark == Some(idx) {
@@ -1654,10 +1747,11 @@ impl Render for SidebarView {
                 let key = SidebarKey::Server(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let server_id = server.id.clone();
-                let is_active = matches!(
-                    &current_loc,
-                    Location::Remote { profile_id, .. } if profile_id == &server.id
-                );
+                let is_active = !trash_active
+                    && matches!(
+                        &current_loc,
+                        Location::Remote { profile_id, .. } if profile_id == &server.id
+                    );
                 let row_bg = if is_active {
                     theme.selection.into()
                 } else {
@@ -1764,7 +1858,7 @@ impl Render for SidebarView {
             .map(|(ix, vol)| {
                 if !drive_details {
                     return self
-                        .drive_row(ix, vol, &current_loc, now, reduced, cx)
+                        .drive_row(ix, vol, &current_loc, trash_active, now, reduced, cx)
                         .on_mouse_down(MouseButton::Right, cx.listener(Self::toggle_drive_details))
                         .into_any_element();
                 }
@@ -1774,7 +1868,7 @@ impl Render for SidebarView {
                 let capacity_text = vol.capacity_summary();
                 let used_pct = vol.used_percentage();
                 let p_nav = vol.mount_point.clone();
-                let is_active = current_loc.path() == vol.mount_point;
+                let is_active = !trash_active && current_loc.path() == vol.mount_point;
 
                 div()
                     .on_mouse_down(MouseButton::Right, cx.listener(Self::toggle_drive_details))
@@ -1902,8 +1996,8 @@ impl Render for SidebarView {
             .map(|(ix, share)| {
                 let key = SidebarKey::NetworkShare(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
-                let is_active =
-                    matches!(&current_loc, Location::Local(p) if p == &share.mount_point);
+                let is_active = !trash_active
+                    && matches!(&current_loc, Location::Local(p) if p == &share.mount_point);
                 let row_bg = if is_active {
                     theme.selection.into()
                 } else {
@@ -1959,6 +2053,62 @@ impl Render for SidebarView {
             })
             .collect();
 
+        let (trash_hover, trash_press) = self.step_row_factors(SidebarKey::Trash, now, reduced);
+        let trash_row = {
+            let row_bg = if trash_active {
+                theme.selection.into()
+            } else {
+                color_lerp(transparent_black(), theme.border, trash_hover)
+            };
+            let scale = if reduced {
+                1.0
+            } else {
+                lerp_f32(1.0, PRESS_SCALE, trash_press)
+            };
+            let trash_motion = if !reduced && (trash_active || trash_hover > 0.01) {
+                IconMotion::State(if trash_active { 1.0 } else { trash_hover })
+            } else {
+                IconMotion::Rest
+            };
+            div()
+                .id("sidebar-trash")
+                .h(size::SIDEBAR_ROW)
+                .px(space::S8)
+                .rounded(radius::CONTROL)
+                .cursor_pointer()
+                .bg(row_bg)
+                .text_body()
+                .text_color(theme.text)
+                .flex()
+                .items_center()
+                .gap(space::S8)
+                .on_hover(cx.listener(|this, hovered, _, cx| {
+                    this.set_hover(SidebarKey::Trash, *hovered, cx);
+                }))
+                .child(animated_icon_sized(
+                    IconName::Trash,
+                    trash_motion,
+                    size::ICON * scale,
+                    theme.text,
+                ))
+                .child(div().ellipsize().child("Trash"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.set_press(SidebarKey::Trash, true, cx);
+                        this.open_trash(cx);
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.set_press(SidebarKey::Trash, false, cx)),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.set_press(SidebarKey::Trash, false, cx)),
+                )
+        };
+
         let animating = self.motion.has_active(now, reduced);
         self.motion.prune_settled(now, reduced);
         request_frame_if_active(animating, window);
@@ -1987,7 +2137,8 @@ impl Render for SidebarView {
                             .text_color(theme.text_muted)
                             .child("Places"),
                     )
-                    .children(place_rows),
+                    .children(place_rows)
+                    .child(trash_row),
             )
             // --- BOOKMARKS SECTION ---
             .when(!bookmarks.is_empty() || can_pin_current, |parent| {

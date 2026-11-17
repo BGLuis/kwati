@@ -1,7 +1,7 @@
 //! File operations and undo actions (#17, #19, #21, #23, #35, #48, #65).
 
-use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use gpui::actions;
 use kwati_core::{
-    copy_between, move_between, move_entry, Backend, BackendError, Confirmed, ConflictPolicy,
-    CopyOptions, CopyOutcome, EntryKind, LocalBackend, Location, Progress,
+    copy_between, move_between, move_entry, purge_trash_items, restore_conflict,
+    restore_trash_items, Backend, BackendError, Confirmed, ConflictPolicy, CopyOptions,
+    CopyOutcome, EntryKind, LocalBackend, Location, Progress, TrashItem,
 };
 
 use crate::state::{AppState, JobKind, JobStatus, UndoOperation};
@@ -1009,6 +1010,120 @@ pub fn execute_permanent_delete_locations(
 pub fn execute_permanent_delete(state: &mut AppState, paths: &[PathBuf]) -> Result<usize, String> {
     let locs: Vec<Location> = paths.iter().cloned().map(Location::Local).collect();
     execute_permanent_delete_locations(state, &locs, Confirmed::user_confirmed())
+}
+
+/// Outcome of attempting to restore selected trash items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreTrashOutcome {
+    Restored(usize),
+    Conflict {
+        item_name: String,
+        destination: PathBuf,
+    },
+    Failed(String),
+}
+
+/// Formats a restore-conflict error showing both the trashed item name and destination path.
+pub fn format_restore_conflict_message(item_name: &str, destination: &Path) -> String {
+    format!(
+        "Cannot restore '{}': '{}' already exists",
+        item_name,
+        destination.display()
+    )
+}
+
+/// Restores `items` from the system trash without modifying [`AppState`].
+pub fn restore_trash_items_op(items: &[TrashItem]) -> RestoreTrashOutcome {
+    if items.is_empty() {
+        return RestoreTrashOutcome::Restored(0);
+    }
+    match restore_trash_items(items) {
+        Ok(()) => RestoreTrashOutcome::Restored(items.len()),
+        Err(err) => {
+            if let Some(conflict) = restore_conflict(&err) {
+                RestoreTrashOutcome::Conflict {
+                    item_name: conflict.item_name.to_string_lossy().into_owned(),
+                    destination: conflict.destination.clone(),
+                }
+            } else {
+                RestoreTrashOutcome::Failed(err.to_string())
+            }
+        }
+    }
+}
+
+/// Applies a [`RestoreTrashOutcome`] to `state`, updating trash listing, selection, and status.
+pub fn apply_restore_trash_outcome(
+    state: &mut AppState,
+    attempted_items: &[TrashItem],
+    outcome: &RestoreTrashOutcome,
+) {
+    match outcome {
+        RestoreTrashOutcome::Restored(count) => {
+            let restored_ids: HashSet<OsString> =
+                attempted_items.iter().map(|i| i.id.clone()).collect();
+            let remaining: Vec<TrashItem> = state
+                .trash_items
+                .iter()
+                .filter(|item| !restored_ids.contains(&item.id))
+                .cloned()
+                .collect();
+            state.set_trash_items(remaining);
+            state.set_completion_status(format!("Restored {count} item(s)"));
+            if state.trash_active {
+                state.reload_trash();
+            }
+        }
+        RestoreTrashOutcome::Conflict {
+            item_name,
+            destination,
+        } => {
+            state.set_status(format_restore_conflict_message(item_name, destination));
+        }
+        RestoreTrashOutcome::Failed(err) => {
+            state.set_status(format!("Failed to restore: {err}"));
+        }
+    }
+}
+
+/// Permanently deletes `items` from the system trash using explicit [`Confirmed`] proof.
+pub fn purge_trash_items_op(items: &[TrashItem], confirmed: Confirmed) -> Result<usize, String> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    purge_trash_items(items, confirmed)
+        .map(|()| items.len())
+        .map_err(|err| err.to_string())
+}
+
+/// Applies the result of emptying/purging trash items to `state`.
+pub fn apply_empty_trash_result(
+    state: &mut AppState,
+    purged_ids: &[OsString],
+    result: Result<usize, String>,
+) -> Result<usize, String> {
+    match result {
+        Ok(count) => {
+            let purged_set: HashSet<&OsString> = purged_ids.iter().collect();
+            let remaining: Vec<TrashItem> = state
+                .trash_items
+                .iter()
+                .filter(|item| !purged_set.contains(&item.id))
+                .cloned()
+                .collect();
+            state.set_trash_items(remaining);
+            state.set_completion_status(format!("Permanently deleted {count} item(s) from trash"));
+            if state.trash_active {
+                state.reload_trash();
+            }
+            Ok(count)
+        }
+        Err(err) => {
+            let msg = format!("Failed to empty trash: {err}");
+            state.set_status(msg.clone());
+            Err(msg)
+        }
+    }
 }
 
 /// Undoes the last reversible local file operation from the undo stack.
