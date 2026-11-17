@@ -13,12 +13,12 @@ use gpui::{
     SharedString, Subscription, Task, UniformListScrollHandle, Window,
 };
 use kwati_core::preview::{read_preview, Preview};
-use kwati_core::{Entry, Location};
+use kwati_core::{Entry, IconConfig, Location};
 
-use crate::components::{icon, icon_for, IconName};
+use crate::components::{icon, icon_for, resolved_icon, IconMotion, IconName};
 use crate::state::{AppState, PreviewData, PreviewKind};
 use crate::theme::Theme;
-use crate::tokens::{Fonts, DATA_SIZE};
+use crate::tokens::{size, Fonts, DATA_SIZE};
 use crate::views::list_view::REMOTE_FILE_NOTICE;
 
 const MAX_IMAGE_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
@@ -271,11 +271,13 @@ pub struct PreviewView {
     text_scroll_handle: UniformListScrollHandle,
     load_task: Option<Task<()>>,
     request_generation: u64,
+    last_icon_config: IconConfig,
     _subscription: Subscription,
 }
 
 impl PreviewView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let last_icon_config = app_state.read(cx).icon_config.clone();
         let subscription = cx.observe(&app_state, |this, app_state, cx| {
             this.sync_with_selection(app_state, cx);
         });
@@ -289,6 +291,7 @@ impl PreviewView {
             text_scroll_handle: UniformListScrollHandle::new(),
             load_task: None,
             request_generation: 0,
+            last_icon_config,
             _subscription: subscription,
         }
     }
@@ -307,14 +310,18 @@ impl PreviewView {
 
     /// Synchronizes preview with the currently selected entry in AppState.
     pub fn sync_with_selection(&mut self, app_state: Entity<AppState>, cx: &mut Context<Self>) {
-        let (preview_open, selected_location) = {
+        let (preview_open, selected_location, icons_changed) = {
             let state = app_state.read(cx);
             let selected = if state.selection.len() == 1 {
                 state.selection.iter().next().cloned()
             } else {
                 None
             };
-            (state.panels.preview_open, selected)
+            let changed = state.icon_config != self.last_icon_config;
+            if changed {
+                self.last_icon_config = state.icon_config.clone();
+            }
+            (state.panels.preview_open, selected, changed)
         };
 
         if !preview_open {
@@ -341,12 +348,17 @@ impl PreviewView {
                     state.set_preview(None);
                 });
                 cx.notify();
+            } else if icons_changed {
+                cx.notify();
             }
             return;
         };
 
         let path = location.path().to_path_buf();
         if self.current_path.as_ref() == Some(&path) {
+            if icons_changed {
+                cx.notify();
+            }
             return;
         }
 
@@ -449,9 +461,9 @@ impl Render for PreviewView {
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
 
-        let preview_snapshot = {
+        let (preview_snapshot, icon_prefs, icon_resolver) = {
             let state = self.app_state.read(cx);
-            state.preview_state.as_ref().map(|preview_data| {
+            let snap = state.preview_state.as_ref().map(|preview_data| {
                 let path = preview_data.path.clone();
                 let body = match &preview_data.kind {
                     PreviewKind::Text(text) => {
@@ -472,7 +484,12 @@ impl Render for PreviewView {
                     PreviewKind::Loading => Ok(RenderPreviewBody::Loading),
                 };
                 (path, body)
-            })
+            });
+            (
+                snap,
+                state.icon_config.active.clone(),
+                state.icon_resolver.clone(),
+            )
         };
 
         let Some((preview_path, body_or_uncached)) = preview_snapshot else {
@@ -550,7 +567,14 @@ impl Render for PreviewView {
                             .items_center()
                             .gap_2()
                             .min_w_0()
-                            .child(icon(header_icon).text_color(header_icon_color))
+                            .child(resolved_icon(
+                                header_icon,
+                                IconMotion::Rest,
+                                size::ICON,
+                                header_icon_color,
+                                &icon_prefs,
+                                &icon_resolver,
+                            ))
                             .child(
                                 div()
                                     .flex_1()
@@ -654,11 +678,18 @@ impl Render for PreviewView {
                     .p_4()
                     .rounded_md()
                     .bg(theme.surface)
-                    .child(icon(header_icon).text_color(if is_dir {
-                        theme.accent
-                    } else {
-                        theme.text_muted
-                    }))
+                    .child(resolved_icon(
+                        header_icon,
+                        IconMotion::Rest,
+                        size::ICON,
+                        if is_dir {
+                            theme.accent
+                        } else {
+                            theme.text_muted
+                        },
+                        &icon_prefs,
+                        &icon_resolver,
+                    ))
                     .child(
                         div()
                             .text_size(px(13.))

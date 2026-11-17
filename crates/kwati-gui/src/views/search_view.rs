@@ -29,7 +29,7 @@ use kwati_core::{Location, RemoteSearchOptions, SearchHandle, SearchHit, SearchO
 
 use crate::components::interactive::hover_bg;
 use crate::components::TextInput;
-use crate::components::{animated_icon_sized, icon, icon_for, IconMotion, IconName};
+use crate::components::{animated_icon_sized, icon, icon_for, resolved_icon, IconMotion, IconName};
 use crate::motion::{
     color_lerp, is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker,
     INSTANT, QUICK,
@@ -126,6 +126,9 @@ impl SearchView {
                 }
             }
             this.stop_for_location_change(&current_loc, cx);
+            if this.is_active {
+                cx.notify();
+            }
         });
 
         Self {
@@ -484,12 +487,14 @@ impl Render for SearchView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
         let now = Instant::now();
-        let (is_remote, max_depth, reduced) = {
+        let (is_remote, max_depth, reduced, icon_prefs, icon_resolver) = {
             let state = self.app_state.read(cx);
             (
                 matches!(state.current_location(), Location::Remote { .. }),
                 state.settings.remote_search_depth.max(1),
                 is_reduced_motion(state.settings.motion_preference),
+                state.icon_config.active.clone(),
+                state.icon_resolver.clone(),
             )
         };
 
@@ -632,7 +637,14 @@ impl Render for SearchView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(icon(hit_icon).text_color(theme.text))
+                            .child(resolved_icon(
+                                hit_icon,
+                                IconMotion::Rest,
+                                size::ICON,
+                                theme.text,
+                                &icon_prefs,
+                                &icon_resolver,
+                            ))
                             .child(
                                 div()
                                     .text_color(theme.text)

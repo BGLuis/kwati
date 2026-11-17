@@ -8,6 +8,7 @@ remote-tests = []
 
 [dependencies]
 dirs = "7.0.0"
+freedesktop-icons = "0.4.0"
 ignore = "0.4.34"
 keyring-core = "1.0.1"
 notify = "8.2.2"

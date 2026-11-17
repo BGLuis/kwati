@@ -9,10 +9,11 @@ use std::borrow::Cow;
 use std::f32::consts::{PI, TAU};
 
 use gpui::{
-    canvas, div, point, px, radians, svg, AnyElement, AssetSource, Bounds, Hsla, IntoElement,
+    canvas, div, img, point, px, radians, svg, AnyElement, AssetSource, Bounds, Hsla, IntoElement,
     ParentElement, PathBuilder, Pixels, Point, Result, SharedString, Size, Styled, Svg,
     Transformation, Window,
 };
+use kwati_core::{IconPreferences, IconResolver, ResolvedIcon};
 
 use crate::motion::Curve;
 use crate::tokens::size;
@@ -634,11 +635,55 @@ fn draw_network_canvas(icon_size: Pixels, color: Hsla, progress: f32) -> AnyElem
     .into_any_element()
 }
 
+/// Renders an icon driven by `motion` at an explicit square size using `color`, or loads a
+/// custom theme/image icon when configured in `prefs`.
+///
+/// Built-in icons and `-symbolic` SVGs are tinted with `color`; full-colour theme/custom images
+/// are rendered via `img(path)`.
+pub fn resolved_icon(
+    builtin: IconName,
+    motion: IconMotion,
+    icon_size: Pixels,
+    color: impl Into<Hsla>,
+    prefs: &IconPreferences,
+    resolver: &IconResolver,
+) -> AnyElement {
+    let color = color.into();
+    let size_px = (icon_size / px(1.0)).round().max(1.0) as u16;
+    match resolver.resolve(prefs, builtin.key_name(), size_px) {
+        ResolvedIcon::BuiltIn => animated_icon_sized(builtin, motion, icon_size, color),
+        ResolvedIcon::Image { path, is_symbolic } => {
+            if is_symbolic {
+                svg()
+                    .path(format!("fs-symbolic:{}", path.display()))
+                    .size(icon_size)
+                    .flex_none()
+                    .text_color(color)
+                    .into_any_element()
+            } else {
+                img(path).size(icon_size).flex_none().into_any_element()
+            }
+        }
+    }
+}
+
 /// The app's bundled assets, registered with `Application::with_assets`.
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(fs_path) = path.strip_prefix("fs-symbolic:") {
+            let p = std::path::Path::new(fs_path);
+            if p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+            {
+                if let Ok(bytes) = std::fs::read(p) {
+                    return Ok(Some(Cow::Owned(bytes)));
+                }
+            }
+            return Ok(None);
+        }
         if let Some(found) = IconName::ALL.iter().find(|name| name.path() == path) {
             return Ok(Some(Cow::Borrowed(found.svg())));
         }

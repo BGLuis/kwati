@@ -20,8 +20,7 @@ use crate::actions::navigation::{
 use crate::actions::operations::get_location_clipboard;
 use crate::components::interactive::focus_ring_color;
 use crate::components::{
-    animated_icon_sized, icon_for_with, Ellipsize, IconMotion, IconName, ScrollbarState,
-    SpecialFolders,
+    icon_for_with, resolved_icon, Ellipsize, IconMotion, IconName, ScrollbarState, SpecialFolders,
 };
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
@@ -180,6 +179,7 @@ impl Focusable for ListView {
 
 impl ListView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
         let (initial_rev, initial_loc, initial_entries) = {
             let state = app_state.read(cx);
             let cur = state.current_location.clone();
@@ -844,6 +844,8 @@ impl Render for ListView {
             show_hidden,
             reduced,
             focused_location,
+            icon_prefs,
+            icon_resolver,
         ) = {
             let state: &AppState = self.app_state.read(cx);
             let r = is_reduced_motion(state.settings.motion_preference);
@@ -862,6 +864,8 @@ impl Render for ListView {
                         .and_then(|ix| state.entries.get(ix))
                         .map(|e| entry_location(&state.current_location, e))
                 }),
+                state.icon_config.active.clone(),
+                state.icon_resolver.clone(),
             )
         };
         let entry_count = entries.len();
@@ -1000,11 +1004,13 @@ impl Render for ListView {
                             .flex()
                             .items_center()
                             .gap(space::S8)
-                            .child(animated_icon_sized(
+                            .child(resolved_icon(
                                 glyph,
                                 IconMotion::Rest,
                                 size::ICON,
                                 glyph_col,
+                                &icon_prefs,
+                                &icon_resolver,
                             ))
                             .child(div().ellipsize().child(ex.name.clone())),
                     )
@@ -1562,7 +1568,7 @@ impl Render for ListView {
                                                                 .flex()
                                                                 .items_center()
                                                                 .gap(space::S8)
-                                                                .child(animated_icon_sized(
+                                                                .child(resolved_icon(
                                                                     icon_for_with(
                                                                         &entry.path,
                                                                         is_dir,
@@ -1579,6 +1585,8 @@ impl Render for ListView {
                                                                     } else {
                                                                         row_text
                                                                     },
+                                                                    &icon_prefs,
+                                                                    &icon_resolver,
                                                                 ))
                                                                 .child(div().ellipsize().child(name)),
                                                         )
