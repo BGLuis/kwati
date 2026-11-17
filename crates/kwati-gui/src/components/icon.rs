@@ -27,6 +27,19 @@ macro_rules! icons {
         impl IconName {
             pub const ALL: &'static [IconName] = &[$(IconName::$variant),+];
 
+            pub const fn key_name(self) -> &'static str {
+                match self {
+                    $(IconName::$variant => $file),+
+                }
+            }
+
+            pub fn from_key_name(key: &str) -> Option<IconName> {
+                match key {
+                    $($file => Some(IconName::$variant),)+
+                    _ => None,
+                }
+            }
+
             pub fn path(self) -> &'static str {
                 match self {
                     $(IconName::$variant => concat!("icons/", $file, ".svg")),+
@@ -79,7 +92,43 @@ icons! {
     Drive => "drive",
     Eject => "eject",
     File => "file",
+    FileArchive => "file-archive",
+    FileAudio => "file-audio",
+    FileBinary => "file-binary",
+    FileCode => "file-code",
+    FileConfig => "file-config",
+    FileData => "file-data",
+    FileDatabase => "file-database",
+    FileDiskImage => "file-disk-image",
+    FileDocument => "file-document",
+    FileEbook => "file-ebook",
+    FileFont => "file-font",
+    FileImage => "file-image",
+    FileKey => "file-key",
+    FileLog => "file-log",
+    FileMarkdown => "file-markdown",
+    FilePackage => "file-package",
+    FilePartial => "file-partial",
+    FilePdf => "file-pdf",
+    FilePresentation => "file-presentation",
+    FileScript => "file-script",
+    FileSpreadsheet => "file-spreadsheet",
+    FileSymlink => "file-symlink",
+    FileText => "file-text",
+    FileVector => "file-vector",
+    FileVideo => "file-video",
+    FileWeb => "file-web",
     Folder => "folder",
+    FolderDesktop => "folder-desktop",
+    FolderDocuments => "folder-documents",
+    FolderDownloads => "folder-downloads",
+    FolderHome => "folder-home",
+    FolderMusic => "folder-music",
+    FolderNetwork => "folder-network",
+    FolderPictures => "folder-pictures",
+    FolderProjects => "folder-projects",
+    FolderPublic => "folder-public",
+    FolderVideos => "folder-videos",
     Home => "home",
     Image => "image",
     Network => "network",
@@ -96,14 +145,118 @@ icons! {
 icon_parts! {
     FolderBack => "folder-back",
     FolderFlap => "folder-flap",
+    FolderDesktopMark => "folder-desktop-mark",
+    FolderDocumentsMark => "folder-documents-mark",
+    FolderDownloadsMark => "folder-downloads-mark",
+    FolderHomeMark => "folder-home-mark",
+    FolderMusicMark => "folder-music-mark",
+    FolderNetworkMark => "folder-network-mark",
+    FolderPicturesMark => "folder-pictures-mark",
+    FolderProjectsMark => "folder-projects-mark",
+    FolderPublicMark => "folder-public-mark",
+    FolderVideosMark => "folder-videos-mark",
     FileBody => "file-body",
     FileCorner => "file-corner",
+    FileArchiveMark => "file-archive-mark",
+    FileAudioMark => "file-audio-mark",
+    FileBinaryMark => "file-binary-mark",
+    FileCodeMark => "file-code-mark",
+    FileConfigMark => "file-config-mark",
+    FileDataMark => "file-data-mark",
+    FileDatabaseMark => "file-database-mark",
+    FileDiskImageMark => "file-disk-image-mark",
+    FileDocumentMark => "file-document-mark",
+    FileEbookMark => "file-ebook-mark",
+    FileFontMark => "file-font-mark",
+    FileImageMark => "file-image-mark",
+    FileKeyMark => "file-key-mark",
+    FileLogMark => "file-log-mark",
+    FileMarkdownMark => "file-markdown-mark",
+    FilePackageMark => "file-package-mark",
+    FilePartialMark => "file-partial-mark",
+    FilePdfMark => "file-pdf-mark",
+    FilePresentationMark => "file-presentation-mark",
+    FileScriptMark => "file-script-mark",
+    FileSpreadsheetMark => "file-spreadsheet-mark",
+    FileSymlinkMark => "file-symlink-mark",
+    FileTextMark => "file-text-mark",
+    FileVectorMark => "file-vector-mark",
+    FileVideoMark => "file-video-mark",
+    FileWebMark => "file-web-mark",
     TrashBody => "trash-body",
     TrashLid => "trash-lid",
     CopyBack => "copy-back",
     CopyFront => "copy-front",
     EjectBar => "eject-bar",
     EjectTriangle => "eject-triangle",
+}
+
+impl IconName {
+    /// Returns `true` for the plain folder and all special folder icons (`folder-*`).
+    pub const fn is_folder(self) -> bool {
+        matches!(
+            self,
+            Self::Folder
+                | Self::FolderDesktop
+                | Self::FolderDocuments
+                | Self::FolderDownloads
+                | Self::FolderHome
+                | Self::FolderMusic
+                | Self::FolderNetwork
+                | Self::FolderPictures
+                | Self::FolderProjects
+                | Self::FolderPublic
+                | Self::FolderVideos
+        )
+    }
+
+    const fn folder_mark_part(self) -> Option<IconPart> {
+        match self {
+            Self::FolderDesktop => Some(IconPart::FolderDesktopMark),
+            Self::FolderDocuments => Some(IconPart::FolderDocumentsMark),
+            Self::FolderDownloads => Some(IconPart::FolderDownloadsMark),
+            Self::FolderHome => Some(IconPart::FolderHomeMark),
+            Self::FolderMusic => Some(IconPart::FolderMusicMark),
+            Self::FolderNetwork => Some(IconPart::FolderNetworkMark),
+            Self::FolderPictures => Some(IconPart::FolderPicturesMark),
+            Self::FolderProjects => Some(IconPart::FolderProjectsMark),
+            Self::FolderPublic => Some(IconPart::FolderPublicMark),
+            Self::FolderVideos => Some(IconPart::FolderVideosMark),
+            _ => None,
+        }
+    }
+
+    const fn file_mark_part(self) -> Option<IconPart> {
+        match self {
+            Self::FileArchive => Some(IconPart::FileArchiveMark),
+            Self::FileAudio => Some(IconPart::FileAudioMark),
+            Self::FileBinary => Some(IconPart::FileBinaryMark),
+            Self::FileCode => Some(IconPart::FileCodeMark),
+            Self::FileConfig => Some(IconPart::FileConfigMark),
+            Self::FileData => Some(IconPart::FileDataMark),
+            Self::FileDatabase => Some(IconPart::FileDatabaseMark),
+            Self::FileDiskImage => Some(IconPart::FileDiskImageMark),
+            Self::FileDocument => Some(IconPart::FileDocumentMark),
+            Self::FileEbook => Some(IconPart::FileEbookMark),
+            Self::FileFont => Some(IconPart::FileFontMark),
+            Self::FileImage => Some(IconPart::FileImageMark),
+            Self::FileKey => Some(IconPart::FileKeyMark),
+            Self::FileLog => Some(IconPart::FileLogMark),
+            Self::FileMarkdown => Some(IconPart::FileMarkdownMark),
+            Self::FilePackage => Some(IconPart::FilePackageMark),
+            Self::FilePartial => Some(IconPart::FilePartialMark),
+            Self::FilePdf => Some(IconPart::FilePdfMark),
+            Self::FilePresentation => Some(IconPart::FilePresentationMark),
+            Self::FileScript => Some(IconPart::FileScriptMark),
+            Self::FileSpreadsheet => Some(IconPart::FileSpreadsheetMark),
+            Self::FileSymlink => Some(IconPart::FileSymlinkMark),
+            Self::FileText => Some(IconPart::FileTextMark),
+            Self::FileVector => Some(IconPart::FileVectorMark),
+            Self::FileVideo => Some(IconPart::FileVideoMark),
+            Self::FileWeb => Some(IconPart::FileWebMark),
+            _ => None,
+        }
+    }
 }
 
 /// Instantaneous normalized progress (`0.0` at rest, `1.0` peak/complete) driving an animated icon.
@@ -203,6 +356,22 @@ pub fn animated_icon_sized(
                 ),
             ],
         ),
+        name if name.folder_mark_part().is_some() && f.abs() > 1e-3 => {
+            let mark = name.folder_mark_part().expect("checked above");
+            layered_parts(
+                icon_size,
+                color,
+                [
+                    (IconPart::FolderBack, Transformation::default()),
+                    (
+                        IconPart::FolderFlap,
+                        Transformation::scale(Size::new(1.0, (1.0 - 0.24 * f).max(0.6)))
+                            .with_translation(point(px(0.0), px(1.1 * f))),
+                    ),
+                    (mark, Transformation::default()),
+                ],
+            )
+        }
         IconName::File if f.abs() > 1e-3 => layered_parts(
             icon_size,
             color,
@@ -215,6 +384,22 @@ pub fn animated_icon_sized(
                 ),
             ],
         ),
+        name if name.file_mark_part().is_some() && f.abs() > 1e-3 => {
+            let mark = name.file_mark_part().expect("checked above");
+            layered_parts(
+                icon_size,
+                color,
+                [
+                    (IconPart::FileBody, Transformation::default()),
+                    (
+                        IconPart::FileCorner,
+                        Transformation::scale(Size::new(1.0 + 0.1 * f, 1.0 + 0.1 * f))
+                            .with_translation(point(px(0.8 * f), px(-0.8 * f))),
+                    ),
+                    (mark, Transformation::default()),
+                ],
+            )
+        }
         IconName::Trash if f.abs() > 1e-3 => layered_parts(
             icon_size,
             color,

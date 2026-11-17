@@ -19,7 +19,10 @@ use crate::actions::navigation::{
 };
 use crate::actions::operations::get_location_clipboard;
 use crate::components::interactive::focus_ring_color;
-use crate::components::{animated_icon_sized, Ellipsize, IconMotion, IconName, ScrollbarState};
+use crate::components::{
+    animated_icon_sized, icon_for_with, Ellipsize, IconMotion, IconName, ScrollbarState,
+    SpecialFolders,
+};
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
     MotionTracker, DELETE_THROW, DELETE_THROW_PX, INSTANT, LIST_CASCADE_CAP, LIST_CASCADE_STEP,
@@ -122,6 +125,7 @@ enum ListMotionKey {
 #[derive(Clone, Debug)]
 struct ExitingRow {
     name: String,
+    icon: IconName,
     is_dir: bool,
     is_hidden: bool,
     size_str: String,
@@ -743,6 +747,7 @@ impl ListView {
                     {
                         self.exiting_rows.push(ExitingRow {
                             name: entry.display_name(),
+                            icon: crate::components::icon_for(&entry.path, entry.is_dir()),
                             is_dir: entry.is_dir(),
                             is_hidden: entry.is_hidden,
                             size_str: format_size(entry.size, entry.is_dir()),
@@ -930,6 +935,7 @@ impl Render for ListView {
         ];
 
         let entries_clone = entries;
+        let special_folders = SpecialFolders::from_system();
         let (row_selected, row_hover, row_text, row_muted, row_accent) = (
             theme.selection,
             theme.surface_raised,
@@ -963,11 +969,7 @@ impl Render for ListView {
                 let scroll_shift_px =
                     (self.exiting_scroll_top as isize - current_top as isize) as f32 * row_h_px;
                 let top_px = ex.top_px + scroll_shift_px;
-                let glyph = if ex.is_dir {
-                    IconName::Folder
-                } else {
-                    IconName::File
-                };
+                let glyph = ex.icon;
                 let glyph_col = if ex.is_dir {
                     row_accent
                 } else if ex.is_hidden {
@@ -1561,11 +1563,11 @@ impl Render for ListView {
                                                                 .items_center()
                                                                 .gap(space::S8)
                                                                 .child(animated_icon_sized(
-                                                                    if is_dir {
-                                                                        IconName::Folder
-                                                                    } else {
-                                                                        IconName::File
-                                                                    },
+                                                                    icon_for_with(
+                                                                        &entry.path,
+                                                                        is_dir,
+                                                                        &special_folders,
+                                                                    ),
                                                                     icon_motion,
                                                                     size::ICON * icon_scale,
                                                                     if is_dir {

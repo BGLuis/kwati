@@ -15,7 +15,7 @@ use gpui::{
 use kwati_core::preview::{read_preview, Preview};
 use kwati_core::{Entry, Location};
 
-use crate::components::{icon, IconName};
+use crate::components::{icon, icon_for, IconName};
 use crate::state::{AppState, PreviewData, PreviewKind};
 use crate::theme::Theme;
 use crate::tokens::{Fonts, DATA_SIZE};
@@ -521,6 +521,9 @@ impl Render for PreviewView {
             .as_ref()
             .map(|m| m.kind_label.clone())
             .unwrap_or_else(|| "File".to_string());
+        let is_dir = self.metadata.as_ref().is_some_and(|m| m.is_dir);
+        let header_icon = icon_for(&preview_path, is_dir);
+        let header_icon_color = if is_dir { theme.accent } else { theme.text };
 
         div()
             .size_full()
@@ -543,11 +546,21 @@ impl Render for PreviewView {
                     .border_color(theme.border)
                     .child(
                         div()
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .overflow_hidden()
-                            .child(file_name),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .child(icon(header_icon).text_color(header_icon_color))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .overflow_hidden()
+                                    .child(file_name),
+                            ),
                     )
                     .child(
                         div()
@@ -641,7 +654,11 @@ impl Render for PreviewView {
                     .p_4()
                     .rounded_md()
                     .bg(theme.surface)
-                    .child(icon(IconName::File).text_color(theme.text_muted))
+                    .child(icon(header_icon).text_color(if is_dir {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    }))
                     .child(
                         div()
                             .text_size(px(13.))

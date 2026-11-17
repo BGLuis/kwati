@@ -11,11 +11,14 @@ use gpui::{
     div, prelude::*, px, transparent_black, AnyElement, Context, Div, Entity, FontWeight,
     KeyDownEvent, MouseButton, MouseDownEvent, Stateful, Subscription, Task, Window,
 };
-use kwati_core::{device_volumes, network_mounts, ConnectionState, Location, NetworkMount, Volume};
+use kwati_core::{
+    device_volumes, network_mounts, ConnectionState, Location, NetworkMount, PlaceKind, Volume,
+};
 
 use crate::actions::ManageServers;
 use crate::components::{
-    animated_icon_sized, icon, Ellipsize, IconMotion, IconName, TextInput, Tooltip,
+    animated_icon_sized, icon, icon_for_with, Ellipsize, IconMotion, IconName, SpecialFolders,
+    TextInput, Tooltip,
 };
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
@@ -78,41 +81,25 @@ pub fn system_home_dir() -> Option<PathBuf> {
 
 /// Returns standard operating system places that exist on the filesystem.
 pub fn standard_places() -> Vec<SidebarPlace> {
-    let mut places = Vec::new();
-
-    if let Some(home) = system_home_dir() {
-        places.push(SidebarPlace::new("Home", home.clone(), IconName::Home));
-
-        let desktop = home.join("Desktop");
-        if desktop.exists() {
-            places.push(SidebarPlace::new("Desktop", desktop, IconName::Folder));
-        }
-
-        let documents = home.join("Documents");
-        if documents.exists() {
-            places.push(SidebarPlace::new("Documents", documents, IconName::Folder));
-        }
-
-        let downloads = home.join("Downloads");
-        if downloads.exists() {
-            places.push(SidebarPlace::new("Downloads", downloads, IconName::Folder));
-        }
-
-        let pictures = home.join("Pictures");
-        if pictures.exists() {
-            places.push(SidebarPlace::new("Pictures", pictures, IconName::Image));
-        }
-
-        let music = home.join("Music");
-        if music.exists() {
-            places.push(SidebarPlace::new("Music", music, IconName::Folder));
-        }
-
-        let videos = home.join("Videos");
-        if videos.exists() {
-            places.push(SidebarPlace::new("Videos", videos, IconName::Folder));
-        }
-    }
+    let specials = SpecialFolders::from_system();
+    let mut places: Vec<SidebarPlace> = kwati_core::standard_places()
+        .into_iter()
+        .map(|place| {
+            let icon = match icon_for_with(&place.path, true, &specials) {
+                IconName::Folder => match place.kind {
+                    PlaceKind::Home => IconName::FolderHome,
+                    PlaceKind::Desktop => IconName::FolderDesktop,
+                    PlaceKind::Documents => IconName::FolderDocuments,
+                    PlaceKind::Downloads => IconName::FolderDownloads,
+                    PlaceKind::Music => IconName::FolderMusic,
+                    PlaceKind::Pictures => IconName::FolderPictures,
+                    PlaceKind::Videos => IconName::FolderVideos,
+                },
+                resolved => resolved,
+            };
+            SidebarPlace::new(place.name, place.path, icon)
+        })
+        .collect();
 
     if places.is_empty() {
         places.push(SidebarPlace::new(
@@ -933,6 +920,7 @@ impl SidebarView {
         let bookmarks = self.bookmarks.clone();
         let volumes = self.volumes.clone();
         let network = self.network.clone();
+        let specials = SpecialFolders::from_system();
 
         let place_rows: Vec<_> = places
             .iter()
@@ -952,19 +940,17 @@ impl SidebarView {
                 } else {
                     lerp_f32(1.0, PRESS_SCALE, press_t)
                 };
-                let color = if place.icon == IconName::Folder {
+                let color = if place.icon.is_folder() {
                     theme.accent
                 } else {
                     theme.text
                 };
-                let glyph_motion = if !reduced
-                    && place.icon == IconName::Folder
-                    && (is_active || hover_t > 0.01)
-                {
-                    IconMotion::State(if is_active { 1.0 } else { hover_t })
-                } else {
-                    IconMotion::Rest
-                };
+                let glyph_motion =
+                    if !reduced && place.icon.is_folder() && (is_active || hover_t > 0.01) {
+                        IconMotion::State(if is_active { 1.0 } else { hover_t })
+                    } else {
+                        IconMotion::Rest
+                    };
                 div()
                     .id(("place", ix))
                     .h(size::SIDEBAR_ROW)
@@ -1028,16 +1014,18 @@ impl SidebarView {
                         format!("{} (missing)", bm.name),
                     )
                 } else {
-                    (IconName::Folder, theme.accent, bm.name.clone())
+                    (
+                        icon_for_with(&bm.path, true, &specials),
+                        theme.accent,
+                        bm.name.clone(),
+                    )
                 };
-                let glyph_motion = if !reduced
-                    && glyph_name == IconName::Folder
-                    && (is_active || hover_t > 0.01)
-                {
-                    IconMotion::State(if is_active { 1.0 } else { hover_t })
-                } else {
-                    IconMotion::Rest
-                };
+                let glyph_motion =
+                    if !reduced && glyph_name.is_folder() && (is_active || hover_t > 0.01) {
+                        IconMotion::State(if is_active { 1.0 } else { hover_t })
+                    } else {
+                        IconMotion::Rest
+                    };
                 div()
                     .id(("bookmark", ix))
                     .h(size::SIDEBAR_ROW)
@@ -1196,10 +1184,10 @@ impl SidebarView {
                         cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
                     )
                     .child(animated_icon_sized(
-                        IconName::Network,
+                        IconName::FolderNetwork,
                         IconMotion::Rest,
                         size::ICON * scale,
-                        theme.text,
+                        theme.accent,
                     ))
             })
             .collect();
@@ -1377,6 +1365,7 @@ impl Render for SidebarView {
         let bookmarks = self.bookmarks.clone();
         let volumes = self.volumes.clone();
         let network = self.network.clone();
+        let specials = SpecialFolders::from_system();
         let drive_details = self.drive_details;
         let editing_bookmark = self.editing_bookmark;
         let (current_loc, servers, reduced) = {
@@ -1408,15 +1397,13 @@ impl Render for SidebarView {
                 } else {
                     lerp_f32(1.0, PRESS_SCALE, press_t)
                 };
-                let icon_motion = if !reduced
-                    && place.icon == IconName::Folder
-                    && (is_active || hover_t > 0.01)
-                {
-                    IconMotion::State(if is_active { 1.0 } else { hover_t })
-                } else {
-                    IconMotion::Rest
-                };
-                let color = if place.icon == IconName::Folder {
+                let icon_motion =
+                    if !reduced && place.icon.is_folder() && (is_active || hover_t > 0.01) {
+                        IconMotion::State(if is_active { 1.0 } else { hover_t })
+                    } else {
+                        IconMotion::Rest
+                    };
+                let color = if place.icon.is_folder() {
                     theme.accent
                 } else {
                     theme.text
@@ -1555,7 +1542,7 @@ impl Render for SidebarView {
                                 )
                             } else {
                                 animated_icon_sized(
-                                    IconName::Folder,
+                                    icon_for_with(&bm.path, true, &specials),
                                     folder_motion,
                                     size::ICON * scale,
                                     theme.accent,
@@ -1935,10 +1922,10 @@ impl Render for SidebarView {
                         this.set_hover(key, *hovered, cx);
                     }))
                     .child(animated_icon_sized(
-                        IconName::Network,
+                        IconName::FolderNetwork,
                         IconMotion::Rest,
                         size::ICON * scale,
-                        theme.text,
+                        theme.accent,
                     ))
                     .child(div().ellipsize().child(share.name.clone()))
                     .on_mouse_down(
