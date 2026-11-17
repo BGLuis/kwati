@@ -32,6 +32,15 @@ pub struct SettingsWarning {
     pub message: String,
 }
 
+/// Reduced-motion preference: follow OS, force full motion, or force reduced motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MotionPreference {
+    #[default]
+    System,
+    Full,
+    Reduced,
+}
+
 /// User settings. Features add their own options here, each with a default.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -47,6 +56,7 @@ pub struct Settings {
     pub remote_search_depth: u32,
     /// Listing requests a remote search may have in flight at once; at least 1.
     pub remote_search_parallel: u32,
+    pub motion_preference: MotionPreference,
     pub bookmarks: Vec<Bookmark>,
     /// Keys this version does not know, kept so a newer version's file survives a save.
     unknown: Table,
@@ -64,6 +74,7 @@ impl Default for Settings {
             remote_poll_interval_secs: DEFAULT_REMOTE_POLL_INTERVAL_SECS,
             remote_search_depth: DEFAULT_REMOTE_SEARCH_DEPTH,
             remote_search_parallel: DEFAULT_REMOTE_SEARCH_PARALLEL,
+            motion_preference: MotionPreference::default(),
             bookmarks: Vec::new(),
             unknown: Table::new(),
         }
@@ -178,6 +189,52 @@ fn sort_direction_str(direction: SortDirection) -> &'static str {
     match direction {
         SortDirection::Ascending => "ascending",
         SortDirection::Descending => "descending",
+    }
+}
+
+fn parse_motion_preference(raw: &str) -> Option<MotionPreference> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "system" | "auto" => Some(MotionPreference::System),
+        "full" | "enabled" => Some(MotionPreference::Full),
+        "reduced" | "off" => Some(MotionPreference::Reduced),
+        _ => None,
+    }
+}
+
+fn motion_preference_str(pref: MotionPreference) -> &'static str {
+    match pref {
+        MotionPreference::System => "system",
+        MotionPreference::Full => "full",
+        MotionPreference::Reduced => "reduced",
+    }
+}
+
+fn take_motion_preference_or_default(
+    table: &mut Table,
+    default: MotionPreference,
+    warnings: &mut Vec<SettingsWarning>,
+) -> MotionPreference {
+    let Some(value) = table.remove("motion_preference") else {
+        return default;
+    };
+    match value {
+        Value::String(raw) => match parse_motion_preference(&raw) {
+            Some(pref) => pref,
+            None => {
+                warnings.push(SettingsWarning {
+                    key: "motion_preference",
+                    message: format!("unknown motion_preference '{raw}'"),
+                });
+                default
+            }
+        },
+        _ => {
+            warnings.push(SettingsWarning {
+                key: "motion_preference",
+                message: "motion_preference must be a string".into(),
+            });
+            default
+        }
     }
 }
 
@@ -419,6 +476,11 @@ impl Settings {
             defaults.remote_search_parallel,
             &mut warnings,
         );
+        let motion_preference = take_motion_preference_or_default(
+            &mut table,
+            defaults.motion_preference,
+            &mut warnings,
+        );
 
         let mut bookmarks = Vec::new();
         if let Some(val) = table.remove("bookmarks") {
@@ -472,6 +534,7 @@ impl Settings {
             remote_poll_interval_secs,
             remote_search_depth,
             remote_search_parallel,
+            motion_preference,
             bookmarks,
             unknown: table,
         };
@@ -578,6 +641,10 @@ impl Settings {
         table.insert(
             "remote_search_parallel".into(),
             Value::Integer(self.remote_search_parallel.into()),
+        );
+        table.insert(
+            "motion_preference".into(),
+            Value::String(motion_preference_str(self.motion_preference).into()),
         );
         let bookmark_tables: Vec<Value> = self
             .bookmarks
@@ -865,5 +932,26 @@ mod tests {
         assert!(s.set_remote_search_parallel(4).is_ok());
 
         assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn settings_motion_preference_roundtrip_and_invalid_warning() {
+        let dir = TestDir::new("settings_motion_preference");
+        let path = dir.path.join("settings.toml");
+
+        let mut s = Settings::default();
+        assert_eq!(s.motion_preference, MotionPreference::System);
+        s.motion_preference = MotionPreference::Reduced;
+        s.save_to(&path).unwrap();
+
+        let (loaded, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(loaded.motion_preference, MotionPreference::Reduced);
+
+        fs::write(&path, "motion_preference = \"bogus\"\n").unwrap();
+        let (fallback, warnings) = Settings::load_from(&path).unwrap();
+        assert_eq!(fallback.motion_preference, MotionPreference::System);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].key, "motion_preference");
     }
 }

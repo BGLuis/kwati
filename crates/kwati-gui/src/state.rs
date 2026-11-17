@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::channel::mpsc;
 use futures::StreamExt;
@@ -14,6 +14,7 @@ use kwati_core::{
 };
 
 use crate::layout::PanelLayout;
+use crate::motion::{set_active_motion_preference, JOB_COMPLETE_HOLD, QUICK};
 use crate::remote::{start_location, RemoteSessions};
 
 /// A question the user must answer before a connection can go on.
@@ -62,6 +63,34 @@ pub enum JobKind {
     Move,
     Delete,
     Trash,
+}
+
+/// Completed background job kept briefly for the `secondary` completion pulse and 1s fade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedJob {
+    pub id: u64,
+    pub title: String,
+    pub kind: JobKind,
+    pub completed_at: Instant,
+}
+
+/// Direction of navigation for list entrance transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NavigationDirection {
+    #[default]
+    Initial,
+    Visit,
+    Back,
+    Forward,
+    Reload,
+}
+
+/// Distinguishes direct user modifications from watcher or remote polling updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EntryChangeOrigin {
+    #[default]
+    UserAction,
+    WatcherOrPoll,
 }
 
 /// Status of an active background file operation (owned by guiops-worker).
@@ -211,17 +240,27 @@ pub struct AppState {
     pub settings: Settings,
     pub settings_open: bool,
     pub settings_warnings: Vec<SettingsWarning>,
-    pub active_jobs: Vec<JobStatus>,        // Owned by guiops-worker
+    pub active_jobs: Vec<JobStatus>, // Owned by guiops-worker
+    pub completed_jobs: Vec<CompletedJob>,
     pub undo_stack: UndoStack,              // Owned by guiops-worker
     pub preview_state: Option<PreviewData>, // Owned by inspect-worker
     pub search_query: Option<String>,       // Owned by inspect-worker
     pub network_status: NetworkMountStatus, // Owned by guinet-worker
+    pub connecting_since: Option<Instant>,
     pub remote: RemoteSessions,
     /// Set when a connection needs an answer; the remote dialogs take it.
     pub remote_prompt: Option<RemotePrompt>,
     /// The profile being connected, while the attempt runs.
     pub connecting: Option<String>,
     pub status_message: Option<String>,
+    pub status_revision: u64,
+    pub status_is_completion: bool,
+    pub listing_revision: u64,
+    pub last_arrival: NavigationDirection,
+    pub last_change_origin: EntryChangeOrigin,
+    pending_change_origin: EntryChangeOrigin,
+    pub highlighted_inserts: Vec<(Location, Instant)>,
+    pub recent_deletions: Vec<(Location, Instant)>,
     pub sort_column: SortColumn,
     pub sort_direction: SortDirection,
     pub show_hidden: bool,
@@ -243,23 +282,35 @@ pub struct AppState {
 impl AppState {
     /// Creates an isolated in-memory state suitable for headless tests (no disk config/keyring I/O).
     pub fn new(initial_location: Location) -> Self {
+        let settings = Settings::default();
+        set_active_motion_preference(settings.motion_preference);
         Self {
             history: History::with_initial(initial_location.clone()),
             current_location: initial_location,
             entries: Arc::new(Vec::new()),
             selection: Selection::new(),
-            settings: Settings::default(),
+            settings,
             settings_open: false,
             settings_warnings: Vec::new(),
             active_jobs: Vec::new(),
+            completed_jobs: Vec::new(),
             undo_stack: UndoStack::new(),
             preview_state: None,
             search_query: None,
             network_status: NetworkMountStatus::Disconnected,
+            connecting_since: None,
             remote: RemoteSessions::in_memory(),
             remote_prompt: None,
             connecting: None,
             status_message: None,
+            status_revision: 0,
+            status_is_completion: false,
+            listing_revision: 0,
+            last_arrival: NavigationDirection::Initial,
+            last_change_origin: EntryChangeOrigin::UserAction,
+            pending_change_origin: EntryChangeOrigin::UserAction,
+            highlighted_inserts: Vec::new(),
+            recent_deletions: Vec::new(),
             sort_column: SortColumn::Name,
             sort_direction: SortDirection::Ascending,
             show_hidden: false,
@@ -302,6 +353,7 @@ impl AppState {
         self.show_hidden = settings.show_hidden;
         self.sort_column = settings.default_sort.column;
         self.sort_direction = settings.default_sort.direction;
+        set_active_motion_preference(settings.motion_preference);
         self.settings = settings;
         self.settings_warnings = warnings;
     }
@@ -352,6 +404,7 @@ impl AppState {
             next.save_to(path)
                 .map_err(|err| format!("Cannot save settings: {err}"))?;
         }
+        set_active_motion_preference(next.motion_preference);
         self.settings = next;
         Ok(())
     }
@@ -491,6 +544,13 @@ impl AppState {
     /// Reloads the entries of the current location using current sort and hidden options,
     /// preserving selection by `Location`.
     pub fn reload_entries(&mut self) {
+        self.pending_change_origin = EntryChangeOrigin::UserAction;
+        self.begin_load(self.current_location.clone(), Arrival::Reload);
+    }
+
+    /// Reloads from a filesystem watcher or background remote poll (no accent insert flash).
+    pub fn reload_entries_from_background(&mut self) {
+        self.pending_change_origin = EntryChangeOrigin::WatcherOrPoll;
         self.begin_load(self.current_location.clone(), Arrival::Reload);
     }
 
@@ -585,7 +645,7 @@ impl AppState {
         };
 
         if self.foreground.is_some() && is_network {
-            self.network_status = NetworkMountStatus::Connecting;
+            self.set_network_status(NetworkMountStatus::Connecting);
         }
 
         let Some(foreground) = &self.foreground else {
@@ -609,8 +669,16 @@ impl AppState {
 
     fn finish_load(&mut self, target: Location, arrival: Arrival, result: io::Result<Vec<Entry>>) {
         self.pending_navigation = None;
+        let origin = std::mem::take(&mut self.pending_change_origin);
         match result {
             Ok(entries) => {
+                self.last_arrival = match arrival {
+                    Arrival::Visit => NavigationDirection::Visit,
+                    Arrival::Back => NavigationDirection::Back,
+                    Arrival::Forward => NavigationDirection::Forward,
+                    Arrival::Reload => NavigationDirection::Reload,
+                };
+                self.last_change_origin = origin;
                 self.arrive(target, arrival);
                 self.set_entries(entries);
                 self.sync_network_status();
@@ -621,19 +689,12 @@ impl AppState {
             Err(err) => {
                 self.read_failure_shown = true;
                 self.set_status(format!("Cannot open {}: {err}", target.path().display()));
-                match err.kind() {
-                    io::ErrorKind::TimedOut => {
-                        self.network_status = NetworkMountStatus::TimedOut;
-                    }
-                    io::ErrorKind::ResourceBusy => {
-                        self.network_status = NetworkMountStatus::MountBusy;
-                    }
-                    _ if is_network_location(&target) => {
-                        self.network_status = match &target {
-                            Location::Remote { profile_id, .. } => match self
-                                .remote
-                                .state(profile_id)
-                            {
+                let next_net = match err.kind() {
+                    io::ErrorKind::TimedOut => Some(NetworkMountStatus::TimedOut),
+                    io::ErrorKind::ResourceBusy => Some(NetworkMountStatus::MountBusy),
+                    _ if is_network_location(&target) => Some(match &target {
+                        Location::Remote { profile_id, .. } => {
+                            match self.remote.state(profile_id) {
                                 Some(ConnectionState::Connected) => NetworkMountStatus::Connected,
                                 Some(ConnectionState::Reconnecting) => {
                                     NetworkMountStatus::Connecting
@@ -641,11 +702,14 @@ impl AppState {
                                 Some(ConnectionState::Disconnected) | None => {
                                     NetworkMountStatus::Disconnected
                                 }
-                            },
-                            Location::Local(_) => NetworkMountStatus::Disconnected,
-                        };
-                    }
-                    _ => {}
+                            }
+                        }
+                        Location::Local(_) => NetworkMountStatus::Disconnected,
+                    }),
+                    _ => None,
+                };
+                if let Some(status) = next_net {
+                    self.set_network_status(status);
                 }
             }
         }
@@ -734,7 +798,10 @@ impl AppState {
         }
         self.watch_task = Some(cx.spawn(async move |cx| {
             while changes.next().await.is_some() {
-                if this.update(cx, |state, _| state.reload_entries()).is_err() {
+                if this
+                    .update(cx, |state, _| state.reload_entries_from_background())
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -870,11 +937,11 @@ impl AppState {
         if let Some(conn_id) = &self.connecting {
             if matches!(&self.current_location, Location::Remote { profile_id, .. } if profile_id == conn_id)
             {
-                self.network_status = NetworkMountStatus::Connecting;
+                self.set_network_status(NetworkMountStatus::Connecting);
                 return;
             }
         }
-        self.network_status = match &self.current_location {
+        let next = match &self.current_location {
             Location::Remote { profile_id, .. } => match self.remote.state(profile_id) {
                 Some(ConnectionState::Connected) => NetworkMountStatus::Connected,
                 Some(ConnectionState::Reconnecting) => NetworkMountStatus::Connecting,
@@ -888,6 +955,7 @@ impl AppState {
                 }
             }
         };
+        self.set_network_status(next);
     }
 
     /// Opens saved server `profile_id` and browses its start path (or pending reconnect target).
@@ -919,7 +987,7 @@ impl AppState {
         self.connect_generation = self.connect_generation.wrapping_add(1);
         let generation = self.connect_generation;
         self.connecting = Some(profile_id.to_owned());
-        self.network_status = NetworkMountStatus::Connecting;
+        self.set_network_status(NetworkMountStatus::Connecting);
         self.set_status(format!("Connecting to {}…", profile.name));
         let id = profile_id.to_owned();
         self.spawn_job(
@@ -1132,9 +1200,32 @@ impl AppState {
 
     /// Replaces the listed entries while preserving selection by `Location`.
     pub fn set_entries(&mut self, entries: Vec<Entry>) {
+        self.listing_revision = self.listing_revision.wrapping_add(1);
+        let now = Instant::now();
+        self.highlighted_inserts
+            .retain(|(_, ts)| now.saturating_duration_since(*ts) < JOB_COMPLETE_HOLD);
+        self.recent_deletions
+            .retain(|(_, ts)| now.saturating_duration_since(*ts) < JOB_COMPLETE_HOLD);
         self.entries = Arc::new(entries);
         let listed: Vec<Location> = self.entries.iter().map(|e| self.location_of(e)).collect();
         self.selection.reload_locations(&listed);
+    }
+
+    /// Marks user-created, renamed, or pasted locations to receive the `accent` entrance flash.
+    pub fn mark_highlighted_insert(&mut self, location: Location) {
+        let now = Instant::now();
+        self.highlighted_inserts.retain(|(loc, _)| loc != &location);
+        self.highlighted_inserts.push((location, now));
+    }
+
+    /// Marks user-trashed or deleted locations so `ListView` animates their departure throw.
+    pub fn mark_recent_deletions(&mut self, locations: impl IntoIterator<Item = Location>) {
+        let now = Instant::now();
+        for loc in locations {
+            self.recent_deletions
+                .retain(|(existing, _)| existing != &loc);
+            self.recent_deletions.push((loc, now));
+        }
     }
 
     /// Returns selected entries in listing order, working correctly for both local and remote
@@ -1359,15 +1450,46 @@ impl AppState {
     /// Sets or clears the status message shown in the footer.
     pub fn set_status(&mut self, message: impl Into<String>) {
         self.status_message = Some(message.into());
+        self.status_revision = self.status_revision.wrapping_add(1);
+        self.status_is_completion = false;
+    }
+
+    /// Sets a completion status message that pops into the footer (`460 ms`, from `0.7`).
+    pub fn set_completion_status(&mut self, message: impl Into<String>) {
+        self.status_message = Some(message.into());
+        self.status_revision = self.status_revision.wrapping_add(1);
+        self.status_is_completion = true;
     }
 
     pub fn clear_status(&mut self) {
         self.status_message = None;
+        self.status_is_completion = false;
     }
 
     /// Appends a new active job.
     pub fn add_job(&mut self, job: JobStatus) {
         self.active_jobs.push(job);
+    }
+
+    /// Completes a job and keeps a transient summary record for the `secondary` 1s completion fade,
+    /// while removing it from `active_jobs` immediately.
+    pub fn complete_job(&mut self, id: u64) {
+        if let Some(pos) = self.active_jobs.iter().position(|j| j.id == id) {
+            let job = self.active_jobs.remove(pos);
+            self.completed_jobs.push(CompletedJob {
+                id: job.id,
+                title: job.title,
+                kind: job.kind,
+                completed_at: Instant::now(),
+            });
+        }
+    }
+
+    /// Prunes expired completion pills once their 1s hold + fade-out has elapsed.
+    pub fn prune_completed_jobs(&mut self, now: Instant) {
+        let total = JOB_COMPLETE_HOLD + QUICK;
+        self.completed_jobs
+            .retain(|j| now.saturating_duration_since(j.completed_at) < total);
     }
 
     /// Removes an active job by ID.
@@ -1385,8 +1507,13 @@ impl AppState {
         self.search_query = query;
     }
 
-    /// Updates network mount status.
+    /// Updates network mount status and tracks when `Connecting` began for the 300ms bar delay.
     pub fn set_network_status(&mut self, status: NetworkMountStatus) {
+        if status == NetworkMountStatus::Connecting {
+            self.connecting_since.get_or_insert_with(Instant::now);
+        } else {
+            self.connecting_since = None;
+        }
         self.network_status = status;
     }
 }

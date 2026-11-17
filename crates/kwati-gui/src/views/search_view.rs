@@ -16,6 +16,7 @@
 //!   on location transitions if desired.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use futures::channel::mpsc;
 use futures::StreamExt;
@@ -26,8 +27,13 @@ use gpui::{
 };
 use kwati_core::{Location, RemoteSearchOptions, SearchHandle, SearchHit, SearchOptions, Searcher};
 
+use crate::components::interactive::hover_bg;
 use crate::components::TextInput;
-use crate::components::{icon, IconName};
+use crate::components::{animated_icon_sized, icon, IconMotion, IconName};
+use crate::motion::{
+    color_lerp, is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker,
+    INSTANT, QUICK,
+};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space};
@@ -56,6 +62,13 @@ pub fn register_search_keybindings(cx: &mut App) {
     ]);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SearchMotionKey {
+    BarOpen,
+    LensTilt,
+    RowHover(usize),
+}
+
 pub struct SearchView {
     pub app_state: Entity<AppState>,
     pub search_input: Entity<TextInput>,
@@ -74,6 +87,9 @@ pub struct SearchView {
     stream_task: Option<Task<()>>,
     search_generation: u64,
     pending_reveal: Option<(Location, Location)>,
+    hovered_row: Option<usize>,
+    lens_hovered: bool,
+    motion: MotionTracker<SearchMotionKey>,
     _input_sub: Subscription,
     _state_sub: Subscription,
 }
@@ -130,6 +146,9 @@ impl SearchView {
             stream_task: None,
             search_generation: 0,
             pending_reveal: None,
+            hovered_row: None,
+            lens_hovered: false,
+            motion: MotionTracker::new(),
             _input_sub: input_sub,
             _state_sub: state_sub,
         }
@@ -270,6 +289,12 @@ impl SearchView {
 
         self.is_searching = true;
         self.search_handle = Some(handle);
+        self.motion.trigger_pulse(
+            SearchMotionKey::LensTilt,
+            QUICK,
+            MotionKind::MovementOrScale,
+            Instant::now(),
+        );
         let generation = self.search_generation;
 
         // Stream hits onto the UI thread as the background walk discovers them.
@@ -456,9 +481,36 @@ fn location_with_path(base: &Location, path: PathBuf) -> Location {
 }
 
 impl Render for SearchView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
-        if !self.is_active {
+        let now = Instant::now();
+        let (is_remote, max_depth, reduced) = {
+            let state = self.app_state.read(cx);
+            (
+                matches!(state.current_location(), Location::Remote { .. }),
+                state.settings.remote_search_depth.max(1),
+                is_reduced_motion(state.settings.motion_preference),
+            )
+        };
+
+        let open_t = self.motion.step_scalar(
+            SearchMotionKey::BarOpen,
+            0.0,
+            if self.is_active { 1.0 } else { 0.0 },
+            QUICK,
+            if self.is_active {
+                Curve::Spring
+            } else {
+                Curve::Exit
+            },
+            MotionKind::OpacityOrColor,
+            now,
+            reduced,
+        );
+
+        if !self.is_active && open_t <= 0.001 {
+            self.hovered_row = None;
+            self.motion.prune_settled(now, reduced);
             return div()
                 .key_context("SearchView")
                 .track_focus(&self.focus_handle)
@@ -467,12 +519,25 @@ impl Render for SearchView {
                 }));
         }
 
-        let (is_remote, max_depth) = {
-            let state = self.app_state.read(cx);
-            (
-                matches!(state.current_location(), Location::Remote { .. }),
-                state.settings.remote_search_depth.max(1),
-            )
+        let lens_pulse = self
+            .motion
+            .pulse_progress(&SearchMotionKey::LensTilt, now, reduced)
+            .map(|t| (t * std::f32::consts::PI).sin())
+            .unwrap_or(0.0);
+        let lens_hover = self.motion.step_scalar(
+            SearchMotionKey::RowHover(usize::MAX),
+            0.0,
+            if self.lens_hovered { 1.0 } else { 0.0 },
+            INSTANT,
+            Curve::EaseOut,
+            MotionKind::MovementOrScale,
+            now,
+            reduced,
+        );
+        let lens_motion = if !reduced && (lens_pulse > 1e-3 || lens_hover > 1e-3) {
+            IconMotion::State(lens_pulse.max(lens_hover))
+        } else {
+            IconMotion::Rest
         };
 
         let query = self.last_query.clone();
@@ -509,6 +574,25 @@ impl Render for SearchView {
         let mut results_elements = Vec::new();
         for (ix, hit) in self.results.iter().take(100).enumerate() {
             let is_selected = selected_idx == Some(ix);
+            let hover_t = self.motion.step_scalar(
+                SearchMotionKey::RowHover(ix),
+                0.0,
+                if self.hovered_row == Some(ix) {
+                    1.0
+                } else {
+                    0.0
+                },
+                INSTANT,
+                Curve::EaseOut,
+                MotionKind::OpacityOrColor,
+                now,
+                reduced,
+            );
+            let row_bg: gpui::Hsla = if is_selected {
+                color_lerp(theme.selection, theme.surface_raised, hover_t * 0.25)
+            } else {
+                hover_bg(transparent_black(), hover_t, &theme)
+            };
             let hit_path = hit.path.clone();
             let display_name = hit_path
                 .file_name()
@@ -531,13 +615,17 @@ impl Render for SearchView {
                     .h(size::ROW)
                     .px(space::S8)
                     .cursor_pointer()
-                    .bg(if is_selected {
-                        theme.selection
-                    } else {
-                        transparent_black().into()
-                    })
-                    .hover(|s| s.bg(theme.surface_raised))
+                    .bg(row_bg)
                     .text_size(px(12.))
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        if *hovered {
+                            this.hovered_row = Some(ix);
+                            cx.notify();
+                        } else if this.hovered_row == Some(ix) {
+                            this.hovered_row = None;
+                            cx.notify();
+                        }
+                    }))
                     .child(
                         div()
                             .flex()
@@ -575,6 +663,10 @@ impl Render for SearchView {
                     ),
             );
         }
+
+        let animating = self.motion.has_active(now, reduced);
+        self.motion.prune_settled(now, reduced);
+        request_frame_if_active(animating, window);
 
         let scope_control = if is_remote {
             div()
@@ -628,6 +720,9 @@ impl Render for SearchView {
             .bg(theme.bg)
             .border_b_1()
             .border_color(theme.border)
+            .opacity(open_t.clamp(0.0, 1.0))
+            .relative()
+            .top(px(if reduced { 0.0 } else { (1.0 - open_t) * -8.0 }))
             .key_context("SearchView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &ToggleSearch, window, cx| {
@@ -658,7 +753,20 @@ impl Render for SearchView {
                     .items_center()
                     .gap_2()
                     .p_2()
-                    .child(icon(IconName::Search).text_color(theme.text_muted))
+                    .child(
+                        div()
+                            .id("search-lens-icon")
+                            .on_hover(cx.listener(|this, hovered, _, cx| {
+                                this.lens_hovered = *hovered;
+                                cx.notify();
+                            }))
+                            .child(animated_icon_sized(
+                                IconName::Search,
+                                lens_motion,
+                                size::ICON,
+                                theme.text_muted,
+                            )),
+                    )
                     .child(div().flex_1().child(self.search_input.clone()))
                     .child(scope_control)
                     .when(self.is_searching, |row| {

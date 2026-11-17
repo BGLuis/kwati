@@ -9,6 +9,7 @@
 //! - **Platforms:** Passes build on Linux (Wayland/X11), macOS, and Windows.
 
 use std::ops::Range;
+use std::time::Instant;
 
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem, Context,
@@ -19,6 +20,11 @@ use gpui::{
 };
 use unicode_segmentation::*;
 
+use crate::components::interactive::focus_ring_color;
+use crate::motion::{
+    reduced_motion_active, request_frame_if_active, shake_decay, Curve, MotionKind,
+    ScalarTransition, INSTANT, SHAKE,
+};
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space};
 
@@ -77,6 +83,9 @@ pub struct TextInput {
     pub is_selecting: bool,
     /// Shows a bullet per character and refuses copy and cut, for passwords.
     pub masked: bool,
+    focus_anim: ScalarTransition,
+    shake_started_at: Option<Instant>,
+    invalid_border: bool,
 }
 
 const MASK: char = '•';
@@ -94,6 +103,9 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             masked: false,
+            focus_anim: ScalarTransition::settled(0.0, MotionKind::OpacityOrColor),
+            shake_started_at: None,
+            invalid_border: false,
         }
     }
 
@@ -139,7 +151,29 @@ impl TextInput {
         self.content = text.into();
         self.selected_range = self.content.len()..self.content.len();
         self.marked_range = None;
+        self.invalid_border = false;
         cx.notify();
+    }
+
+    /// Marks the input invalid (`danger` border) and triggers the `11 px`, 5-cycle shake animation.
+    pub fn trigger_shake(&mut self, cx: &mut Context<Self>) {
+        self.invalid_border = true;
+        self.shake_started_at = Some(Instant::now());
+        cx.notify();
+    }
+
+    /// Sets or clears the `danger` border state without starting a shake.
+    pub fn set_invalid(&mut self, invalid: bool, cx: &mut Context<Self>) {
+        if self.invalid_border != invalid {
+            self.invalid_border = invalid;
+            cx.notify();
+        }
+    }
+
+    /// Returns whether a shake animation is still in progress.
+    pub fn is_shaking(&self) -> bool {
+        self.shake_started_at
+            .is_some_and(|start| start.elapsed() < SHAKE)
     }
 
     pub fn set_placeholder(
@@ -420,6 +454,7 @@ impl EntityInputHandler for TextInput {
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        self.invalid_border = false;
         cx.notify();
     }
 
@@ -681,9 +716,47 @@ impl Element for TextElement {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
+        let now = Instant::now();
+        let reduced = reduced_motion_active();
+        let focused = self.focus_handle.is_focused(window);
+
+        self.focus_anim.retarget(
+            if focused { 1.0 } else { 0.0 },
+            INSTANT,
+            Curve::Spring,
+            MotionKind::OpacityOrColor,
+            now,
+            reduced,
+        );
+        let focus_t = self.focus_anim.value_at(now, reduced);
+
+        let mut shake_px = 0.0_f32;
+        if let Some(started) = self.shake_started_at {
+            let elapsed = now.saturating_duration_since(started);
+            if elapsed >= SHAKE {
+                self.shake_started_at = None;
+            } else if !reduced {
+                let t = (elapsed.as_secs_f32() / SHAKE.as_secs_f32()).clamp(0.0, 1.0);
+                shake_px = shake_decay(t);
+            }
+        }
+
+        let is_invalid = self.invalid_border || self.shake_started_at.is_some();
+        let border_col: gpui::Hsla = if is_invalid {
+            theme.danger.into()
+        } else {
+            focus_ring_color(theme.border_strong, focus_t, &theme)
+        };
+
+        let animating =
+            self.focus_anim.is_active_at(now, reduced) || self.shake_started_at.is_some();
+        request_frame_if_active(animating, window);
+
         div()
+            .relative()
+            .left(px(shake_px))
             .flex()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
@@ -712,7 +785,7 @@ impl Render for TextInput {
             .rounded(radius::CONTROL)
             .bg(theme.surface)
             .border_1()
-            .border_color(theme.border_strong)
+            .border_color(border_col)
             .text_color(theme.text)
             .child(TextElement { input: cx.entity() })
     }

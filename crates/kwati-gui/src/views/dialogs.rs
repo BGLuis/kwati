@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     div, prelude::*, px, transparent_black, App, Context, Entity, FocusHandle, KeyDownEvent,
@@ -21,7 +22,12 @@ use crate::actions::operations::{
     location_display_name, rename_location_on_backend, start_transfer, trash_locations_on_backends,
     validate_entry_name, Transfer, TrashOutcome,
 };
-use crate::components::TextInput;
+use crate::components::{
+    animated_icon, modal_scrim_color, wrap_modal_card_entrance, IconMotion, IconName, TextInput,
+};
+use crate::motion::{
+    is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker, QUICK, SETTLE,
+};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -57,6 +63,12 @@ pub enum DialogKind {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DialogMotionKey {
+    ModalOpen,
+    ConfirmHover,
+}
+
 pub struct DialogsView {
     pub app_state: Entity<AppState>,
     pub input: Entity<TextInput>,
@@ -64,6 +76,9 @@ pub struct DialogsView {
     focus_handle: FocusHandle,
     pending_op: bool,
     op_generation: u64,
+    was_open: bool,
+    confirm_hovered: bool,
+    motion: MotionTracker<DialogMotionKey>,
 }
 
 fn format_item_names(locations: &[Location]) -> String {
@@ -104,6 +119,9 @@ impl DialogsView {
             focus_handle: cx.focus_handle(),
             pending_op: false,
             op_generation: 0,
+            was_open: false,
+            confirm_hovered: false,
+            motion: MotionTracker::new(),
         }
     }
 
@@ -431,6 +449,7 @@ impl DialogsView {
                         parent,
                         error: Some(err),
                     };
+                    self.input.update(cx, |input, cx| input.trigger_shake(cx));
                     cx.notify();
                     return;
                 }
@@ -443,6 +462,7 @@ impl DialogsView {
                         parent,
                         error: Some(err),
                     };
+                    self.input.update(cx, |input, cx| input.trigger_shake(cx));
                     cx.notify();
                     return;
                 };
@@ -480,6 +500,7 @@ impl DialogsView {
                                     parent,
                                     error: Some(err),
                                 };
+                                this.input.update(cx, |input, cx| input.trigger_shake(cx));
                                 cx.notify();
                             }
                         }
@@ -502,6 +523,7 @@ impl DialogsView {
                         current_name: original_name,
                         error: Some(err),
                     };
+                    self.input.update(cx, |input, cx| input.trigger_shake(cx));
                     cx.notify();
                     return;
                 }
@@ -515,6 +537,7 @@ impl DialogsView {
                         current_name: original_name,
                         error: Some(err),
                     };
+                    self.input.update(cx, |input, cx| input.trigger_shake(cx));
                     cx.notify();
                     return;
                 };
@@ -553,6 +576,7 @@ impl DialogsView {
                                     current_name: original_name,
                                     error: Some(err),
                                 };
+                                this.input.update(cx, |input, cx| input.trigger_shake(cx));
                                 cx.notify();
                             }
                         }
@@ -663,15 +687,47 @@ impl DialogsView {
 }
 
 impl Render for DialogsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
         if self.current_dialog == DialogKind::None {
+            self.was_open = false;
+            self.confirm_hovered = false;
             return div();
         }
+
+        let now = Instant::now();
+        let reduced = is_reduced_motion(self.app_state.read(cx).settings.motion_preference);
+        if !self.was_open {
+            self.was_open = true;
+            self.motion
+                .set_immediate(DialogMotionKey::ModalOpen, 0.0, MotionKind::MovementOrScale);
+        }
+
+        let open_t = self.motion.step_scalar(
+            DialogMotionKey::ModalOpen,
+            0.0,
+            1.0,
+            SETTLE,
+            Curve::Linear,
+            MotionKind::OpacityOrColor,
+            now,
+            reduced,
+        );
+        let confirm_hover_t = self.motion.step_scalar(
+            DialogMotionKey::ConfirmHover,
+            0.0,
+            if self.confirm_hovered { 1.0 } else { 0.0 },
+            QUICK,
+            Curve::Spring,
+            MotionKind::MovementOrScale,
+            now,
+            reduced,
+        );
 
         let is_conflict_dialog =
             matches!(self.current_dialog, DialogKind::ConflictResolution { .. });
         let is_delete_dialog = matches!(self.current_dialog, DialogKind::ConfirmDelete { .. });
+        let is_trash_dialog = matches!(self.current_dialog, DialogKind::ConfirmTrash { .. });
         let is_open_with = matches!(self.current_dialog, DialogKind::OpenWith { .. });
 
         let (title, error_msg, is_input_dialog, prompt_text) = match &self.current_dialog {
@@ -707,277 +763,300 @@ impl Render for DialogsView {
             DialogKind::None => ("", None, false, None),
         };
 
+        let trash_icon = if is_delete_dialog || is_trash_dialog {
+            Some(animated_icon(
+                IconName::Trash,
+                IconMotion::State(confirm_hover_t),
+                theme.on_accent,
+            ))
+        } else {
+            None
+        };
+
+        request_frame_if_active(self.motion.has_active(now, reduced), window);
+
+        let card = div()
+            .w(px(420.))
+            .p_4()
+            .rounded_lg()
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_size(px(14.)).text_color(theme.text).child(title))
+            .children(prompt_text.map(|prompt| {
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.text_muted)
+                    .child(prompt)
+            }))
+            // Input element if rename or new folder
+            .children(if is_input_dialog {
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(self.input.clone())
+                        .children(error_msg.map(|err| {
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.danger)
+                                .child(err.to_string())
+                        })),
+                )
+            } else {
+                None
+            })
+            .children(
+                if let DialogKind::OpenWith {
+                    ref available_apps,
+                    selected_index,
+                    ref error,
+                    ..
+                } = self.current_dialog
+                {
+                    let mut app_nodes = Vec::new();
+                    for (ix, app) in available_apps.iter().enumerate() {
+                        let is_sel = selected_index == Some(ix);
+                        let app_name = app.name.clone();
+                        let is_default = app.is_default;
+                        app_nodes.push(
+                            div()
+                                .id(ix)
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(if is_sel {
+                                    theme.selection
+                                } else {
+                                    transparent_black().into()
+                                })
+                                .hover(|s| s.bg(theme.surface_raised))
+                                .text_size(px(12.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(if is_sel { "🔘" } else { "⚪" })
+                                        .child(
+                                            div()
+                                                .text_color(if is_sel {
+                                                    theme.accent
+                                                } else {
+                                                    theme.text
+                                                })
+                                                .child(app_name),
+                                        ),
+                                )
+                                .children(if is_default {
+                                    Some(
+                                        div()
+                                            .text_size(px(10.))
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_sm()
+                                            .bg(theme.surface)
+                                            .text_color(theme.text_muted)
+                                            .child("Default"),
+                                    )
+                                } else {
+                                    None
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.select_app(ix, cx);
+                                    }),
+                                ),
+                        );
+                    }
+
+                    Some(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .max_h(px(160.))
+                                    .overflow_hidden()
+                                    .children(app_nodes),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.text_muted)
+                                    .child("Or specify custom command / executable:"),
+                            )
+                            .child(self.input.clone())
+                            .children(error.as_ref().map(|err| {
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.danger)
+                                    .child(err.clone())
+                            })),
+                    )
+                } else {
+                    None
+                },
+            )
+            .children(if is_conflict_dialog {
+                Some(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme.surface_raised)
+                                .text_color(theme.text_muted)
+                                .cursor_pointer()
+                                .child("Cancel")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.close(cx)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme.surface_raised)
+                                .text_color(theme.text)
+                                .cursor_pointer()
+                                .child("Skip")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.resolve_conflict(ConflictPolicy::Skip, cx)
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme.surface_raised)
+                                .text_color(theme.text)
+                                .cursor_pointer()
+                                .child("Keep Both")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.resolve_conflict(ConflictPolicy::KeepBoth, cx)
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme.accent)
+                                .text_color(theme.on_accent)
+                                .cursor_pointer()
+                                .child("Replace")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.resolve_conflict(ConflictPolicy::Replace, cx)
+                                    }),
+                                ),
+                        ),
+                )
+            } else {
+                Some(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme.surface_raised)
+                                .text_color(theme.text_muted)
+                                .cursor_pointer()
+                                .child("Cancel")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.close(cx)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("dialog-confirm-btn")
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(if is_delete_dialog {
+                                    theme.danger
+                                } else {
+                                    theme.accent
+                                })
+                                .text_color(theme.on_accent)
+                                .cursor_pointer()
+                                .children(trash_icon)
+                                .child(if is_delete_dialog {
+                                    "Permanently Delete"
+                                } else if is_open_with {
+                                    "Open"
+                                } else {
+                                    "Confirm"
+                                })
+                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                    this.confirm_hovered = *hovered;
+                                    cx.notify();
+                                }))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.confirm_hovered = false;
+                                        if is_delete_dialog {
+                                            this.confirm_permanent_delete(cx);
+                                        } else {
+                                            this.submit(cx);
+                                        }
+                                    }),
+                                ),
+                        ),
+                )
+            })
+            .into_any_element();
+
         div()
             .absolute()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
-            .bg(theme.scrim)
+            .bg(modal_scrim_color(&theme, open_t))
             .occlude()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(
-                div()
-                    .w(px(420.))
-                    .p_4()
-                    .rounded_lg()
-                    .bg(theme.surface)
-                    .border_1()
-                    .border_color(theme.border)
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(div().text_size(px(14.)).text_color(theme.text).child(title))
-                    .children(prompt_text.map(|prompt| {
-                        div()
-                            .text_size(px(12.))
-                            .text_color(theme.text_muted)
-                            .child(prompt)
-                    }))
-                    // Input element if rename or new folder
-                    .children(if is_input_dialog {
-                        Some(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(self.input.clone())
-                                .children(error_msg.map(|err| {
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(theme.danger)
-                                        .child(err.to_string())
-                                })),
-                        )
-                    } else {
-                        None
-                    })
-                    .children(
-                        if let DialogKind::OpenWith {
-                            ref available_apps,
-                            selected_index,
-                            ref error,
-                            ..
-                        } = self.current_dialog
-                        {
-                            let mut app_nodes = Vec::new();
-                            for (ix, app) in available_apps.iter().enumerate() {
-                                let is_sel = selected_index == Some(ix);
-                                let app_name = app.name.clone();
-                                let is_default = app.is_default;
-                                app_nodes.push(
-                                    div()
-                                        .id(ix)
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_between()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .bg(if is_sel {
-                                            theme.selection
-                                        } else {
-                                            transparent_black().into()
-                                        })
-                                        .hover(|s| s.bg(theme.surface_raised))
-                                        .text_size(px(12.))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .child(if is_sel { "🔘" } else { "⚪" })
-                                                .child(
-                                                    div()
-                                                        .text_color(if is_sel {
-                                                            theme.accent
-                                                        } else {
-                                                            theme.text
-                                                        })
-                                                        .child(app_name),
-                                                ),
-                                        )
-                                        .children(if is_default {
-                                            Some(
-                                                div()
-                                                    .text_size(px(10.))
-                                                    .px_2()
-                                                    .py_0p5()
-                                                    .rounded_sm()
-                                                    .bg(theme.surface)
-                                                    .text_color(theme.text_muted)
-                                                    .child("Default"),
-                                            )
-                                        } else {
-                                            None
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.select_app(ix, cx);
-                                            }),
-                                        ),
-                                );
-                            }
-
-                            Some(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_1()
-                                            .max_h(px(160.))
-                                            .overflow_hidden()
-                                            .children(app_nodes),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(theme.text_muted)
-                                            .child("Or specify custom command / executable:"),
-                                    )
-                                    .child(self.input.clone())
-                                    .children(error.as_ref().map(|err| {
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(theme.danger)
-                                            .child(err.clone())
-                                    })),
-                            )
-                        } else {
-                            None
-                        },
-                    )
-                    .children(if is_conflict_dialog {
-                        Some(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(theme.surface_raised)
-                                        .text_color(theme.text_muted)
-                                        .cursor_pointer()
-                                        .child("Cancel")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| this.close(cx)),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(theme.surface_raised)
-                                        .text_color(theme.text)
-                                        .cursor_pointer()
-                                        .child("Skip")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.resolve_conflict(ConflictPolicy::Skip, cx)
-                                            }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(theme.surface_raised)
-                                        .text_color(theme.text)
-                                        .cursor_pointer()
-                                        .child("Keep Both")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.resolve_conflict(ConflictPolicy::KeepBoth, cx)
-                                            }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(theme.accent)
-                                        .text_color(theme.on_accent)
-                                        .cursor_pointer()
-                                        .child("Replace")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.resolve_conflict(ConflictPolicy::Replace, cx)
-                                            }),
-                                        ),
-                                ),
-                        )
-                    } else {
-                        Some(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(theme.surface_raised)
-                                        .text_color(theme.text_muted)
-                                        .cursor_pointer()
-                                        .child("Cancel")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| this.close(cx)),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(if is_delete_dialog {
-                                            theme.danger
-                                        } else {
-                                            theme.accent
-                                        })
-                                        .text_color(theme.on_accent)
-                                        .cursor_pointer()
-                                        .child(if is_delete_dialog {
-                                            "Permanently Delete"
-                                        } else if is_open_with {
-                                            "Open"
-                                        } else {
-                                            "Confirm"
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                if is_delete_dialog {
-                                                    this.confirm_permanent_delete(cx);
-                                                } else {
-                                                    this.submit(cx);
-                                                }
-                                            }),
-                                        ),
-                                ),
-                        )
-                    }),
-            )
+            .child(wrap_modal_card_entrance(card, px(420.), open_t, reduced))
     }
 }

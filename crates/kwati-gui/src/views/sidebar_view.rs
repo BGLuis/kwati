@@ -3,18 +3,24 @@
 //! Renders quick-access places, bookmarks, the device's mounted drives with capacity
 //! indicators, and mounted network shares.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, transparent_black, AnyElement, Context, Div, ElementId, Entity,
-    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Stateful, Subscription, Svg, Task,
-    Window,
+    div, prelude::*, px, transparent_black, AnyElement, Context, Div, Entity, FontWeight,
+    KeyDownEvent, MouseButton, MouseDownEvent, Stateful, Subscription, Task, Window,
 };
 use kwati_core::{device_volumes, network_mounts, ConnectionState, Location, NetworkMount, Volume};
 
 use crate::actions::ManageServers;
-use crate::components::{icon, Ellipsize, IconName, TextInput, Tooltip};
+use crate::components::{
+    animated_icon_sized, icon, Ellipsize, IconMotion, IconName, TextInput, Tooltip,
+};
+use crate::motion::{
+    color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
+    MotionTracker, INSTANT, PRESS_SCALE, QUICK,
+};
 use crate::remote::protocol_label;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -298,6 +304,27 @@ pub fn server_items(state: &AppState) -> Vec<SidebarServerItem> {
 /// share shows up without a restart.
 const DEVICE_POLL: Duration = Duration::from_secs(3);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SidebarKey {
+    Place(usize),
+    Bookmark(usize),
+    AddBookmark,
+    ManageServers,
+    AddServer,
+    Server(usize),
+    Drive(usize),
+    DriveEject(usize),
+    NetworkShare(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SidebarMotionKey {
+    Hover(SidebarKey),
+    Press(SidebarKey),
+    ServerDraw(usize),
+    EjectHop(usize),
+}
+
 pub struct SidebarView {
     pub app_state: Entity<AppState>,
     pub places: Vec<SidebarPlace>,
@@ -308,6 +335,10 @@ pub struct SidebarView {
     pub drive_details: bool,
     editing_bookmark: Option<usize>,
     rename_input: Entity<TextInput>,
+    hovered: HashSet<SidebarKey>,
+    pressed: HashSet<SidebarKey>,
+    last_server_states: Vec<(String, ServerConnectionStatus)>,
+    motion: MotionTracker<SidebarMotionKey>,
     _state_sub: Subscription,
     _device_poll: Task<()>,
 }
@@ -346,6 +377,10 @@ impl SidebarView {
             drive_details: false,
             editing_bookmark: None,
             rename_input,
+            hovered: HashSet::new(),
+            pressed: HashSet::new(),
+            last_server_states: Vec::new(),
+            motion: MotionTracker::new(),
             _state_sub: state_sub,
             _device_poll: device_poll,
         }
@@ -597,6 +632,86 @@ impl SidebarView {
 }
 
 impl SidebarView {
+    fn set_hover(&mut self, key: SidebarKey, active: bool, cx: &mut Context<Self>) {
+        let changed = if active {
+            self.hovered.insert(key)
+        } else {
+            self.pressed.remove(&key);
+            self.hovered.remove(&key)
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn set_press(&mut self, key: SidebarKey, active: bool, cx: &mut Context<Self>) {
+        let changed = if active {
+            self.pressed.insert(key)
+        } else {
+            self.pressed.remove(&key)
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn step_row_factors(&mut self, key: SidebarKey, now: Instant, reduced: bool) -> (f32, f32) {
+        let hover_target = if self.hovered.contains(&key) {
+            1.0
+        } else {
+            0.0
+        };
+        let press_target = if self.pressed.contains(&key) {
+            1.0
+        } else {
+            0.0
+        };
+        let hover_t = self.motion.step_scalar(
+            SidebarMotionKey::Hover(key),
+            0.0,
+            hover_target,
+            INSTANT,
+            Curve::EaseOut,
+            MotionKind::OpacityOrColor,
+            now,
+            reduced,
+        );
+        let press_t = self.motion.step_scalar(
+            SidebarMotionKey::Press(key),
+            0.0,
+            press_target,
+            INSTANT,
+            Curve::Spring,
+            MotionKind::MovementOrScale,
+            now,
+            reduced,
+        );
+        (hover_t, press_t)
+    }
+
+    fn sync_server_draws(&mut self, servers: &[SidebarServerItem], now: Instant) {
+        let snapshot: Vec<(String, ServerConnectionStatus)> =
+            servers.iter().map(|s| (s.id.clone(), s.status)).collect();
+        if self.last_server_states != snapshot {
+            for (ix, (id, status)) in snapshot.iter().enumerate() {
+                let prev = self
+                    .last_server_states
+                    .iter()
+                    .find(|(pid, _)| pid == id)
+                    .map(|(_, st)| *st);
+                if prev != Some(*status) {
+                    self.motion.trigger_pulse(
+                        SidebarMotionKey::ServerDraw(ix),
+                        QUICK,
+                        MotionKind::MovementOrScale,
+                        now,
+                    );
+                }
+            }
+            self.last_server_states = snapshot;
+        }
+    }
+
     fn toggle_drive_details(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.drive_details = !self.drive_details;
         cx.notify();
@@ -604,10 +719,12 @@ impl SidebarView {
 
     /// A drive as one row, like a place; its capacity waits in the tooltip.
     fn drive_row(
-        &self,
+        &mut self,
         ix: usize,
         vol: SidebarVolume,
         current_loc: &Location,
+        now: Instant,
+        reduced: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::get(cx);
@@ -618,6 +735,40 @@ impl SidebarView {
             format!("{} (not mounted)", vol.name)
         };
         let path = vol.mount_point.clone();
+        let row_key = SidebarKey::Drive(ix);
+        let (hover_t, press_t) = self.step_row_factors(row_key, now, reduced);
+        let row_bg = if is_active {
+            theme.selection.into()
+        } else {
+            color_lerp(transparent_black(), theme.border, hover_t)
+        };
+        let drive_scale = if reduced {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, press_t)
+        };
+        let eject_key = SidebarKey::DriveEject(ix);
+        let (eject_hover, eject_press) = if vol.is_removable && vol.is_mounted {
+            self.step_row_factors(eject_key, now, reduced)
+        } else {
+            (0.0, 0.0)
+        };
+        let eject_pulse = self
+            .motion
+            .pulse_progress(&SidebarMotionKey::EjectHop(ix), now, reduced)
+            .map(|t| (t * std::f32::consts::PI).sin())
+            .unwrap_or(0.0);
+        let eject_motion = if !reduced && (eject_pulse > 1e-3 || eject_hover > 1e-3) {
+            IconMotion::State(eject_pulse.max(eject_hover))
+        } else {
+            IconMotion::Rest
+        };
+        let eject_scale = if reduced {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, eject_press)
+        };
+        let eject_id = vol.id.clone();
 
         div()
             .id(("drive-row", ix))
@@ -625,8 +776,7 @@ impl SidebarView {
             .px(space::S8)
             .rounded(radius::CONTROL)
             .cursor_pointer()
-            .when(is_active, |s| s.bg(theme.selection))
-            .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
+            .bg(row_bg)
             .text_body()
             .text_color(if vol.is_mounted {
                 theme.text
@@ -635,104 +785,316 @@ impl SidebarView {
             })
             .flex()
             .items_center()
+            .justify_between()
             .gap(space::S8)
-            .child(icon(IconName::Drive).text_color(if vol.is_busy {
-                theme.warning
-            } else {
-                theme.text
-            }))
-            .child(div().ellipsize().child(vol.name))
             .tooltip(Tooltip::text(tooltip))
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                this.set_hover(row_key, *hovered, cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap(space::S8)
+                    .child(animated_icon_sized(
+                        IconName::Drive,
+                        IconMotion::Rest,
+                        size::ICON * drive_scale,
+                        if vol.is_busy {
+                            theme.warning
+                        } else {
+                            theme.text
+                        },
+                    ))
+                    .child(div().ellipsize().child(vol.name)),
+            )
+            .when(vol.is_removable && vol.is_mounted, |el| {
+                el.child(
+                    div()
+                        .id(("drive-eject", ix))
+                        .p(space::S2)
+                        .rounded(radius::CONTROL)
+                        .bg(color_lerp(
+                            transparent_black(),
+                            theme.surface_raised,
+                            eject_hover,
+                        ))
+                        .tooltip(Tooltip::text("Ejetar"))
+                        .on_hover(cx.listener(move |this, hovered, _, cx| {
+                            if *hovered && !this.hovered.contains(&eject_key) {
+                                this.motion.trigger_pulse(
+                                    SidebarMotionKey::EjectHop(ix),
+                                    QUICK,
+                                    MotionKind::MovementOrScale,
+                                    Instant::now(),
+                                );
+                            }
+                            this.set_hover(eject_key, *hovered, cx);
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.set_press(eject_key, true, cx);
+                                this.motion.trigger_pulse(
+                                    SidebarMotionKey::EjectHop(ix),
+                                    QUICK,
+                                    MotionKind::MovementOrScale,
+                                    Instant::now(),
+                                );
+                                let cur_loc = this.app_state.read(cx).current_location.clone();
+                                match this.eject_volume(&eject_id, &cur_loc) {
+                                    EjectResult::SafeToRemove {
+                                        volume_name,
+                                        unmounted_path: _,
+                                    } => {
+                                        this.app_state.update(cx, |state, _| {
+                                            state.set_completion_status(format!(
+                                                "Seguro para remover '{volume_name}'"
+                                            ));
+                                        });
+                                    }
+                                    EjectResult::Busy {
+                                        volume_name,
+                                        reason,
+                                    } => {
+                                        this.app_state.update(cx, |state, _| {
+                                            state.set_status(format!(
+                                                "Não foi possível ejetar '{volume_name}': {reason}"
+                                            ));
+                                        });
+                                    }
+                                    EjectResult::NotFound => {}
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.set_press(eject_key, false, cx);
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.set_press(eject_key, false, cx);
+                            }),
+                        )
+                        .child(animated_icon_sized(
+                            IconName::Eject,
+                            eject_motion,
+                            size::ICON * eject_scale,
+                            theme.text_muted,
+                        )),
+                )
+            })
             .when(vol.is_mounted, |s| {
                 s.on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_press(row_key, true, cx);
+                        this.navigate_to_path(&path, cx);
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_press(row_key, false, cx);
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_press(row_key, false, cx);
+                    }),
                 )
             })
     }
 
     /// Icons only, each named by its tooltip. Section titles become dividers, and drive
     /// actions wait for the full sidebar.
-    fn render_compact(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_compact(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx);
-        let (current_loc, servers) = {
+        let now = Instant::now();
+        let (current_loc, servers, reduced) = {
             let state = self.app_state.read(cx);
-            (state.current_location.clone(), server_items(state))
+            (
+                state.current_location.clone(),
+                server_items(state),
+                is_reduced_motion(state.settings.motion_preference),
+            )
         };
-        let divider = || div().h(px(1.)).mx(space::S4).bg(theme.border);
-        let row = |id: ElementId, icon: Svg, label: String, is_active: bool| -> Stateful<Div> {
-            div()
-                .id(id)
-                .h(size::SIDEBAR_ROW)
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(radius::CONTROL)
-                .cursor_pointer()
-                .when(is_active, |s| s.bg(theme.selection))
-                .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
-                .child(icon)
-                .tooltip(Tooltip::text(label))
-        };
+        self.sync_server_draws(&servers, now);
 
-        div()
-            .size_full()
-            .p(space::S8)
-            .bg(theme.surface_raised)
-            .border_r_1()
-            .border_color(theme.border)
-            .flex()
-            .flex_col()
-            .gap_1()
-            .overflow_hidden()
-            .children(self.places.iter().enumerate().map(|(ix, place)| {
+        let places = self.places.clone();
+        let bookmarks = self.bookmarks.clone();
+        let volumes = self.volumes.clone();
+        let network = self.network.clone();
+
+        let place_rows: Vec<_> = places
+            .iter()
+            .enumerate()
+            .map(|(ix, place)| {
+                let key = SidebarKey::Place(ix);
+                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let path = place.path.clone();
+                let is_active = matches!(&current_loc, Location::Local(p) if p == &place.path);
+                let row_bg = if is_active {
+                    theme.selection.into()
+                } else {
+                    color_lerp(transparent_black(), theme.border, hover_t)
+                };
+                let scale = if reduced {
+                    1.0
+                } else {
+                    lerp_f32(1.0, PRESS_SCALE, press_t)
+                };
                 let color = if place.icon == IconName::Folder {
                     theme.accent
                 } else {
                     theme.text
                 };
-                row(
-                    ("place", ix).into(),
-                    icon(place.icon).text_color(color),
-                    place.name.clone(),
-                    matches!(&current_loc, Location::Local(p) if p == &place.path),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
-                )
-            }))
-            .when(!self.bookmarks.is_empty(), |s| s.child(divider()))
-            .children(self.bookmarks.iter().enumerate().map(|(ix, bm)| {
+                let glyph_motion = if !reduced
+                    && place.icon == IconName::Folder
+                    && (is_active || hover_t > 0.01)
+                {
+                    IconMotion::State(if is_active { 1.0 } else { hover_t })
+                } else {
+                    IconMotion::Rest
+                };
+                div()
+                    .id(("place", ix))
+                    .h(size::SIDEBAR_ROW)
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .bg(row_bg)
+                    .tooltip(Tooltip::text(place.name.clone()))
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.set_hover(key, *hovered, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_press(key, true, cx);
+                            this.navigate_to_path(&path, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .child(animated_icon_sized(
+                        place.icon,
+                        glyph_motion,
+                        size::ICON * scale,
+                        color,
+                    ))
+            })
+            .collect();
+
+        let bookmark_rows: Vec<_> = bookmarks
+            .iter()
+            .enumerate()
+            .map(|(ix, bm)| {
+                let key = SidebarKey::Bookmark(ix);
+                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let path = bm.path.clone();
-                let (glyph, label) = if bm.is_missing() {
+                let is_active = matches!(&current_loc, Location::Local(p) if p == &bm.path);
+                let row_bg = if is_active {
+                    theme.selection.into()
+                } else {
+                    color_lerp(transparent_black(), theme.border, hover_t)
+                };
+                let scale = if reduced {
+                    1.0
+                } else {
+                    lerp_f32(1.0, PRESS_SCALE, press_t)
+                };
+                let (glyph_name, glyph_color, label) = if bm.is_missing() {
                     (
-                        icon(IconName::Alert).text_color(theme.danger),
+                        IconName::Alert,
+                        theme.danger,
                         format!("{} (missing)", bm.name),
                     )
                 } else {
-                    (
-                        icon(IconName::Folder).text_color(theme.accent),
-                        bm.name.clone(),
-                    )
+                    (IconName::Folder, theme.accent, bm.name.clone())
                 };
-                row(
-                    ("bookmark", ix).into(),
-                    glyph,
-                    label,
-                    matches!(&current_loc, Location::Local(p) if p == &bm.path),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
-                )
-            }))
-            .when(!self.volumes.is_empty(), |s| s.child(divider()))
-            .children(self.volumes.iter().enumerate().map(|(ix, vol)| {
+                let glyph_motion = if !reduced
+                    && glyph_name == IconName::Folder
+                    && (is_active || hover_t > 0.01)
+                {
+                    IconMotion::State(if is_active { 1.0 } else { hover_t })
+                } else {
+                    IconMotion::Rest
+                };
+                div()
+                    .id(("bookmark", ix))
+                    .h(size::SIDEBAR_ROW)
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .bg(row_bg)
+                    .tooltip(Tooltip::text(label))
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.set_hover(key, *hovered, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_press(key, true, cx);
+                            this.navigate_to_path(&path, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .child(animated_icon_sized(
+                        glyph_name,
+                        glyph_motion,
+                        size::ICON * scale,
+                        glyph_color,
+                    ))
+            })
+            .collect();
+
+        let drive_rows: Vec<_> = volumes
+            .iter()
+            .enumerate()
+            .map(|(ix, vol)| {
+                let key = SidebarKey::Drive(ix);
+                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let path = vol.mount_point.clone();
                 let is_mounted = vol.is_mounted;
+                let is_active = matches!(&current_loc, Location::Local(p) if p == &vol.mount_point);
+                let row_bg = if is_active {
+                    theme.selection.into()
+                } else {
+                    color_lerp(transparent_black(), theme.border, hover_t)
+                };
+                let scale = if reduced {
+                    1.0
+                } else {
+                    lerp_f32(1.0, PRESS_SCALE, press_t)
+                };
                 let label = if is_mounted {
                     format!("{} — {}", vol.name, vol.capacity_summary())
                 } else {
@@ -745,40 +1107,124 @@ impl SidebarView {
                 } else {
                     theme.text_muted
                 };
-                row(
-                    ("drive", ix).into(),
-                    icon(IconName::Drive).text_color(color),
-                    label,
-                    matches!(&current_loc, Location::Local(p) if p == &vol.mount_point),
-                )
-                .when(is_mounted, |s| {
-                    s.on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
-                    )
-                })
-            }))
-            .when(!self.network.is_empty(), |s| s.child(divider()))
-            .children(self.network.iter().enumerate().map(|(ix, share)| {
+                div()
+                    .id(("drive", ix))
+                    .h(size::SIDEBAR_ROW)
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .bg(row_bg)
+                    .tooltip(Tooltip::text(label))
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.set_hover(key, *hovered, cx);
+                    }))
+                    .when(is_mounted, |s| {
+                        s.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.set_press(key, true, cx);
+                                this.navigate_to_path(&path, cx);
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                        )
+                    })
+                    .child(animated_icon_sized(
+                        IconName::Drive,
+                        IconMotion::Rest,
+                        size::ICON * scale,
+                        color,
+                    ))
+            })
+            .collect();
+
+        let share_rows: Vec<_> = network
+            .iter()
+            .enumerate()
+            .map(|(ix, share)| {
+                let key = SidebarKey::NetworkShare(ix);
+                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let path = share.mount_point.clone();
-                row(
-                    ("share", ix).into(),
-                    icon(IconName::Network).text_color(theme.text),
-                    share.name.clone(),
-                    matches!(&current_loc, Location::Local(p) if p == &share.mount_point),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.navigate_to_path(&path, cx)),
-                )
-            }))
-            .child(divider())
-            .children(servers.into_iter().enumerate().map(|(ix, server)| {
+                let is_active =
+                    matches!(&current_loc, Location::Local(p) if p == &share.mount_point);
+                let row_bg = if is_active {
+                    theme.selection.into()
+                } else {
+                    color_lerp(transparent_black(), theme.border, hover_t)
+                };
+                let scale = if reduced {
+                    1.0
+                } else {
+                    lerp_f32(1.0, PRESS_SCALE, press_t)
+                };
+                div()
+                    .id(("share", ix))
+                    .h(size::SIDEBAR_ROW)
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .bg(row_bg)
+                    .tooltip(Tooltip::text(share.name.clone()))
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.set_hover(key, *hovered, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_press(key, true, cx);
+                            this.navigate_to_path(&path, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .child(animated_icon_sized(
+                        IconName::Network,
+                        IconMotion::Rest,
+                        size::ICON * scale,
+                        theme.text,
+                    ))
+            })
+            .collect();
+
+        let server_rows: Vec<_> = servers
+            .iter()
+            .enumerate()
+            .map(|(ix, server)| {
+                let key = SidebarKey::Server(ix);
+                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let server_id = server.id.clone();
                 let is_active = matches!(
                     &current_loc,
                     Location::Remote { profile_id, .. } if profile_id == &server.id
                 );
+                let row_bg = if is_active {
+                    theme.selection.into()
+                } else {
+                    color_lerp(transparent_black(), theme.border, hover_t)
+                };
+                let scale = if reduced {
+                    1.0
+                } else {
+                    lerp_f32(1.0, PRESS_SCALE, press_t)
+                };
                 let color = match server.status {
                     ServerConnectionStatus::Connected => theme.secondary,
                     ServerConnectionStatus::Connecting | ServerConnectionStatus::Reconnecting => {
@@ -786,33 +1232,128 @@ impl SidebarView {
                     }
                     ServerConnectionStatus::Disconnected => theme.text,
                 };
+                let draw_motion = self
+                    .motion
+                    .pulse_progress(&SidebarMotionKey::ServerDraw(ix), now, reduced)
+                    .map_or(IconMotion::Rest, |t| {
+                        IconMotion::Draw(Curve::EaseOut.sample(t))
+                    });
                 let tooltip = format!(
                     "{} ({}) — {}",
                     server.name,
                     server.protocol,
                     server.status.label()
                 );
-                row(
-                    ("server", ix).into(),
-                    icon(IconName::Network).text_color(color),
-                    tooltip,
-                    is_active,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.connect_server(&server_id, cx);
-                    }),
-                )
-            }))
+                div()
+                    .id(("server", ix))
+                    .h(size::SIDEBAR_ROW)
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .bg(row_bg)
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.set_hover(key, *hovered, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_press(key, true, cx);
+                            this.connect_server(&server_id, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .child(animated_icon_sized(
+                        IconName::Network,
+                        draw_motion,
+                        size::ICON * scale,
+                        color,
+                    ))
+            })
+            .collect();
+
+        let (manage_hover, manage_press) =
+            self.step_row_factors(SidebarKey::ManageServers, now, reduced);
+        let manage_scale = if reduced {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, manage_press)
+        };
+        let animating = self.motion.has_active(now, reduced);
+        self.motion.prune_settled(now, reduced);
+        request_frame_if_active(animating, window);
+
+        let divider = || div().h(px(1.)).mx(space::S4).bg(theme.border);
+
+        div()
+            .size_full()
+            .p(space::S8)
+            .bg(theme.surface_raised)
+            .border_r_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .gap_1()
+            .overflow_hidden()
+            .children(place_rows)
+            .when(!bookmarks.is_empty(), |s| s.child(divider()))
+            .children(bookmark_rows)
+            .when(!volumes.is_empty(), |s| s.child(divider()))
+            .children(drive_rows)
+            .when(!network.is_empty(), |s| s.child(divider()))
+            .children(share_rows)
+            .child(divider())
+            .children(server_rows)
             .child(
-                row(
-                    "compact-manage-servers".into(),
-                    icon(IconName::Plus).text_color(theme.text_muted),
-                    "Gerenciar servidores".into(),
-                    false,
-                )
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(ManageServers), cx)),
+                div()
+                    .id("compact-manage-servers")
+                    .h(size::SIDEBAR_ROW)
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .bg(color_lerp(transparent_black(), theme.border, manage_hover))
+                    .tooltip(Tooltip::text("Gerenciar servidores"))
+                    .on_hover(cx.listener(|this, hovered, _, cx| {
+                        this.set_hover(SidebarKey::ManageServers, *hovered, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_press(SidebarKey::ManageServers, true, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_press(SidebarKey::ManageServers, false, cx);
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_press(SidebarKey::ManageServers, false, cx);
+                        }),
+                    )
+                    .child(animated_icon_sized(
+                        IconName::Plus,
+                        IconMotion::Rest,
+                        size::ICON * manage_scale,
+                        theme.text_muted,
+                    ))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ManageServers), cx)),
             )
             .into_any_element()
     }
@@ -827,22 +1368,600 @@ impl Render for SidebarView {
             .resolve(window.viewport_size().width)
             .sidebar_compact;
         if compact {
-            return self.render_compact(cx);
+            return self.render_compact(window, cx);
         }
 
         let theme = Theme::get(cx);
+        let now = Instant::now();
         let places = self.places.clone();
         let bookmarks = self.bookmarks.clone();
         let volumes = self.volumes.clone();
         let network = self.network.clone();
         let drive_details = self.drive_details;
         let editing_bookmark = self.editing_bookmark;
-        let (current_loc, servers) = {
+        let (current_loc, servers, reduced) = {
             let state = self.app_state.read(cx);
-            (state.current_location.clone(), server_items(state))
+            (
+                state.current_location.clone(),
+                server_items(state),
+                is_reduced_motion(state.settings.motion_preference),
+            )
         };
+        self.sync_server_draws(&servers, now);
         let can_pin_current =
             matches!(&current_loc, Location::Local(p) if !bookmarks.iter().any(|b| &b.path == p));
+
+        let place_rows: Vec<_> = places
+            .into_iter()
+            .enumerate()
+            .map(|(ix, place)| {
+                let key = SidebarKey::Place(ix);
+                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
+                let is_active = matches!(&current_loc, Location::Local(p) if p == &place.path);
+                let row_bg = if is_active {
+                    theme.selection.into()
+                } else {
+                    color_lerp(transparent_black(), theme.border, hover_t)
+                };
+                let scale = if reduced {
+                    1.0
+                } else {
+                    lerp_f32(1.0, PRESS_SCALE, press_t)
+                };
+                let icon_motion = if !reduced
+                    && place.icon == IconName::Folder
+                    && (is_active || hover_t > 0.01)
+                {
+                    IconMotion::State(if is_active { 1.0 } else { hover_t })
+                } else {
+                    IconMotion::Rest
+                };
+                let color = if place.icon == IconName::Folder {
+                    theme.accent
+                } else {
+                    theme.text
+                };
+                let p_clone = place.path.clone();
+
+                div()
+                    .id(("place-row", ix))
+                    .h(size::SIDEBAR_ROW)
+                    .px(space::S8)
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .bg(row_bg)
+                    .text_body()
+                    .text_color(theme.text)
+                    .flex()
+                    .items_center()
+                    .gap(space::S8)
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.set_hover(key, *hovered, cx);
+                    }))
+                    .child(animated_icon_sized(
+                        place.icon,
+                        icon_motion,
+                        size::ICON * scale,
+                        color,
+                    ))
+                    .child(div().ellipsize().child(place.name))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_press(key, true, cx);
+                            this.navigate_to_path(&p_clone, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+            })
+            .collect();
+
+        let (add_bm_hover, add_bm_press) =
+            self.step_row_factors(SidebarKey::AddBookmark, now, reduced);
+        let add_bm_scale = if reduced {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, add_bm_press)
+        };
+
+        let bookmark_rows: Vec<_> = bookmarks
+            .iter()
+            .enumerate()
+            .map(|(idx, bm)| {
+                let is_missing = bm.is_missing();
+                let is_active = matches!(&current_loc, Location::Local(p) if p == &bm.path);
+                let p_clone = bm.path.clone();
+
+                if editing_bookmark == Some(idx) {
+                    return div()
+                        .id(("bookmark-edit", idx))
+                        .h(size::SIDEBAR_ROW)
+                        .px(space::S4)
+                        .rounded(radius::CONTROL)
+                        .bg(theme.surface)
+                        .border_1()
+                        .border_color(theme.accent)
+                        .flex()
+                        .items_center()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                            if ev.keystroke.key == "enter" {
+                                cx.stop_propagation();
+                                this.commit_rename_bookmark(cx);
+                            } else if ev.keystroke.key == "escape" {
+                                cx.stop_propagation();
+                                this.cancel_rename_bookmark(cx);
+                            }
+                        }))
+                        .child(self.rename_input.clone())
+                        .into_any_element();
+                }
+
+                let key = SidebarKey::Bookmark(idx);
+                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
+                let row_bg = if is_active {
+                    theme.selection.into()
+                } else {
+                    color_lerp(transparent_black(), theme.border, hover_t)
+                };
+                let scale = if reduced {
+                    1.0
+                } else {
+                    lerp_f32(1.0, PRESS_SCALE, press_t)
+                };
+                let folder_motion = if !reduced && !is_missing && (is_active || hover_t > 0.01) {
+                    IconMotion::State(if is_active { 1.0 } else { hover_t })
+                } else {
+                    IconMotion::Rest
+                };
+
+                div()
+                    .id(("bookmark-row", idx))
+                    .h(size::SIDEBAR_ROW)
+                    .px(space::S8)
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .bg(row_bg)
+                    .text_body()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(space::S4)
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.set_hover(key, *hovered, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap(space::S8)
+                            .child(if is_missing {
+                                animated_icon_sized(
+                                    IconName::Alert,
+                                    IconMotion::Rest,
+                                    size::ICON * scale,
+                                    theme.danger,
+                                )
+                            } else {
+                                animated_icon_sized(
+                                    IconName::Folder,
+                                    folder_motion,
+                                    size::ICON * scale,
+                                    theme.accent,
+                                )
+                            })
+                            .child(
+                                div()
+                                    .ellipsize()
+                                    .text_color(if is_missing { theme.danger } else { theme.text })
+                                    .child(bm.name.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(space::S2)
+                            .child(
+                                div()
+                                    .id(("bookmark-rename", idx))
+                                    .px(space::S4)
+                                    .rounded(radius::CONTROL)
+                                    .hover(|s| s.bg(theme.surface_raised))
+                                    .text_label()
+                                    .text_color(theme.text_muted)
+                                    .tooltip(Tooltip::text("Renomear favorito"))
+                                    .child("Aa")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.begin_rename_bookmark(idx, window, cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(("bookmark-remove", idx))
+                                    .rounded(radius::CONTROL)
+                                    .hover(|s| s.bg(theme.surface_raised))
+                                    .tooltip(Tooltip::text("Remover favorito"))
+                                    .child(icon(IconName::Close).text_color(theme.text_muted))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            let _ = this.remove_bookmark_in_state(idx, cx);
+                                        }),
+                                    ),
+                            ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_press(key, true, cx);
+                            this.navigate_to_path(&p_clone, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        let (manage_hover, manage_press) =
+            self.step_row_factors(SidebarKey::ManageServers, now, reduced);
+        let manage_scale = if reduced {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, manage_press)
+        };
+        let manage_motion = if !reduced && manage_hover > 0.01 {
+            IconMotion::State(manage_hover)
+        } else {
+            IconMotion::Rest
+        };
+
+        let (add_srv_hover, add_srv_press) =
+            self.step_row_factors(SidebarKey::AddServer, now, reduced);
+        let add_srv_scale = if reduced {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, add_srv_press)
+        };
+
+        let server_rows: Vec<_> = servers
+            .iter()
+            .enumerate()
+            .map(|(ix, server)| {
+                let key = SidebarKey::Server(ix);
+                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
+                let server_id = server.id.clone();
+                let is_active = matches!(
+                    &current_loc,
+                    Location::Remote { profile_id, .. } if profile_id == &server.id
+                );
+                let row_bg = if is_active {
+                    theme.selection.into()
+                } else {
+                    color_lerp(transparent_black(), theme.border, hover_t)
+                };
+                let scale = if reduced {
+                    1.0
+                } else {
+                    lerp_f32(1.0, PRESS_SCALE, press_t)
+                };
+                let dot_color = match server.status {
+                    ServerConnectionStatus::Connected => theme.secondary,
+                    ServerConnectionStatus::Connecting | ServerConnectionStatus::Reconnecting => {
+                        theme.warning
+                    }
+                    ServerConnectionStatus::Disconnected => theme.border_strong,
+                };
+                let draw_motion = self
+                    .motion
+                    .pulse_progress(&SidebarMotionKey::ServerDraw(ix), now, reduced)
+                    .map_or(IconMotion::Rest, |t| {
+                        IconMotion::Draw(Curve::EaseOut.sample(t))
+                    });
+                let tooltip = format!(
+                    "{} ({}://{}:{}) — {}",
+                    server.name,
+                    server.protocol.to_ascii_lowercase(),
+                    server.host,
+                    server.port,
+                    server.status.label()
+                );
+
+                div()
+                    .id(("server-row", ix))
+                    .h(size::SIDEBAR_ROW)
+                    .px(space::S8)
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .bg(row_bg)
+                    .text_body()
+                    .text_color(theme.text)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(space::S8)
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.set_hover(key, *hovered, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap(space::S8)
+                            .child(
+                                div()
+                                    .w(px(7.))
+                                    .h(px(7.))
+                                    .rounded_full()
+                                    .flex_none()
+                                    .bg(dot_color),
+                            )
+                            .child(animated_icon_sized(
+                                IconName::Network,
+                                draw_motion,
+                                size::ICON * scale,
+                                theme.text,
+                            ))
+                            .child(div().ellipsize().child(server.name.clone())),
+                    )
+                    .child(
+                        div()
+                            .px(space::S4)
+                            .rounded(radius::CONTROL)
+                            .bg(theme.surface)
+                            .text_label()
+                            .text_color(theme.text_muted)
+                            .child(server.protocol),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_press(key, true, cx);
+                            this.connect_server(&server_id, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+            })
+            .collect();
+
+        let drive_elements: Vec<_> = volumes
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(ix, vol)| {
+                if !drive_details {
+                    return self
+                        .drive_row(ix, vol, &current_loc, now, reduced, cx)
+                        .on_mouse_down(MouseButton::Right, cx.listener(Self::toggle_drive_details))
+                        .into_any_element();
+                }
+                let vol_id = vol.id.clone();
+                let is_mounted = vol.is_mounted;
+                let is_busy = vol.is_busy;
+                let capacity_text = vol.capacity_summary();
+                let used_pct = vol.used_percentage();
+                let p_nav = vol.mount_point.clone();
+                let is_active = current_loc.path() == vol.mount_point;
+
+                div()
+                    .on_mouse_down(MouseButton::Right, cx.listener(Self::toggle_drive_details))
+                    .p_2()
+                    .rounded_md()
+                    .bg(if is_active {
+                        theme.selection
+                    } else {
+                        transparent_black().into()
+                    })
+                    .border_1()
+                    .border_color(if is_active {
+                        theme.accent
+                    } else {
+                        theme.border
+                    })
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.navigate_to_path(&p_nav, cx);
+                                        }),
+                                    )
+                                    .child(icon(IconName::Drive).text_color(theme.text))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .child(vol.name),
+                                    ),
+                            )
+                            .when(!is_mounted, |p| {
+                                let v_id = vol_id.clone();
+                                p.child(
+                                    div()
+                                        .px_2()
+                                        .py(px(1.))
+                                        .rounded_sm()
+                                        .bg(theme.accent)
+                                        .text_color(theme.on_accent)
+                                        .text_size(px(11.))
+                                        .cursor_pointer()
+                                        .child("Mount")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                if let MountResult::Mounted {
+                                                    mount_point,
+                                                    volume_name,
+                                                } = this.mount_volume(&v_id)
+                                                {
+                                                    this.navigate_to_path(&mount_point, cx);
+                                                    this.app_state.update(cx, |state, _cx| {
+                                                        state.set_status(format!(
+                                                            "Mounted '{}'",
+                                                            volume_name
+                                                        ));
+                                                    });
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        ),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_muted)
+                            .child(capacity_text),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(4.))
+                            .rounded_sm()
+                            .bg(theme.border)
+                            .child(
+                                div()
+                                    .w(gpui::DefiniteLength::Fraction(
+                                        (used_pct as f32 / 100.0).min(1.0),
+                                    ))
+                                    .h_full()
+                                    .rounded_sm()
+                                    .bg(if used_pct > 90 {
+                                        theme.danger
+                                    } else {
+                                        theme.accent
+                                    }),
+                            ),
+                    )
+                    .when(is_busy, |p| {
+                        p.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(space::S4)
+                                .text_size(px(11.))
+                                .text_color(theme.warning)
+                                .child(icon(IconName::Alert).text_color(theme.warning))
+                                .child("In use by open files"),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        let network_rows: Vec<_> = network
+            .iter()
+            .enumerate()
+            .map(|(ix, share)| {
+                let key = SidebarKey::NetworkShare(ix);
+                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
+                let is_active =
+                    matches!(&current_loc, Location::Local(p) if p == &share.mount_point);
+                let row_bg = if is_active {
+                    theme.selection.into()
+                } else {
+                    color_lerp(transparent_black(), theme.border, hover_t)
+                };
+                let scale = if reduced {
+                    1.0
+                } else {
+                    lerp_f32(1.0, PRESS_SCALE, press_t)
+                };
+                let path = share.mount_point.clone();
+
+                div()
+                    .id(("network-share", ix))
+                    .h(size::SIDEBAR_ROW)
+                    .px(space::S8)
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .bg(row_bg)
+                    .text_body()
+                    .text_color(theme.text)
+                    .flex()
+                    .items_center()
+                    .gap(space::S8)
+                    .tooltip(Tooltip::text(
+                        share.mount_point.to_string_lossy().into_owned(),
+                    ))
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.set_hover(key, *hovered, cx);
+                    }))
+                    .child(animated_icon_sized(
+                        IconName::Network,
+                        IconMotion::Rest,
+                        size::ICON * scale,
+                        theme.text,
+                    ))
+                    .child(div().ellipsize().child(share.name.clone()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_press(key, true, cx);
+                            this.navigate_to_path(&path, cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
+                    )
+            })
+            .collect();
+
+        let animating = self.motion.has_active(now, reduced);
+        self.motion.prune_settled(now, reduced);
+        request_frame_if_active(animating, window);
 
         div()
             .size_full()
@@ -868,37 +1987,7 @@ impl Render for SidebarView {
                             .text_color(theme.text_muted)
                             .child("Places"),
                     )
-                    .children(places.into_iter().map(|place| {
-                        let is_active = matches!(&current_loc, Location::Local(p) if p == &place.path);
-                        let p_clone = place.path.clone();
-
-                        div()
-                            .h(size::SIDEBAR_ROW)
-                            .px(space::S8)
-                            .rounded(radius::CONTROL)
-                            .cursor_pointer()
-                            .when(is_active, |s| s.bg(theme.selection))
-                            .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
-                            .text_body()
-                            .text_color(theme.text)
-                            .flex()
-                            .items_center()
-                            .gap(space::S8)
-                            .child(
-                                icon(place.icon).text_color(if place.icon == IconName::Folder {
-                                    theme.accent
-                                } else {
-                                    theme.text
-                                }),
-                            )
-                            .child(div().ellipsize().child(place.name))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.navigate_to_path(&p_clone, cx);
-                                }),
-                            )
-                    })),
+                    .children(place_rows),
             )
             // --- BOOKMARKS SECTION ---
             .when(!bookmarks.is_empty() || can_pin_current, |parent| {
@@ -927,145 +2016,63 @@ impl Render for SidebarView {
                                             .p(space::S2)
                                             .rounded(radius::CONTROL)
                                             .cursor_pointer()
-                                            .hover(|s| s.bg(theme.border))
+                                            .bg(color_lerp(
+                                                transparent_black(),
+                                                theme.border,
+                                                add_bm_hover,
+                                            ))
                                             .tooltip(Tooltip::text(
                                                 "Adicionar pasta atual aos favoritos",
                                             ))
-                                            .child(
-                                                icon(IconName::Plus).text_color(theme.text_muted),
-                                            )
+                                            .on_hover(cx.listener(|this, hovered, _, cx| {
+                                                this.set_hover(
+                                                    SidebarKey::AddBookmark,
+                                                    *hovered,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child(animated_icon_sized(
+                                                IconName::Plus,
+                                                IconMotion::Rest,
+                                                size::ICON * add_bm_scale,
+                                                theme.text_muted,
+                                            ))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
                                                     cx.stop_propagation();
+                                                    this.set_press(
+                                                        SidebarKey::AddBookmark,
+                                                        true,
+                                                        cx,
+                                                    );
                                                     let _ = this.pin_current_location(cx);
+                                                }),
+                                            )
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.set_press(
+                                                        SidebarKey::AddBookmark,
+                                                        false,
+                                                        cx,
+                                                    );
+                                                }),
+                                            )
+                                            .on_mouse_up_out(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.set_press(
+                                                        SidebarKey::AddBookmark,
+                                                        false,
+                                                        cx,
+                                                    );
                                                 }),
                                             ),
                                     )
                                 }),
                         )
-                        .children(bookmarks.into_iter().enumerate().map(|(idx, bm)| {
-                            let is_missing = bm.is_missing();
-                            let is_active =
-                                matches!(&current_loc, Location::Local(p) if p == &bm.path);
-                            let p_clone = bm.path.clone();
-
-                            if editing_bookmark == Some(idx) {
-                                return div()
-                                    .id(("bookmark-edit", idx))
-                                    .h(size::SIDEBAR_ROW)
-                                    .px(space::S4)
-                                    .rounded(radius::CONTROL)
-                                    .bg(theme.surface)
-                                    .border_1()
-                                    .border_color(theme.accent)
-                                    .flex()
-                                    .items_center()
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                                        if ev.keystroke.key == "enter" {
-                                            cx.stop_propagation();
-                                            this.commit_rename_bookmark(cx);
-                                        } else if ev.keystroke.key == "escape" {
-                                            cx.stop_propagation();
-                                            this.cancel_rename_bookmark(cx);
-                                        }
-                                    }))
-                                    .child(self.rename_input.clone())
-                                    .into_any_element();
-                            }
-
-                            div()
-                                .id(("bookmark-row", idx))
-                                .h(size::SIDEBAR_ROW)
-                                .px(space::S8)
-                                .rounded(radius::CONTROL)
-                                .cursor_pointer()
-                                .when(is_active, |s| s.bg(theme.selection))
-                                .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
-                                .text_body()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(space::S4)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .items_center()
-                                        .gap(space::S8)
-                                        .child(if is_missing {
-                                            icon(IconName::Alert).text_color(theme.danger)
-                                        } else {
-                                            icon(IconName::Folder).text_color(theme.accent)
-                                        })
-                                        .child(
-                                            div()
-                                                .ellipsize()
-                                                .text_color(if is_missing {
-                                                    theme.danger
-                                                } else {
-                                                    theme.text
-                                                })
-                                                .child(bm.name),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(space::S2)
-                                        .child(
-                                            div()
-                                                .id(("bookmark-rename", idx))
-                                                .px(space::S4)
-                                                .rounded(radius::CONTROL)
-                                                .hover(|s| s.bg(theme.surface_raised))
-                                                .text_label()
-                                                .text_color(theme.text_muted)
-                                                .tooltip(Tooltip::text("Renomear favorito"))
-                                                .child("Aa")
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, window, cx| {
-                                                        cx.stop_propagation();
-                                                        this.begin_rename_bookmark(
-                                                            idx, window, cx,
-                                                        );
-                                                    }),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(("bookmark-remove", idx))
-                                                .rounded(radius::CONTROL)
-                                                .hover(|s| s.bg(theme.surface_raised))
-                                                .tooltip(Tooltip::text("Remover favorito"))
-                                                .child(
-                                                    icon(IconName::Close)
-                                                        .text_color(theme.text_muted),
-                                                )
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        let _ =
-                                                            this.remove_bookmark_in_state(idx, cx);
-                                                    }),
-                                                ),
-                                        ),
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.navigate_to_path(&p_clone, cx);
-                                    }),
-                                )
-                                .into_any_element()
-                        })),
+                        .children(bookmark_rows),
                 )
             })
             // --- SERVERS SECTION ---
@@ -1094,14 +2101,40 @@ impl Render for SidebarView {
                                     .py(space::S2)
                                     .rounded(radius::CONTROL)
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(theme.border))
+                                    .bg(color_lerp(transparent_black(), theme.border, manage_hover))
                                     .flex()
                                     .items_center()
                                     .gap(space::S4)
                                     .text_label()
                                     .text_color(theme.text_muted)
                                     .tooltip(Tooltip::text("Gerenciar servidores"))
-                                    .child(icon(IconName::Settings).text_color(theme.text_muted))
+                                    .on_hover(cx.listener(|this, hovered, _, cx| {
+                                        this.set_hover(SidebarKey::ManageServers, *hovered, cx);
+                                    }))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.set_press(SidebarKey::ManageServers, true, cx);
+                                        }),
+                                    )
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.set_press(SidebarKey::ManageServers, false, cx);
+                                        }),
+                                    )
+                                    .on_mouse_up_out(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.set_press(SidebarKey::ManageServers, false, cx);
+                                        }),
+                                    )
+                                    .child(animated_icon_sized(
+                                        IconName::Settings,
+                                        manage_motion,
+                                        size::ICON * manage_scale,
+                                        theme.text_muted,
+                                    ))
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(Box::new(ManageServers), cx);
                                     }),
@@ -1115,89 +2148,46 @@ impl Render for SidebarView {
                                 .px(space::S8)
                                 .rounded(radius::CONTROL)
                                 .cursor_pointer()
-                                .hover(|s| s.bg(theme.border))
+                                .bg(color_lerp(transparent_black(), theme.border, add_srv_hover))
                                 .flex()
                                 .items_center()
                                 .gap(space::S8)
                                 .text_body()
                                 .text_color(theme.text_muted)
-                                .child(icon(IconName::Plus).text_color(theme.text_muted))
+                                .on_hover(cx.listener(|this, hovered, _, cx| {
+                                    this.set_hover(SidebarKey::AddServer, *hovered, cx);
+                                }))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_press(SidebarKey::AddServer, true, cx);
+                                    }),
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_press(SidebarKey::AddServer, false, cx);
+                                    }),
+                                )
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_press(SidebarKey::AddServer, false, cx);
+                                    }),
+                                )
+                                .child(animated_icon_sized(
+                                    IconName::Plus,
+                                    IconMotion::Rest,
+                                    size::ICON * add_srv_scale,
+                                    theme.text_muted,
+                                ))
                                 .child("Adicionar servidor…")
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(Box::new(ManageServers), cx);
                                 }),
                         )
                     })
-                    .children(servers.into_iter().enumerate().map(|(ix, server)| {
-                        let server_id = server.id.clone();
-                        let is_active = matches!(
-                            &current_loc,
-                            Location::Remote { profile_id, .. } if profile_id == &server.id
-                        );
-                        let dot_color = match server.status {
-                            ServerConnectionStatus::Connected => theme.secondary,
-                            ServerConnectionStatus::Connecting
-                            | ServerConnectionStatus::Reconnecting => theme.warning,
-                            ServerConnectionStatus::Disconnected => theme.border_strong,
-                        };
-                        let tooltip = format!(
-                            "{} ({}://{}:{}) — {}",
-                            server.name,
-                            server.protocol.to_ascii_lowercase(),
-                            server.host,
-                            server.port,
-                            server.status.label()
-                        );
-
-                        div()
-                            .id(("server-row", ix))
-                            .h(size::SIDEBAR_ROW)
-                            .px(space::S8)
-                            .rounded(radius::CONTROL)
-                            .cursor_pointer()
-                            .when(is_active, |s| s.bg(theme.selection))
-                            .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
-                            .text_body()
-                            .text_color(theme.text)
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(space::S8)
-                            .tooltip(Tooltip::text(tooltip))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .items_center()
-                                    .gap(space::S8)
-                                    .child(
-                                        div()
-                                            .w(px(7.))
-                                            .h(px(7.))
-                                            .rounded_full()
-                                            .flex_none()
-                                            .bg(dot_color),
-                                    )
-                                    .child(icon(IconName::Network).text_color(theme.text))
-                                    .child(div().ellipsize().child(server.name)),
-                            )
-                            .child(
-                                div()
-                                    .px(space::S4)
-                                    .rounded(radius::CONTROL)
-                                    .bg(theme.surface)
-                                    .text_label()
-                                    .text_color(theme.text_muted)
-                                    .child(server.protocol),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.connect_server(&server_id, cx);
-                                }),
-                            )
-                    })),
+                    .children(server_rows),
             )
             // --- VOLUMES & DRIVES SECTION ---
             .when(!volumes.is_empty(), |parent| {
@@ -1219,153 +2209,7 @@ impl Render for SidebarView {
                                     cx.listener(Self::toggle_drive_details),
                                 ),
                         )
-                        .children(volumes.into_iter().enumerate().map(|(ix, vol)| {
-                            if !drive_details {
-                                return self
-                                    .drive_row(ix, vol, &current_loc, cx)
-                                    .on_mouse_down(
-                                        MouseButton::Right,
-                                        cx.listener(Self::toggle_drive_details),
-                                    )
-                                    .into_any_element();
-                            }
-                            let vol_id = vol.id.clone();
-                            let is_mounted = vol.is_mounted;
-                            let is_busy = vol.is_busy;
-                            let capacity_text = vol.capacity_summary();
-                            let used_pct = vol.used_percentage();
-                            let p_nav = vol.mount_point.clone();
-                            let is_active = current_loc.path() == vol.mount_point;
-
-                            div()
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    cx.listener(Self::toggle_drive_details),
-                                )
-                                .p_2()
-                                .rounded_md()
-                                .bg(if is_active {
-                                    theme.selection
-                                } else {
-                                    transparent_black().into()
-                                })
-                                .border_1()
-                                .border_color(if is_active {
-                                    theme.accent
-                                } else {
-                                    theme.border
-                                })
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .justify_between()
-                                        .items_center()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .cursor_pointer()
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        this.navigate_to_path(&p_nav, cx);
-                                                    }),
-                                                )
-                                                .child(icon(IconName::Drive).text_color(theme.text))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(13.))
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(theme.text)
-                                                        .child(vol.name),
-                                                ),
-                                        )
-                                        .when(!is_mounted, |p| {
-                                            let v_id = vol_id.clone();
-                                            p.child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(1.))
-                                                    .rounded_sm()
-                                                    .bg(theme.accent)
-                                                    .text_color(theme.on_accent)
-                                                    .text_size(px(11.))
-                                                    .cursor_pointer()
-                                                    .child("Mount")
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            if let MountResult::Mounted {
-                                                                mount_point,
-                                                                volume_name,
-                                                            } = this.mount_volume(&v_id)
-                                                            {
-                                                                this.navigate_to_path(
-                                                                    &mount_point,
-                                                                    cx,
-                                                                );
-                                                                this.app_state.update(
-                                                                    cx,
-                                                                    |state, _cx| {
-                                                                        state.set_status(format!(
-                                                                            "Mounted '{}'",
-                                                                            volume_name
-                                                                        ));
-                                                                    },
-                                                                );
-                                                                cx.notify();
-                                                            }
-                                                        }),
-                                                    ),
-                                            )
-                                        }),
-                                )
-                                // Capacity summary
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(theme.text_muted)
-                                        .child(capacity_text),
-                                )
-                                // Usage progress bar
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .h(px(4.))
-                                        .rounded_sm()
-                                        .bg(theme.border)
-                                        .child(
-                                            div()
-                                                .w(gpui::DefiniteLength::Fraction(
-                                                    (used_pct as f32 / 100.0).min(1.0),
-                                                ))
-                                                .h_full()
-                                                .rounded_sm()
-                                                .bg(if used_pct > 90 {
-                                                    theme.danger
-                                                } else {
-                                                    theme.accent
-                                                }),
-                                        ),
-                                )
-                                .when(is_busy, |p| {
-                                    p.child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(space::S4)
-                                            .text_size(px(11.))
-                                            .text_color(theme.warning)
-                                            .child(icon(IconName::Alert).text_color(theme.warning))
-                                            .child("In use by open files"),
-                                    )
-                                })
-                                .into_any_element()
-                        })),
+                        .children(drive_elements),
                 )
             })
             // --- NETWORK SECTION ---
@@ -1383,36 +2227,7 @@ impl Render for SidebarView {
                                 .text_color(theme.text_muted)
                                 .child("Network"),
                         )
-                        .children(network.into_iter().enumerate().map(|(ix, share)| {
-                            let is_active =
-                                matches!(&current_loc, Location::Local(p) if p == &share.mount_point);
-                            let path = share.mount_point.clone();
-
-                            div()
-                                .id(("network-share", ix))
-                                .h(size::SIDEBAR_ROW)
-                                .px(space::S8)
-                                .rounded(radius::CONTROL)
-                                .cursor_pointer()
-                                .when(is_active, |s| s.bg(theme.selection))
-                                .when(!is_active, |s| s.hover(|s| s.bg(theme.border)))
-                                .text_body()
-                                .text_color(theme.text)
-                                .flex()
-                                .items_center()
-                                .gap(space::S8)
-                                .child(icon(IconName::Network).text_color(theme.text))
-                                .child(div().ellipsize().child(share.name))
-                                .tooltip(Tooltip::text(
-                                    share.mount_point.to_string_lossy().into_owned(),
-                                ))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.navigate_to_path(&path, cx);
-                                    }),
-                                )
-                        })),
+                        .children(network_rows),
                 )
             })
             .into_any_element()

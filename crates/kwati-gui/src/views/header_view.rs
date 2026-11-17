@@ -2,24 +2,52 @@
 //!
 //! Provides navigation buttons (Back, Forward, Up) and the interactive address bar.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, Context, CursorStyle, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
-    SharedString, Window,
+    div, prelude::*, transparent_black, Context, CursorStyle, Entity, KeyDownEvent, MouseButton,
+    MouseDownEvent, SharedString, Stateful, Window,
 };
 
 use kwati_core::{ConnectionState, Location};
 
 use crate::actions::navigation::TogglePreview;
 use crate::actions::{DisconnectRemote, OpenSettings, ReconnectRemote, RefreshListing};
-use crate::components::TextInput;
-use crate::components::{icon, IconName, Tooltip};
+use crate::components::interactive::hover_bg;
+use crate::components::{animated_icon_sized, IconMotion, IconName, TextInput, Tooltip};
+use crate::motion::{
+    color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
+    MotionTracker, INSTANT, PRESS_SCALE, QUICK,
+};
 use crate::remote::protocol_label;
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole};
 use crate::views::search_view::ToggleSearch;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HeaderControl {
+    Back,
+    Forward,
+    Up,
+    Refresh,
+    Reconnect,
+    Disconnect,
+    Search,
+    Preview,
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HeaderMotionKey {
+    Hover(HeaderControl),
+    Press(HeaderControl),
+    RefreshSpin,
+    RemoteDraw,
+    MountDraw,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteBadgeState {
@@ -95,6 +123,11 @@ pub struct HeaderView {
     // The address field is rewritten only when this changes, so a refresh of the same
     // directory does not erase a path being typed.
     shown_location: Location,
+    hovered: HashSet<HeaderControl>,
+    pressed: HashSet<HeaderControl>,
+    last_remote_state: Option<RemoteBadgeState>,
+    last_network_badge: bool,
+    motion: MotionTracker<HeaderMotionKey>,
 }
 
 impl HeaderView {
@@ -123,6 +156,11 @@ impl HeaderView {
             app_state,
             address_input,
             shown_location,
+            hovered: HashSet::new(),
+            pressed: HashSet::new(),
+            last_remote_state: None,
+            last_network_badge: false,
+            motion: MotionTracker::new(),
         }
     }
 
@@ -185,6 +223,9 @@ impl HeaderView {
                 self.sync_address_input(cx);
             } else {
                 let err_msg = format!("Directory not found: {}", typed);
+                self.address_input.update(cx, |input, cx| {
+                    input.trigger_shake(cx);
+                });
                 self.app_state.update(cx, |state, _cx| {
                     state.set_status(err_msg);
                 });
@@ -230,24 +271,380 @@ impl HeaderView {
             cx.notify();
         }
     }
+    fn control_factors(
+        &mut self,
+        ctrl: HeaderControl,
+        enabled: bool,
+        now: Instant,
+        reduced: bool,
+    ) -> (f32, f32) {
+        let hover_target = if enabled && self.hovered.contains(&ctrl) {
+            1.0
+        } else {
+            0.0
+        };
+        let press_target = if enabled && self.pressed.contains(&ctrl) {
+            1.0
+        } else {
+            0.0
+        };
+        let hover_t = self.motion.step_scalar(
+            HeaderMotionKey::Hover(ctrl),
+            0.0,
+            hover_target,
+            INSTANT,
+            Curve::EaseOut,
+            MotionKind::OpacityOrColor,
+            now,
+            reduced,
+        );
+        let press_t = self.motion.step_scalar(
+            HeaderMotionKey::Press(ctrl),
+            0.0,
+            press_target,
+            INSTANT,
+            Curve::Spring,
+            MotionKind::MovementOrScale,
+            now,
+            reduced,
+        );
+        (hover_t, press_t)
+    }
+
+    fn set_hover(&mut self, ctrl: HeaderControl, active: bool, cx: &mut Context<Self>) {
+        let changed = if active {
+            self.hovered.insert(ctrl)
+        } else {
+            self.pressed.remove(&ctrl);
+            self.hovered.remove(&ctrl)
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn set_press(&mut self, ctrl: HeaderControl, active: bool, cx: &mut Context<Self>) {
+        let changed = if active {
+            self.pressed.insert(ctrl)
+        } else {
+            self.pressed.remove(&ctrl)
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn icon_button(
+        &self,
+        id: &'static str,
+        ctrl: HeaderControl,
+        icon_name: IconName,
+        enabled: bool,
+        active: bool,
+        hover_t: f32,
+        press_t: f32,
+        reduced: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<gpui::Div> {
+        let rest_bg: gpui::Hsla = if active {
+            theme.selection.into()
+        } else {
+            transparent_black()
+        };
+        let bg = if active {
+            rest_bg
+        } else {
+            hover_bg(rest_bg, hover_t, theme)
+        };
+        let scale = if reduced || !enabled {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, press_t.clamp(0.0, 1.0))
+        };
+        let icon_motion = if enabled && !reduced && hover_t > 0.01 {
+            IconMotion::State(hover_t)
+        } else {
+            IconMotion::Rest
+        };
+        let color = if enabled {
+            theme.text
+        } else {
+            theme.border_strong
+        };
+
+        div()
+            .id(id)
+            .w(size::ICON + space::S4 * 2.0)
+            .h(size::ICON + space::S2 * 2.0)
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .rounded(radius::CONTROL)
+            .bg(bg)
+            .cursor(if enabled {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::Arrow
+            })
+            .when(enabled, |el| {
+                el.on_hover(cx.listener(move |this, hovered, _, cx| {
+                    this.set_hover(ctrl, *hovered, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_press(ctrl, true, cx);
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_press(ctrl, false, cx);
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_press(ctrl, false, cx);
+                    }),
+                )
+            })
+            .child(animated_icon_sized(
+                icon_name,
+                icon_motion,
+                size::ICON * scale,
+                color,
+            ))
+    }
 }
 
 impl Render for HeaderView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
-        let state = self.app_state.read(cx);
-        let can_go_back = state.history.can_go_back();
-        let can_go_forward = state.history.can_go_forward();
-        let preview_open = state.panels.preview_open;
-        let settings_open = state.settings_open;
-        let remote_info = remote_header_info(state);
-        let show_network_badge = is_network_mount_badge_visible(state);
-        let can_go_up = state
-            .current_location
-            .parent()
-            .map(|p| !p.path().as_os_str().is_empty())
-            .unwrap_or(false);
+        let now = Instant::now();
+        let (
+            can_go_back,
+            can_go_forward,
+            preview_open,
+            settings_open,
+            remote_info,
+            show_network_badge,
+            can_go_up,
+            reduced,
+        ) = {
+            let state = self.app_state.read(cx);
+            let can_go_up = state
+                .current_location
+                .parent()
+                .map(|p| !p.path().as_os_str().is_empty())
+                .unwrap_or(false);
+            (
+                state.history.can_go_back(),
+                state.history.can_go_forward(),
+                state.panels.preview_open,
+                state.settings_open,
+                remote_header_info(state),
+                is_network_mount_badge_visible(state),
+                can_go_up,
+                is_reduced_motion(state.settings.motion_preference),
+            )
+        };
+
+        let remote_state_now = remote_info.as_ref().map(|info| info.state);
+        if remote_state_now != self.last_remote_state {
+            self.last_remote_state = remote_state_now;
+            if remote_state_now.is_some() {
+                self.motion.trigger_pulse(
+                    HeaderMotionKey::RemoteDraw,
+                    QUICK,
+                    MotionKind::MovementOrScale,
+                    now,
+                );
+            }
+        }
+        if show_network_badge != self.last_network_badge {
+            self.last_network_badge = show_network_badge;
+            if show_network_badge {
+                self.motion.trigger_pulse(
+                    HeaderMotionKey::MountDraw,
+                    QUICK,
+                    MotionKind::MovementOrScale,
+                    now,
+                );
+            }
+        }
+
+        let (back_hover, back_press) =
+            self.control_factors(HeaderControl::Back, can_go_back, now, reduced);
+        let (fwd_hover, fwd_press) =
+            self.control_factors(HeaderControl::Forward, can_go_forward, now, reduced);
+        let (up_hover, up_press) = self.control_factors(HeaderControl::Up, can_go_up, now, reduced);
+        let (refresh_hover, refresh_press) =
+            self.control_factors(HeaderControl::Refresh, remote_info.is_some(), now, reduced);
+        let (_, reconnect_press) = self.control_factors(
+            HeaderControl::Reconnect,
+            remote_info.as_ref().is_some_and(|i| i.show_reconnect),
+            now,
+            reduced,
+        );
+        let (disconnect_hover, disconnect_press) = self.control_factors(
+            HeaderControl::Disconnect,
+            remote_info.as_ref().is_some_and(|i| i.show_disconnect),
+            now,
+            reduced,
+        );
+        let (search_hover, search_press) =
+            self.control_factors(HeaderControl::Search, true, now, reduced);
+        let (preview_hover, preview_press) =
+            self.control_factors(HeaderControl::Preview, true, now, reduced);
+        let (settings_hover, settings_press) =
+            self.control_factors(HeaderControl::Settings, true, now, reduced);
+
+        let refresh_motion = self
+            .motion
+            .pulse_progress(&HeaderMotionKey::RefreshSpin, now, reduced)
+            .map_or(IconMotion::Rest, IconMotion::Pulse);
+        let remote_draw_motion = self
+            .motion
+            .pulse_progress(&HeaderMotionKey::RemoteDraw, now, reduced)
+            .map_or(IconMotion::Rest, |t| {
+                IconMotion::Draw(Curve::EaseOut.sample(t))
+            });
+        let mount_draw_motion = self
+            .motion
+            .pulse_progress(&HeaderMotionKey::MountDraw, now, reduced)
+            .map_or(IconMotion::Rest, |t| {
+                IconMotion::Draw(Curve::EaseOut.sample(t))
+            });
+
+        let animating = self.motion.has_active(now, reduced);
+        self.motion.prune_settled(now, reduced);
+        request_frame_if_active(animating, window);
+
+        let back_btn = self
+            .icon_button(
+                "header-back",
+                HeaderControl::Back,
+                IconName::ArrowLeft,
+                can_go_back,
+                false,
+                back_hover,
+                back_press,
+                reduced,
+                &theme,
+                cx,
+            )
+            .when(can_go_back, |s| {
+                s.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, ev, window, cx| {
+                        this.set_press(HeaderControl::Back, true, cx);
+                        this.on_back_click(ev, window, cx);
+                    }),
+                )
+            });
+
+        let fwd_btn = self
+            .icon_button(
+                "header-forward",
+                HeaderControl::Forward,
+                IconName::ArrowRight,
+                can_go_forward,
+                false,
+                fwd_hover,
+                fwd_press,
+                reduced,
+                &theme,
+                cx,
+            )
+            .when(can_go_forward, |s| {
+                s.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, ev, window, cx| {
+                        this.set_press(HeaderControl::Forward, true, cx);
+                        this.on_forward_click(ev, window, cx);
+                    }),
+                )
+            });
+
+        let up_btn = self
+            .icon_button(
+                "header-up",
+                HeaderControl::Up,
+                IconName::ArrowUp,
+                can_go_up,
+                false,
+                up_hover,
+                up_press,
+                reduced,
+                &theme,
+                cx,
+            )
+            .when(can_go_up, |s| {
+                s.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, ev, window, cx| {
+                        this.set_press(HeaderControl::Up, true, cx);
+                        this.on_up_click(ev, window, cx);
+                    }),
+                )
+            });
+
+        let search_btn = self
+            .icon_button(
+                "header-search",
+                HeaderControl::Search,
+                IconName::Search,
+                true,
+                false,
+                search_hover,
+                search_press,
+                reduced,
+                &theme,
+                cx,
+            )
+            .tooltip(Tooltip::text("Buscar (Ctrl+F)"))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSearch), cx));
+
+        let preview_btn = self
+            .icon_button(
+                "toggle-preview",
+                HeaderControl::Preview,
+                IconName::PanelRight,
+                true,
+                preview_open,
+                preview_hover,
+                preview_press,
+                reduced,
+                &theme,
+                cx,
+            )
+            .tooltip(Tooltip::text(if preview_open {
+                "Hide preview (Alt+P)"
+            } else {
+                "Show preview (Alt+P)"
+            }))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(TogglePreview), cx));
+
+        let settings_btn = self
+            .icon_button(
+                "header-settings",
+                HeaderControl::Settings,
+                IconName::Settings,
+                true,
+                settings_open,
+                settings_hover,
+                settings_press,
+                reduced,
+                &theme,
+                cx,
+            )
+            .tooltip(Tooltip::text("Configurações (Ctrl+,)"))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx));
 
         div()
             .flex()
@@ -261,69 +658,9 @@ impl Render for HeaderView {
             .bg(theme.bg)
             .border_b_1()
             .border_color(theme.border)
-            // Back button
-            .child(
-                div()
-                    .px(space::S4)
-                    .py(space::S2)
-                    .rounded(radius::CONTROL)
-                    .cursor(if can_go_back {
-                        CursorStyle::PointingHand
-                    } else {
-                        CursorStyle::Arrow
-                    })
-                    .when(can_go_back, |s| s.hover(|h| h.bg(theme.surface_raised)))
-                    .when(can_go_back, |s| {
-                        s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_back_click))
-                    })
-                    .child(icon(IconName::ArrowLeft).text_color(if can_go_back {
-                        theme.text
-                    } else {
-                        theme.border_strong
-                    })),
-            )
-            // Forward button
-            .child(
-                div()
-                    .px(space::S4)
-                    .py(space::S2)
-                    .rounded(radius::CONTROL)
-                    .cursor(if can_go_forward {
-                        CursorStyle::PointingHand
-                    } else {
-                        CursorStyle::Arrow
-                    })
-                    .when(can_go_forward, |s| s.hover(|h| h.bg(theme.surface_raised)))
-                    .when(can_go_forward, |s| {
-                        s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_forward_click))
-                    })
-                    .child(icon(IconName::ArrowRight).text_color(if can_go_forward {
-                        theme.text
-                    } else {
-                        theme.border_strong
-                    })),
-            )
-            // Up button
-            .child(
-                div()
-                    .px(space::S4)
-                    .py(space::S2)
-                    .rounded(radius::CONTROL)
-                    .cursor(if can_go_up {
-                        CursorStyle::PointingHand
-                    } else {
-                        CursorStyle::Arrow
-                    })
-                    .when(can_go_up, |s| s.hover(|h| h.bg(theme.surface_raised)))
-                    .when(can_go_up, |s| {
-                        s.on_mouse_down(MouseButton::Left, cx.listener(Self::on_up_click))
-                    })
-                    .child(icon(IconName::ArrowUp).text_color(if can_go_up {
-                        theme.text
-                    } else {
-                        theme.border_strong
-                    })),
-            )
+            .child(back_btn)
+            .child(fwd_btn)
+            .child(up_btn)
             // Remote connection badge & controls
             .when_some(remote_info, |el, info| {
                 let badge_color = match info.state {
@@ -331,6 +668,16 @@ impl Render for HeaderView {
                     RemoteBadgeState::Reconnecting => theme.warning,
                     RemoteBadgeState::Disconnected => theme.danger,
                 };
+                let refresh_bg = color_lerp(theme.surface_raised, theme.border, refresh_hover);
+                let refresh_icon_size = if reduced {
+                    size::ICON
+                } else {
+                    size::ICON * lerp_f32(1.0, PRESS_SCALE, refresh_press)
+                };
+                let disconnect_bg =
+                    color_lerp(theme.surface_raised, theme.border, disconnect_hover);
+                let reconnect_bg =
+                    color_lerp(theme.accent, theme.surface_raised, reconnect_press * 0.15);
                 el.child(
                     div()
                         .id("header-remote-badge")
@@ -343,7 +690,12 @@ impl Render for HeaderView {
                         .bg(theme.surface_raised)
                         .border_1()
                         .border_color(theme.border)
-                        .child(icon(IconName::Network).text_color(badge_color))
+                        .child(animated_icon_sized(
+                            IconName::Network,
+                            remote_draw_motion,
+                            size::ICON,
+                            badge_color,
+                        ))
                         .child(
                             div()
                                 .text_label()
@@ -364,22 +716,54 @@ impl Render for HeaderView {
                             .px(space::S8)
                             .py(space::S2)
                             .rounded(radius::CONTROL)
-                            .bg(theme.surface_raised)
+                            .bg(refresh_bg)
                             .border_1()
                             .border_color(theme.border)
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|h| h.bg(theme.border))
                             .flex()
                             .items_center()
                             .gap(space::S4)
                             .text_label()
                             .text_color(theme.text)
                             .tooltip(Tooltip::text("Atualizar listagem (F5)"))
-                            .child(icon(IconName::Refresh).text_color(theme.text))
+                            .on_hover(cx.listener(|this, hovered, _, cx| {
+                                this.set_hover(HeaderControl::Refresh, *hovered, cx);
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_press(HeaderControl::Refresh, true, cx);
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_press(HeaderControl::Refresh, false, cx);
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_press(HeaderControl::Refresh, false, cx);
+                                }),
+                            )
+                            .child(animated_icon_sized(
+                                IconName::Refresh,
+                                refresh_motion,
+                                refresh_icon_size,
+                                theme.text,
+                            ))
                             .child("Atualizar")
-                            .on_click(|_, window, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.motion.trigger_pulse(
+                                    HeaderMotionKey::RefreshSpin,
+                                    QUICK,
+                                    MotionKind::MovementOrScale,
+                                    Instant::now(),
+                                );
                                 window.dispatch_action(Box::new(RefreshListing), cx);
-                            }),
+                                cx.notify();
+                            })),
                     )
                 })
                 .when(info.show_reconnect, |el| {
@@ -389,10 +773,28 @@ impl Render for HeaderView {
                             .px(space::S8)
                             .py(space::S2)
                             .rounded(radius::CONTROL)
-                            .bg(theme.accent)
+                            .bg(reconnect_bg)
                             .cursor(CursorStyle::PointingHand)
                             .text_label()
                             .text_color(theme.on_accent)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_press(HeaderControl::Reconnect, true, cx);
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_press(HeaderControl::Reconnect, false, cx);
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_press(HeaderControl::Reconnect, false, cx);
+                                }),
+                            )
                             .child("Reconectar")
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(Box::new(ReconnectRemote), cx);
@@ -406,13 +808,37 @@ impl Render for HeaderView {
                             .px(space::S8)
                             .py(space::S2)
                             .rounded(radius::CONTROL)
-                            .bg(theme.surface_raised)
+                            .bg(disconnect_bg)
                             .border_1()
                             .border_color(theme.border)
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|h| h.bg(theme.border))
                             .text_label()
-                            .text_color(theme.text_muted)
+                            .text_color(if disconnect_press > 0.5 && !reduced {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            })
+                            .on_hover(cx.listener(|this, hovered, _, cx| {
+                                this.set_hover(HeaderControl::Disconnect, *hovered, cx);
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_press(HeaderControl::Disconnect, true, cx);
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_press(HeaderControl::Disconnect, false, cx);
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_press(HeaderControl::Disconnect, false, cx);
+                                }),
+                            )
                             .child("Desconectar")
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(Box::new(DisconnectRemote), cx);
@@ -437,7 +863,12 @@ impl Render for HeaderView {
                         .text_label()
                         .text_color(theme.warning)
                         .tooltip(Tooltip::text("Pasta localizada em montagem de rede"))
-                        .child(icon(IconName::Network).text_color(theme.warning))
+                        .child(animated_icon_sized(
+                            IconName::Network,
+                            mount_draw_motion,
+                            size::ICON,
+                            theme.warning,
+                        ))
                         .child("Montagem de rede"),
                 )
             })
@@ -456,50 +887,8 @@ impl Render for HeaderView {
                     }))
                     .child(self.address_input.clone()),
             )
-            // Search button
-            .child(
-                div()
-                    .id("header-search")
-                    .px(space::S4)
-                    .py(space::S2)
-                    .rounded(radius::CONTROL)
-                    .cursor(CursorStyle::PointingHand)
-                    .hover(|h| h.bg(theme.surface_raised))
-                    .child(icon(IconName::Search).text_color(theme.text))
-                    .tooltip(Tooltip::text("Buscar (Ctrl+F)"))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSearch), cx)),
-            )
-            // Preview toggle button
-            .child(
-                div()
-                    .id("toggle-preview")
-                    .px(space::S4)
-                    .py(space::S2)
-                    .rounded(radius::CONTROL)
-                    .cursor(CursorStyle::PointingHand)
-                    .when(preview_open, |s| s.bg(theme.selection))
-                    .when(!preview_open, |s| s.hover(|h| h.bg(theme.surface_raised)))
-                    .child(icon(IconName::PanelRight).text_color(theme.text))
-                    .tooltip(Tooltip::text(if preview_open {
-                        "Hide preview (Alt+P)"
-                    } else {
-                        "Show preview (Alt+P)"
-                    }))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(TogglePreview), cx)),
-            )
-            // Settings button
-            .child(
-                div()
-                    .id("header-settings")
-                    .px(space::S4)
-                    .py(space::S2)
-                    .rounded(radius::CONTROL)
-                    .cursor(CursorStyle::PointingHand)
-                    .when(settings_open, |s| s.bg(theme.selection))
-                    .when(!settings_open, |s| s.hover(|h| h.bg(theme.surface_raised)))
-                    .child(icon(IconName::Settings).text_color(theme.text))
-                    .tooltip(Tooltip::text("Configurações (Ctrl+,)"))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx)),
-            )
+            .child(search_btn)
+            .child(preview_btn)
+            .child(settings_btn)
     }
 }

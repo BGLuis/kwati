@@ -5,6 +5,7 @@
 //! and invalid TLS certificate) as well as the saved server profile manager.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use gpui::{
     div, prelude::*, px, transparent_black, AnyElement, App, Context, Entity, FocusHandle,
@@ -12,11 +13,16 @@ use gpui::{
 };
 use kwati_core::{AuthMethod, ConnectionProfile, Protocol};
 
-use crate::components::{icon, IconName, TextInput};
+use crate::components::{
+    animated_checkbox_row, icon, modal_scrim_color, wrap_modal_card_entrance, IconName, TextInput,
+};
+use crate::motion::{
+    is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker, QUICK, SETTLE,
+};
 use crate::remote::{default_port, new_profile_id, protocol_label};
 use crate::state::{AppState, RemotePrompt};
 use crate::theme::Theme;
-use crate::tokens::{radius, size, space, Fonts, TextRole};
+use crate::tokens::{radius, space, Fonts, TextRole};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteDialogKind {
@@ -233,6 +239,13 @@ fn secret_placeholder_for(auth: AuthMethod, is_editing: bool) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RemoteMotionKey {
+    ModalOpen,
+    RememberCheckbox,
+    InsecureFtpCheckbox,
+}
+
 pub struct RemoteDialogsView {
     pub app_state: Entity<AppState>,
     pub password_input: Entity<TextInput>,
@@ -245,6 +258,8 @@ pub struct RemoteDialogsView {
     pub focus_handle: FocusHandle,
     active_prompt_key: PromptKey,
     needs_focus: bool,
+    was_open: bool,
+    motion: MotionTracker<RemoteMotionKey>,
 }
 
 impl RemoteDialogsView {
@@ -267,6 +282,8 @@ impl RemoteDialogsView {
             focus_handle: cx.focus_handle(),
             active_prompt_key: PromptKey::None,
             needs_focus: false,
+            was_open: false,
+            motion: MotionTracker::new(),
         };
         view.sync_from_state(&app_state, cx);
         view
@@ -291,11 +308,17 @@ impl RemoteDialogsView {
             self.active_prompt_key = next_key;
 
             match &prompt {
-                Some(RemotePrompt::Password { profile_id, .. }) => {
+                Some(RemotePrompt::Password { profile_id, error }) => {
                     if prev_profile.as_deref() != Some(profile_id.as_str()) {
                         self.remember_password = false;
                     }
-                    self.password_input.update(cx, |input, cx| input.clear(cx));
+                    let has_err = error.is_some();
+                    self.password_input.update(cx, |input, cx| {
+                        input.clear(cx);
+                        if has_err {
+                            input.trigger_shake(cx);
+                        }
+                    });
                     self.needs_focus = true;
                 }
                 Some(_) => {
@@ -652,28 +675,38 @@ impl RemoteDialogsView {
             .to_owned();
         let secret_text = form.secret_input.read(cx).text().to_owned();
 
-        let validation_err = if name.is_empty() {
-            Some("Profile name is required.".to_owned())
+        let (validation_err, bad_input) = if name.is_empty() {
+            ("Profile name is required.", Some(form.name_input.clone()))
         } else if host.is_empty() {
-            Some("Host is required.".to_owned())
+            ("Host is required.", Some(form.host_input.clone()))
         } else if port_text.parse::<u16>().ok().filter(|&p| p > 0).is_none() {
-            Some("Port must be a number between 1 and 65535.".to_owned())
+            (
+                "Port must be a number between 1 and 65535.",
+                Some(form.port_input.clone()),
+            )
         } else if user.is_empty() {
-            Some("Username is required.".to_owned())
+            ("Username is required.", Some(form.user_input.clone()))
         } else if form.auth == AuthMethod::PrivateKey && key_path_text.is_empty() {
-            Some("Private key path is required for key authentication.".to_owned())
+            (
+                "Private key path is required for key authentication.",
+                Some(form.private_key_path_input.clone()),
+            )
         } else if form.protocol == Protocol::Smb
             && (raw_start_path.is_empty() || raw_start_path == "/")
         {
-            Some("SMB start path must begin with a share name (e.g. /share).".to_owned())
+            (
+                "SMB start path must begin with a share name (e.g. /share).",
+                Some(form.start_path_input.clone()),
+            )
         } else {
-            None
+            ("", None)
         };
 
-        if let Some(err) = validation_err {
+        if let Some(field) = bad_input {
             if let Some(form) = &mut self.profile_form {
-                form.error = Some(err);
+                form.error = Some(validation_err.to_owned());
             }
+            field.update(cx, |input, cx| input.trigger_shake(cx));
             cx.notify();
             return false;
         }
@@ -865,17 +898,75 @@ impl RemoteDialogsView {
 impl Render for RemoteDialogsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let prompt = self.app_state.read(cx).remote_prompt.clone();
-        if prompt.is_none()
-            && !self.profile_manager_open
-            && self.current_dialog == RemoteDialogKind::None
-        {
+        let is_open = !prompt.is_none()
+            || self.profile_manager_open
+            || self.current_dialog != RemoteDialogKind::None;
+        if !is_open {
+            self.was_open = false;
             return div();
+        }
+
+        let now = Instant::now();
+        let reduced = is_reduced_motion(self.app_state.read(cx).settings.motion_preference);
+        if !self.was_open {
+            self.was_open = true;
+            self.motion
+                .set_immediate(RemoteMotionKey::ModalOpen, 0.0, MotionKind::MovementOrScale);
         }
 
         if self.needs_focus {
             self.needs_focus = false;
             self.focus(window, cx);
         }
+
+        let open_t = self.motion.step_scalar(
+            RemoteMotionKey::ModalOpen,
+            0.0,
+            1.0,
+            SETTLE,
+            Curve::Linear,
+            MotionKind::OpacityOrColor,
+            now,
+            reduced,
+        );
+        self.motion.step_scalar(
+            RemoteMotionKey::RememberCheckbox,
+            if self.remember_password { 1.0 } else { 0.0 },
+            if self.remember_password { 1.0 } else { 0.0 },
+            QUICK,
+            Curve::Spring,
+            MotionKind::MovementOrScale,
+            now,
+            reduced,
+        );
+        let insecure_checked = self.profile_form.as_ref().is_some_and(|f| f.allow_insecure);
+        self.motion.step_scalar(
+            RemoteMotionKey::InsecureFtpCheckbox,
+            if insecure_checked { 1.0 } else { 0.0 },
+            if insecure_checked { 1.0 } else { 0.0 },
+            QUICK,
+            Curve::Spring,
+            MotionKind::MovementOrScale,
+            now,
+            reduced,
+        );
+
+        let target_w = if let Some(p) = &prompt {
+            match p {
+                RemotePrompt::Password { .. } => px(420.),
+                RemotePrompt::HostKeyChanged { .. } => px(520.),
+                _ => px(480.),
+            }
+        } else if self.profile_manager_open {
+            px(560.)
+        } else {
+            match &self.current_dialog {
+                RemoteDialogKind::PasswordPrompt { .. } => px(420.),
+                RemoteDialogKind::HostKeyChanged { .. } => px(520.),
+                RemoteDialogKind::ProfileManager { .. } => px(560.),
+                _ => px(480.),
+            }
+        };
 
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
@@ -888,17 +979,19 @@ impl Render for RemoteDialogsView {
             self.render_legacy_dialog(&theme, &fonts, cx)
         };
 
+        request_frame_if_active(self.motion.has_active(now, reduced), window);
+
         div()
             .absolute()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
-            .bg(theme.scrim)
+            .bg(modal_scrim_color(&theme, open_t))
             .occlude()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(content)
+            .child(wrap_modal_card_entrance(content, target_w, open_t, reduced))
     }
 }
 
@@ -1011,10 +1104,17 @@ impl RemoteDialogsView {
             .when_some(error, |parent, err| {
                 parent.child(div().text_label().text_color(theme.danger).child(err))
             })
-            .child(
-                checkbox_row(
+            .child({
+                let reduced = is_reduced_motion(self.app_state.read(cx).settings.motion_preference);
+                let check_t = self.motion.scalar_or(
+                    &RemoteMotionKey::RememberCheckbox,
+                    if self.remember_password { 1.0 } else { 0.0 },
+                    Instant::now(),
+                    reduced,
+                );
+                animated_checkbox_row(
                     "remember-password-checkbox",
-                    self.remember_password,
+                    check_t,
                     "Save password",
                     theme,
                 )
@@ -1024,8 +1124,8 @@ impl RemoteDialogsView {
                         this.toggle_remember_password();
                         cx.notify();
                     }),
-                ),
-            )
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1640,18 +1740,26 @@ impl RemoteDialogsView {
                                 ),
                         ),
                 )
-                .child(
-                    checkbox_row(
+                .child({
+                    let reduced =
+                        is_reduced_motion(self.app_state.read(cx).settings.motion_preference);
+                    let check_t = self.motion.scalar_or(
+                        &RemoteMotionKey::InsecureFtpCheckbox,
+                        if form.allow_insecure { 1.0 } else { 0.0 },
+                        Instant::now(),
+                        reduced,
+                    );
+                    animated_checkbox_row(
                         "allow-insecure-ftp-checkbox",
-                        form.allow_insecure,
+                        check_t,
                         "Allow unencrypted plain FTP fallback when TLS is unavailable",
                         theme,
                     )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.toggle_form_allow_insecure(cx)),
-                    ),
-                )
+                    )
+                })
             })
             .child(
                 div()
@@ -1799,46 +1907,14 @@ fn selector_pill(label: &str, active: bool, theme: &Theme) -> gpui::Div {
         .child(label.to_owned())
 }
 
+#[allow(dead_code)]
 fn checkbox_row(
     id: &'static str,
     checked: bool,
     label: &str,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .gap(space::S8)
-        .cursor_pointer()
-        .child(
-            div()
-                .size(size::ICON)
-                .rounded(radius::CONTROL)
-                .border_1()
-                .border_color(if checked {
-                    theme.accent
-                } else {
-                    theme.border_strong
-                })
-                .bg(if checked {
-                    theme.accent
-                } else {
-                    theme.surface_raised
-                })
-                .flex()
-                .items_center()
-                .justify_center()
-                .when(checked, |box_div| {
-                    box_div.child(icon(IconName::Check).text_color(theme.on_accent))
-                }),
-        )
-        .child(
-            div()
-                .text_body()
-                .text_color(theme.text_muted)
-                .child(label.to_owned()),
-        )
+    animated_checkbox_row(id, if checked { 1.0 } else { 0.0 }, label, theme)
 }
 
 fn action_button(label: &str, tone: ButtonTone, theme: &Theme) -> gpui::Div {

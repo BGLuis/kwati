@@ -2,12 +2,19 @@
 //!
 //! Shows network status, timeouts, cancellation, and retry actions when browsing network shares.
 
+use std::time::Instant;
+
 use gpui::{
-    div, prelude::*, px, Context, Entity, MouseButton, MouseDownEvent, Subscription, Window,
+    div, prelude::*, px, relative, Context, Entity, MouseButton, MouseDownEvent, Subscription,
+    Window,
 };
 use kwati_core::{volume_kind, ConnectionState, Location, VolumeKind};
 
-use crate::components::{icon, IconName};
+use crate::components::{animated_icon, icon, IconMotion, IconName};
+use crate::motion::{
+    is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker,
+    MOUNT_INDETERMINATE_DELAY, QUICK,
+};
 use crate::state::{AppState, NetworkMountStatus};
 use crate::theme::Theme;
 
@@ -30,6 +37,8 @@ pub fn is_network_location(location: &Location) -> bool {
 pub struct NetworkView {
     pub app_state: Entity<AppState>,
     pub timeout_secs: u32,
+    last_status: NetworkMountStatus,
+    motion: MotionTracker<u8>,
     _state_sub: Subscription,
 }
 
@@ -43,6 +52,8 @@ impl NetworkView {
         Self {
             app_state,
             timeout_secs,
+            last_status: NetworkMountStatus::Disconnected,
+            motion: MotionTracker::new(),
             _state_sub: state_sub,
         }
     }
@@ -120,19 +131,44 @@ impl NetworkView {
 }
 
 impl Render for NetworkView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
-        let (status, current_loc, timeout_secs) = {
+        let now = Instant::now();
+        let (status, current_loc, timeout_secs, connecting_since, reduced) = {
             let state = self.app_state.read(cx);
             (
                 state.network_status,
                 state.current_location.clone(),
                 self.effective_timeout_secs(state),
+                state.connecting_since,
+                is_reduced_motion(state.settings.motion_preference),
             )
         };
         self.timeout_secs = timeout_secs;
 
         let is_network = is_network_location(&current_loc);
+
+        if status != self.last_status {
+            self.last_status = status;
+            self.motion
+                .trigger_pulse(0, QUICK, MotionKind::MovementOrScale, now);
+        }
+
+        let icon_motion = self
+            .motion
+            .pulse_progress(&0, now, reduced)
+            .map_or(IconMotion::Rest, |t| {
+                IconMotion::Draw(Curve::EaseOut.sample(t))
+            });
+
+        let show_indeterminate = status == NetworkMountStatus::Connecting
+            && connecting_since.is_some_and(|start| {
+                now.saturating_duration_since(start) >= MOUNT_INDETERMINATE_DELAY
+            });
+
+        let animating =
+            status == NetworkMountStatus::Connecting || self.motion.has_active(now, reduced);
+        request_frame_if_active(animating, window);
 
         match status {
             NetworkMountStatus::Disconnected => {
@@ -147,7 +183,7 @@ impl Render for NetworkView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(icon(IconName::Network).text_color(theme.text))
+                        .child(animated_icon(IconName::Network, icon_motion, theme.text))
                         .child("Network share")
                         .child(
                             div()
@@ -158,36 +194,78 @@ impl Render for NetworkView {
                     div()
                 }
             }
-            NetworkMountStatus::Connecting => div()
-                .flex()
-                .flex_row()
-                .justify_between()
-                .items_center()
-                .w_full()
-                .px_3()
-                .py_1()
-                .bg(theme.surface_raised)
-                .text_color(theme.text)
-                .text_size(px(12.))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(icon(IconName::Network).text_color(theme.text))
-                        .child("Connecting to network share…"),
-                )
-                .child(
-                    div()
-                        .px_2()
-                        .py(px(2.))
-                        .rounded_sm()
-                        .bg(theme.surface_raised)
-                        .text_color(theme.text_muted)
-                        .cursor_pointer()
-                        .child("Cancel")
-                        .on_mouse_down(MouseButton::Left, cx.listener(Self::on_cancel)),
-                ),
+            NetworkMountStatus::Connecting => {
+                let elapsed_secs = connecting_since.map_or(0.0, |start| {
+                    now.saturating_duration_since(start).as_secs_f32()
+                });
+                let sweep_pos = if reduced {
+                    0.35
+                } else {
+                    ((elapsed_secs * 1.15) % 1.4) - 0.35
+                };
+                let left_frac = sweep_pos.clamp(0.0, 0.7);
+                let width_frac = (sweep_pos + 0.35).min(1.0) - left_frac;
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .bg(theme.surface_raised)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .items_center()
+                            .w_full()
+                            .px_3()
+                            .py_1()
+                            .text_color(theme.text)
+                            .text_size(px(12.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(animated_icon(
+                                        IconName::Network,
+                                        icon_motion,
+                                        theme.text,
+                                    ))
+                                    .child("Connecting to network share…"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(2.))
+                                    .rounded_sm()
+                                    .bg(theme.surface_raised)
+                                    .text_color(theme.text_muted)
+                                    .cursor_pointer()
+                                    .child("Cancel")
+                                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_cancel)),
+                            ),
+                    )
+                    .when(show_indeterminate, |bar_parent| {
+                        bar_parent.child(
+                            div()
+                                .w_full()
+                                .h(px(4.))
+                                .bg(theme.border)
+                                .relative()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .left(relative(left_frac))
+                                        .w(relative(width_frac.max(0.08)))
+                                        .bg(theme.accent),
+                                ),
+                        )
+                    })
+            }
             NetworkMountStatus::Connected => {
                 if is_network {
                     div()
@@ -200,7 +278,7 @@ impl Render for NetworkView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(icon(IconName::Check).text_color(theme.secondary))
+                        .child(animated_icon(IconName::Check, icon_motion, theme.secondary))
                         .child("Connected:")
                         .child(
                             div()

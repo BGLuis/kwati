@@ -3,11 +3,12 @@
 //! Uses `uniform_list` to render only visible rows, with support for columns
 //! (name, size, date), sort headers, and scrollbar synchronization.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use gpui::{
     div, point, prelude::*, px, relative, transparent_black, uniform_list, Context, CursorStyle,
-    Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
+    Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, UniformListScrollHandle, Window,
 };
 use kwati_core::{Entry, Location, SortColumn, SortDirection};
@@ -16,8 +17,15 @@ use crate::actions::navigation::{
     ClearSelection, GoBack, GoForward, GoUp, OpenContextMenu, OpenSelected, PageDown, PageUp,
     Refresh, SelectAll, SelectFirst, SelectLast, SelectNext, SelectPrevious, ToggleHidden,
 };
-use crate::components::{icon, Ellipsize, IconName, ScrollbarState};
-use crate::state::{entry_location, AppState};
+use crate::actions::operations::get_location_clipboard;
+use crate::components::interactive::focus_ring_color;
+use crate::components::{animated_icon_sized, Ellipsize, IconMotion, IconName, ScrollbarState};
+use crate::motion::{
+    color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
+    MotionTracker, DELETE_THROW, DELETE_THROW_PX, INSTANT, LIST_CASCADE_CAP, LIST_CASCADE_STEP,
+    LIST_ENTER_OFFSET_PX, PRESS_SCALE, ROW_INSERT_START_SCALE, SETTLE,
+};
+use crate::state::{entry_location, AppState, EntryChangeOrigin, NavigationDirection};
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole};
 
@@ -99,6 +107,35 @@ impl RubberBand {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ListMotionKey {
+    Hover(Location),
+    Press(Location),
+    SelectBg(Location),
+    FocusRing(Location),
+    CutFade(Location),
+    InsertEnter(Location),
+    FolderOpen(Location),
+    HeaderHover(u8),
+}
+
+#[derive(Clone, Debug)]
+struct ExitingRow {
+    name: String,
+    is_dir: bool,
+    is_hidden: bool,
+    size_str: String,
+    date_str: String,
+    top_px: f32,
+    started_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct ReorderOffset {
+    from_delta_px: f32,
+    started_at: Instant,
+}
+
 /// Events emitted by [`ListView`] to [`super::MainView`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ListViewEvent {
@@ -113,6 +150,20 @@ pub struct ListView {
     pub scrollbar_state: ScrollbarState,
     pub row_height: Pixels,
     rubber_band: Option<RubberBand>,
+    hovered_location: Option<Location>,
+    pressed_location: Option<Location>,
+    hovered_header: Option<u8>,
+    last_listing_revision: u64,
+    last_location: Option<Location>,
+    prev_entries: Vec<(Location, Entry)>,
+    prev_deletion_watermark: Option<Instant>,
+    nav_anim: Option<(Instant, NavigationDirection)>,
+    reorder_offsets: HashMap<Location, ReorderOffset>,
+    flash_inserts: HashMap<Location, Instant>,
+    calm_inserts: HashMap<Location, Instant>,
+    exiting_rows: Vec<ExitingRow>,
+    exiting_scroll_top: usize,
+    motion: MotionTracker<ListMotionKey>,
 }
 
 impl EventEmitter<ListViewEvent> for ListView {}
@@ -125,6 +176,16 @@ impl Focusable for ListView {
 
 impl ListView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let (initial_rev, initial_loc, initial_entries) = {
+            let state = app_state.read(cx);
+            let cur = state.current_location.clone();
+            let snaps = state
+                .entries
+                .iter()
+                .map(|e| (entry_location(&cur, e), e.clone()))
+                .collect();
+            (state.listing_revision, cur, snaps)
+        };
         Self {
             app_state,
             focus_handle: cx.focus_handle(),
@@ -132,6 +193,20 @@ impl ListView {
             scrollbar_state: ScrollbarState::default(),
             row_height: size::ROW,
             rubber_band: None,
+            hovered_location: None,
+            pressed_location: None,
+            hovered_header: None,
+            last_listing_revision: initial_rev,
+            last_location: Some(initial_loc),
+            prev_entries: initial_entries,
+            prev_deletion_watermark: None,
+            nav_anim: None,
+            reorder_offsets: HashMap::new(),
+            flash_inserts: HashMap::new(),
+            calm_inserts: HashMap::new(),
+            exiting_rows: Vec::new(),
+            exiting_scroll_top: 0,
+            motion: MotionTracker::new(),
         }
     }
 
@@ -581,19 +656,172 @@ const DATE_COLUMN: Pixels = px(128.);
 const HIDDEN_TOGGLE_COLUMN: Pixels = px(80.);
 const SCROLLBAR_WIDTH: Pixels = px(10.);
 
+impl ListView {
+    /// Detects navigation, sort/filter reorders, user/watcher inserts, and deletions on revision change.
+    fn sync_listing_transitions(
+        &mut self,
+        state: &AppState,
+        scroll_top: usize,
+        row_h_px: f32,
+        now: Instant,
+        reduced: bool,
+    ) {
+        if state.listing_revision == self.last_listing_revision
+            && self.last_location.as_ref() == Some(&state.current_location)
+        {
+            return;
+        }
+
+        let dir_changed = self.last_location.as_ref() != Some(&state.current_location);
+        self.last_listing_revision = state.listing_revision;
+        self.last_location = Some(state.current_location.clone());
+
+        let new_entries: Vec<(Location, Entry)> = state
+            .entries
+            .iter()
+            .map(|e| (entry_location(&state.current_location, e), e.clone()))
+            .collect();
+
+        if dir_changed
+            || matches!(
+                state.last_arrival,
+                NavigationDirection::Visit
+                    | NavigationDirection::Back
+                    | NavigationDirection::Forward
+            )
+        {
+            self.hovered_location = None;
+            self.pressed_location = None;
+            self.reorder_offsets.clear();
+            self.flash_inserts.clear();
+            self.calm_inserts.clear();
+            self.exiting_rows.clear();
+            self.motion.clear();
+            self.nav_anim = if reduced
+                || matches!(
+                    state.last_arrival,
+                    NavigationDirection::Initial | NavigationDirection::Reload
+                ) {
+                None
+            } else {
+                Some((now, state.last_arrival))
+            };
+            self.prev_entries = new_entries;
+            return;
+        }
+
+        // Same directory update (sort, filter, insert, or delete).
+        if !reduced {
+            let win_start = scroll_top.saturating_sub(32);
+            let win_end = (scroll_top + 64).min(new_entries.len());
+
+            let prev_index: HashMap<&Location, usize> = self
+                .prev_entries
+                .iter()
+                .enumerate()
+                .map(|(ix, (loc, _))| (loc, ix))
+                .collect();
+
+            // Record recent deletions that were near the visible viewport so they can throw right + fade.
+            let del_set: HashSet<&Location> = state
+                .recent_deletions
+                .iter()
+                .filter(|(_, ts)| self.prev_deletion_watermark.is_none_or(|wm| *ts > wm))
+                .map(|(loc, _)| loc)
+                .collect();
+            if let Some(max_ts) = state.recent_deletions.iter().map(|(_, ts)| *ts).max() {
+                self.prev_deletion_watermark = Some(max_ts);
+            }
+
+            if !del_set.is_empty() {
+                self.exiting_scroll_top = scroll_top;
+                for (old_ix, (loc, entry)) in self.prev_entries.iter().enumerate() {
+                    if del_set.contains(loc)
+                        && !new_entries.iter().any(|(nloc, _)| nloc == loc)
+                        && old_ix >= scroll_top.saturating_sub(8)
+                        && old_ix < scroll_top + 48
+                    {
+                        self.exiting_rows.push(ExitingRow {
+                            name: entry.display_name(),
+                            is_dir: entry.is_dir(),
+                            is_hidden: entry.is_hidden,
+                            size_str: format_size(entry.size, entry.is_dir()),
+                            date_str: format_modified(entry.modified),
+                            top_px: (old_ix as isize - scroll_top as isize) as f32 * row_h_px,
+                            started_at: now,
+                        });
+                    }
+                }
+            }
+
+            let flash_set: HashSet<&Location> = state
+                .highlighted_inserts
+                .iter()
+                .map(|(loc, _)| loc)
+                .collect();
+
+            for (new_ix, (loc, _)) in new_entries.iter().enumerate().take(win_end).skip(win_start) {
+                if let Some(&old_ix) = prev_index.get(loc) {
+                    if old_ix != new_ix {
+                        let delta_px = (old_ix as isize - new_ix as isize) as f32 * row_h_px;
+                        self.reorder_offsets.insert(
+                            loc.clone(),
+                            ReorderOffset {
+                                from_delta_px: delta_px,
+                                started_at: now,
+                            },
+                        );
+                    }
+                } else if flash_set.contains(loc)
+                    || state.last_change_origin == EntryChangeOrigin::UserAction
+                {
+                    self.flash_inserts.insert(loc.clone(), now);
+                } else {
+                    self.calm_inserts.insert(loc.clone(), now);
+                }
+            }
+        }
+
+        self.prev_entries = new_entries;
+    }
+
+    fn prune_list_motion(&mut self, now: Instant, reduced: bool) {
+        self.motion.prune_settled(now, reduced);
+        self.reorder_offsets
+            .retain(|_, r| !reduced && now.saturating_duration_since(r.started_at) < SETTLE);
+        self.flash_inserts
+            .retain(|_, ts| !reduced && now.saturating_duration_since(*ts) < SETTLE);
+        self.calm_inserts
+            .retain(|_, ts| !reduced && now.saturating_duration_since(*ts) < SETTLE);
+        self.exiting_rows
+            .retain(|r| !reduced && now.saturating_duration_since(r.started_at) < DELETE_THROW);
+        if let Some((start, _)) = self.nav_anim {
+            let max_nav = LIST_CASCADE_STEP * (LIST_CASCADE_CAP as u32) + SETTLE;
+            if reduced || now.saturating_duration_since(start) >= max_nav {
+                self.nav_anim = None;
+            }
+        }
+    }
+
+    fn has_active_list_motion(&self, now: Instant, reduced: bool) -> bool {
+        if reduced {
+            return false;
+        }
+        self.motion.has_active(now, reduced)
+            || self.nav_anim.is_some()
+            || !self.reorder_offsets.is_empty()
+            || !self.flash_inserts.is_empty()
+            || !self.calm_inserts.is_empty()
+            || !self.exiting_rows.is_empty()
+    }
+}
+
 impl Render for ListView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
-        let state = self.app_state.read(cx);
-        let entries = state.entries.clone();
-        let selection = state.selection.clone();
-        let current = state.current_location.clone();
-        let entry_count = entries.len();
-        let sort_column = state.sort_column;
-        let sort_direction = state.sort_direction;
-        let show_hidden = state.show_hidden;
-
+        let now = Instant::now();
+        let row_h_px = self.row_height / px(1.);
         let current_top = self
             .scroll_handle
             .0
@@ -601,11 +829,107 @@ impl Render for ListView {
             .base_handle
             .logical_scroll_top()
             .0;
+
+        let (
+            entries,
+            selection,
+            current,
+            sort_column,
+            sort_direction,
+            show_hidden,
+            reduced,
+            focused_location,
+        ) = {
+            let state: &AppState = self.app_state.read(cx);
+            let r = is_reduced_motion(state.settings.motion_preference);
+            self.sync_listing_transitions(state, current_top, row_h_px, now, r);
+            (
+                state.entries.clone(),
+                state.selection.clone(),
+                state.current_location.clone(),
+                state.sort_column,
+                state.sort_direction,
+                state.show_hidden,
+                r,
+                state.selection.anchor().cloned().or_else(|| {
+                    state
+                        .selected_index()
+                        .and_then(|ix| state.entries.get(ix))
+                        .map(|e| entry_location(&state.current_location, e))
+                }),
+            )
+        };
+        let entry_count = entries.len();
         let visible_items = 25;
         self.scrollbar_state
             .set_metrics(entry_count, visible_items, current_top);
 
-        let entries_clone = entries.clone();
+        let cut_sources: HashSet<Location> = get_location_clipboard()
+            .filter(|c| c.is_cut)
+            .map(|c| c.sources.into_iter().collect())
+            .unwrap_or_default();
+        let list_focused = self.focus_handle.is_focused(window);
+
+        let header_hovers = [
+            self.motion.step_scalar(
+                ListMotionKey::HeaderHover(0),
+                0.0,
+                if self.hovered_header == Some(0) {
+                    1.0
+                } else {
+                    0.0
+                },
+                INSTANT,
+                Curve::EaseOut,
+                MotionKind::OpacityOrColor,
+                now,
+                reduced,
+            ),
+            self.motion.step_scalar(
+                ListMotionKey::HeaderHover(1),
+                0.0,
+                if self.hovered_header == Some(1) {
+                    1.0
+                } else {
+                    0.0
+                },
+                INSTANT,
+                Curve::EaseOut,
+                MotionKind::OpacityOrColor,
+                now,
+                reduced,
+            ),
+            self.motion.step_scalar(
+                ListMotionKey::HeaderHover(2),
+                0.0,
+                if self.hovered_header == Some(2) {
+                    1.0
+                } else {
+                    0.0
+                },
+                INSTANT,
+                Curve::EaseOut,
+                MotionKind::OpacityOrColor,
+                now,
+                reduced,
+            ),
+            self.motion.step_scalar(
+                ListMotionKey::HeaderHover(3),
+                0.0,
+                if self.hovered_header == Some(3) {
+                    1.0
+                } else {
+                    0.0
+                },
+                INSTANT,
+                Curve::EaseOut,
+                MotionKind::OpacityOrColor,
+                now,
+                reduced,
+            ),
+        ];
+
+        let entries_clone = entries;
         let (row_selected, row_hover, row_text, row_muted, row_accent) = (
             theme.selection,
             theme.surface_raised,
@@ -626,7 +950,85 @@ impl Render for ListView {
             }
         };
 
-        div()
+        let exiting_elements: Vec<_> = self
+            .exiting_rows
+            .iter()
+            .map(|ex| {
+                let t = (now.saturating_duration_since(ex.started_at).as_secs_f32()
+                    / DELETE_THROW.as_secs_f32())
+                .clamp(0.0, 1.0);
+                let exit_eased = Curve::Exit.sample(t);
+                let x_throw = DELETE_THROW_PX * exit_eased;
+                let opacity = (1.0 - exit_eased).clamp(0.0, 1.0);
+                let scroll_shift_px =
+                    (self.exiting_scroll_top as isize - current_top as isize) as f32 * row_h_px;
+                let top_px = ex.top_px + scroll_shift_px;
+                let glyph = if ex.is_dir {
+                    IconName::Folder
+                } else {
+                    IconName::File
+                };
+                let glyph_col = if ex.is_dir {
+                    row_accent
+                } else if ex.is_hidden {
+                    row_muted
+                } else {
+                    row_text
+                };
+
+                div()
+                    .absolute()
+                    .left(px(x_throw))
+                    .top(px(top_px))
+                    .w_full()
+                    .h(size::ROW)
+                    .px(space::S8)
+                    .gap(space::S8)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .rounded(radius::CONTROL)
+                    .opacity(opacity)
+                    .text_body()
+                    .text_color(if ex.is_hidden { row_muted } else { row_text })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(space::S8)
+                            .child(animated_icon_sized(
+                                glyph,
+                                IconMotion::Rest,
+                                size::ICON,
+                                glyph_col,
+                            ))
+                            .child(div().ellipsize().child(ex.name.clone())),
+                    )
+                    .child(
+                        div()
+                            .w(SIZE_COLUMN)
+                            .flex()
+                            .justify_end()
+                            .text_data(&fonts)
+                            .text_color(row_muted)
+                            .child(ex.size_str.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(DATE_COLUMN)
+                            .text_data(&fonts)
+                            .text_color(row_muted)
+                            .child(ex.date_str.clone()),
+                    )
+                    .child(div().w(HIDDEN_TOGGLE_COLUMN))
+            })
+            .collect();
+
+        let theme_for_rows = theme;
+
+        let root = div()
             .flex()
             .flex_col()
             .size_full()
@@ -704,11 +1106,16 @@ impl Render for ListView {
                     // Name column header
                     .child(
                         div()
+                            .id("col-sort-name")
                             .flex_1()
                             .flex()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.text_color(theme.text))
+                            .text_color(color_lerp(theme.text_muted, theme.text, header_hovers[0]))
+                            .on_hover(cx.listener(|this, hovered, _, cx| {
+                                this.hovered_header = if *hovered { Some(0) } else { None };
+                                cx.notify();
+                            }))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -720,12 +1127,17 @@ impl Render for ListView {
                     // Size column header
                     .child(
                         div()
+                            .id("col-sort-size")
                             .w(SIZE_COLUMN)
                             .flex()
                             .justify_end()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.text_color(theme.text))
+                            .text_color(color_lerp(theme.text_muted, theme.text, header_hovers[1]))
+                            .on_hover(cx.listener(|this, hovered, _, cx| {
+                                this.hovered_header = if *hovered { Some(1) } else { None };
+                                cx.notify();
+                            }))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -737,11 +1149,16 @@ impl Render for ListView {
                     // Modified column header
                     .child(
                         div()
+                            .id("col-sort-date")
                             .w(DATE_COLUMN)
                             .flex()
                             .items_center()
                             .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.text_color(theme.text))
+                            .text_color(color_lerp(theme.text_muted, theme.text, header_hovers[2]))
+                            .on_hover(cx.listener(|this, hovered, _, cx| {
+                                this.hovered_header = if *hovered { Some(2) } else { None };
+                                cx.notify();
+                            }))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -753,22 +1170,26 @@ impl Render for ListView {
                     // Hidden toggle button
                     .child(
                         div()
+                            .id("col-toggle-hidden")
                             .w(HIDDEN_TOGGLE_COLUMN)
                             .flex()
                             .justify_center()
                             .rounded(radius::CONTROL)
                             .cursor(CursorStyle::PointingHand)
                             .bg(if show_hidden {
-                                theme.selection
+                                theme.selection.into()
                             } else {
-                                transparent_black().into()
+                                color_lerp(transparent_black(), theme.surface_raised, header_hovers[3])
                             })
                             .text_color(if show_hidden {
                                 theme.text
                             } else {
-                                theme.text_muted
+                                color_lerp(theme.text_muted, theme.text, header_hovers[3]).into()
                             })
-                            .hover(|s| s.bg(theme.surface_raised))
+                            .on_hover(cx.listener(|this, hovered, _, cx| {
+                                this.hovered_header = if *hovered { Some(3) } else { None };
+                                cx.notify();
+                            }))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.on_toggle_hidden_click(cx)),
@@ -811,14 +1232,24 @@ impl Render for ListView {
                                 uniform_list(
                                     "directory_entries",
                                     entry_count,
-                                    cx.processor(move |_this: &mut ListView, range, _window, cx| {
+                                    cx.processor(
+                                        move |this: &mut ListView,
+                                              range: std::ops::Range<usize>,
+                                              _window,
+                                              cx| {
                                         let mut items: Vec<gpui::AnyElement> = Vec::new();
                                         for ix in range {
                                             if let Some(entry) = entries_clone.get(ix) {
                                                 let entry: &Entry = entry;
-                                                let loc: Location =
-                                                    entry_location(&current, entry);
+                                                let loc: Location = entry_location(&current, entry);
                                                 let is_selected = selection.contains(&loc);
+                                                let is_focused_row = list_focused
+                                                    && focused_location.as_ref() == Some(&loc);
+                                                let is_hovered =
+                                                    this.hovered_location.as_ref() == Some(&loc);
+                                                let is_pressed =
+                                                    this.pressed_location.as_ref() == Some(&loc);
+                                                let is_cut = cut_sources.contains(&loc);
                                                 let is_dir = entry.is_dir();
                                                 let is_hidden = entry.is_hidden;
                                                 let name = entry.display_name();
@@ -827,9 +1258,209 @@ impl Render for ListView {
                                                 let entry_for_click = entry.clone();
                                                 let entry_for_rclick = entry.clone();
 
+                                                let hover_t = this.motion.step_scalar(
+                                                    ListMotionKey::Hover(loc.clone()),
+                                                    0.0,
+                                                    if is_hovered { 1.0 } else { 0.0 },
+                                                    INSTANT,
+                                                    Curve::EaseOut,
+                                                    MotionKind::OpacityOrColor,
+                                                    now,
+                                                    reduced,
+                                                );
+                                                let press_t = this.motion.step_scalar(
+                                                    ListMotionKey::Press(loc.clone()),
+                                                    0.0,
+                                                    if is_pressed { 1.0 } else { 0.0 },
+                                                    INSTANT,
+                                                    Curve::Spring,
+                                                    MotionKind::MovementOrScale,
+                                                    now,
+                                                    reduced,
+                                                );
+                                                let select_t = this.motion.step_scalar(
+                                                    ListMotionKey::SelectBg(loc.clone()),
+                                                    if is_selected { 1.0 } else { 0.0 },
+                                                    if is_selected { 1.0 } else { 0.0 },
+                                                    INSTANT,
+                                                    Curve::EaseOut,
+                                                    MotionKind::OpacityOrColor,
+                                                    now,
+                                                    reduced,
+                                                );
+                                                let focus_t = this.motion.step_scalar(
+                                                    ListMotionKey::FocusRing(loc.clone()),
+                                                    0.0,
+                                                    if is_focused_row { 1.0 } else { 0.0 },
+                                                    INSTANT,
+                                                    Curve::Spring,
+                                                    MotionKind::OpacityOrColor,
+                                                    now,
+                                                    reduced,
+                                                );
+                                                let cut_t = this.motion.step_scalar(
+                                                    ListMotionKey::CutFade(loc.clone()),
+                                                    0.0,
+                                                    if is_cut { 1.0 } else { 0.0 },
+                                                    INSTANT,
+                                                    Curve::EaseOut,
+                                                    MotionKind::OpacityOrColor,
+                                                    now,
+                                                    reduced,
+                                                );
+                                                let folder_open_t = if is_dir {
+                                                    this.motion.step_scalar(
+                                                        ListMotionKey::FolderOpen(loc.clone()),
+                                                        0.0,
+                                                        if is_hovered { 1.0 } else { 0.0 },
+                                                        INSTANT,
+                                                        Curve::Spring,
+                                                        MotionKind::MovementOrScale,
+                                                        now,
+                                                        reduced,
+                                                    )
+                                                } else {
+                                                    0.0
+                                                };
+
+                                                // Navigation stagger cascade for first LIST_CASCADE_CAP rows.
+                                                let (mut x_offset, mut row_opacity) =
+                                                    if let Some((start, dir)) = this.nav_anim {
+                                                        let rel_ix = ix.saturating_sub(current_top);
+                                                        let delay = LIST_CASCADE_STEP
+                                                            * (rel_ix.min(LIST_CASCADE_CAP) as u32);
+                                                        let elapsed =
+                                                            now.saturating_duration_since(start);
+                                                        if elapsed < delay {
+                                                            let sign = match dir {
+                                                                NavigationDirection::Back => -1.0,
+                                                                _ => 1.0,
+                                                            };
+                                                            (sign * LIST_ENTER_OFFSET_PX, 0.0)
+                                                        } else {
+                                                            let raw_t = (elapsed - delay)
+                                                                .as_secs_f32()
+                                                                / SETTLE.as_secs_f32();
+                                                            let spring = Curve::Spring
+                                                                .sample(raw_t.clamp(0.0, 1.0));
+                                                            let op = Curve::EaseOut
+                                                                .sample(raw_t.clamp(0.0, 1.0));
+                                                            let sign = match dir {
+                                                                NavigationDirection::Back => -1.0,
+                                                                _ => 1.0,
+                                                            };
+                                                            (
+                                                                sign * LIST_ENTER_OFFSET_PX
+                                                                    * (1.0 - spring),
+                                                                op,
+                                                            )
+                                                        }
+                                                    } else {
+                                                        (0.0, 1.0)
+                                                    };
+
+                                                // Insert flash vs watcher calm insert.
+                                                let mut insert_flash_a = 0.0_f32;
+                                                let mut insert_box_scale = 1.0_f32;
+                                                if let Some(&ts) = this.flash_inserts.get(&loc) {
+                                                    let t = (now
+                                                        .saturating_duration_since(ts)
+                                                        .as_secs_f32()
+                                                        / SETTLE.as_secs_f32())
+                                                    .clamp(0.0, 1.0);
+                                                    let spring = Curve::Spring.sample(t);
+                                                    x_offset += -24.0 * (1.0 - spring);
+                                                    insert_box_scale =
+                                                        lerp_f32(ROW_INSERT_START_SCALE, 1.0, spring);
+                                                    insert_flash_a =
+                                                        0.22 * (1.0 - Curve::EaseOut.sample(t));
+                                                    row_opacity *= Curve::EaseOut.sample(t);
+                                                    let _ = this.motion.step_scalar(
+                                                        ListMotionKey::InsertEnter(loc.clone()),
+                                                        0.0,
+                                                        1.0,
+                                                        SETTLE,
+                                                        Curve::Spring,
+                                                        MotionKind::MovementOrScale,
+                                                        now,
+                                                        reduced,
+                                                    );
+                                                } else if let Some(&ts) =
+                                                    this.calm_inserts.get(&loc)
+                                                {
+                                                    let t = (now
+                                                        .saturating_duration_since(ts)
+                                                        .as_secs_f32()
+                                                        / SETTLE.as_secs_f32())
+                                                    .clamp(0.0, 1.0);
+                                                    let spring = Curve::Spring.sample(t);
+                                                    x_offset += -18.0 * (1.0 - spring);
+                                                    row_opacity *= Curve::EaseOut.sample(t);
+                                                }
+
+                                                // Sort / filter / delete gap closure Y offset.
+                                                let y_offset = if let Some(ro) =
+                                                    this.reorder_offsets.get(&loc)
+                                                {
+                                                    let t = (now
+                                                        .saturating_duration_since(ro.started_at)
+                                                        .as_secs_f32()
+                                                        / SETTLE.as_secs_f32())
+                                                    .clamp(0.0, 1.0);
+                                                    ro.from_delta_px
+                                                        * (1.0 - Curve::Spring.sample(t))
+                                                } else {
+                                                    0.0
+                                                };
+
+                                                row_opacity *= lerp_f32(1.0, 0.5, cut_t);
+
+                                                let base_hover = color_lerp(
+                                                    transparent_black(),
+                                                    row_hover,
+                                                    hover_t,
+                                                );
+                                                let mut bg: Hsla =
+                                                    color_lerp(base_hover, row_selected, select_t);
+                                                if insert_flash_a > 0.005 {
+                                                    bg = color_lerp(
+                                                        bg,
+                                                        row_accent,
+                                                        insert_flash_a.min(0.35),
+                                                    );
+                                                }
+                                                let border_col = focus_ring_color(
+                                                    transparent_black(),
+                                                    focus_t,
+                                                    &theme_for_rows,
+                                                );
+                                                let icon_scale = if reduced {
+                                                    1.0
+                                                } else {
+                                                    lerp_f32(1.0, PRESS_SCALE, press_t)
+                                                        * insert_box_scale
+                                                };
+                                                let icon_motion = if is_dir {
+                                                    if !reduced && folder_open_t > 0.01 {
+                                                        IconMotion::State(folder_open_t)
+                                                    } else {
+                                                        IconMotion::Rest
+                                                    }
+                                                } else if !reduced && hover_t > 0.01 {
+                                                    IconMotion::State(hover_t)
+                                                } else {
+                                                    IconMotion::Rest
+                                                };
+
+                                                let loc_hover = loc.clone();
+                                                let loc_press = loc.clone();
+
                                                 items.push(
                                                     div()
                                                         .id(ix)
+                                                        .relative()
+                                                        .left(px(x_offset))
+                                                        .top(px(y_offset))
                                                         .flex()
                                                         .flex_row()
                                                         .w_full()
@@ -837,18 +1468,35 @@ impl Render for ListView {
                                                         .px(space::S8)
                                                         .gap(space::S8)
                                                         .rounded(radius::CONTROL)
+                                                        .border_1()
+                                                        .border_color(border_col)
+                                                        .bg(bg)
+                                                        .opacity(row_opacity.clamp(0.0, 1.0))
                                                         .items_center()
                                                         .cursor_pointer()
-                                                        .when(is_selected, |s| s.bg(row_selected))
-                                                        .when(!is_selected, |s| {
-                                                            s.hover(|s| s.bg(row_hover))
-                                                        })
                                                         .text_body()
                                                         .text_color(if is_hidden && !is_selected {
                                                             row_muted
                                                         } else {
                                                             row_text
                                                         })
+                                                        .on_hover(cx.listener(
+                                                            move |this, hovered, _, cx| {
+                                                                if *hovered {
+                                                                    this.hovered_location =
+                                                                        Some(loc_hover.clone());
+                                                                    cx.notify();
+                                                                } else if this
+                                                                    .hovered_location
+                                                                    .as_ref()
+                                                                    == Some(&loc_hover)
+                                                                {
+                                                                    this.hovered_location = None;
+                                                                    this.pressed_location = None;
+                                                                    cx.notify();
+                                                                }
+                                                            },
+                                                        ))
                                                         .on_mouse_down(
                                                             MouseButton::Left,
                                                             cx.listener(
@@ -856,6 +1504,8 @@ impl Render for ListView {
                                                                       event: &MouseDownEvent,
                                                                       window,
                                                                       cx| {
+                                                                    this.pressed_location =
+                                                                        Some(loc_press.clone());
                                                                     this.on_entry_click(
                                                                         ix,
                                                                         entry_for_click.clone(),
@@ -865,6 +1515,24 @@ impl Render for ListView {
                                                                     );
                                                                 },
                                                             ),
+                                                        )
+                                                        .on_mouse_up(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                if this.pressed_location.is_some() {
+                                                                    this.pressed_location = None;
+                                                                    cx.notify();
+                                                                }
+                                                            }),
+                                                        )
+                                                        .on_mouse_up_out(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                if this.pressed_location.is_some() {
+                                                                    this.pressed_location = None;
+                                                                    cx.notify();
+                                                                }
+                                                            }),
                                                         )
                                                         .on_mouse_down(
                                                             MouseButton::Right,
@@ -892,19 +1560,24 @@ impl Render for ListView {
                                                                 .flex()
                                                                 .items_center()
                                                                 .gap(space::S8)
-                                                                .child(if is_dir {
-                                                                    icon(IconName::Folder)
-                                                                        .text_color(row_accent)
-                                                                } else {
-                                                                    icon(IconName::File).text_color(
-                                                                        if is_hidden && !is_selected
-                                                                        {
-                                                                            row_muted
-                                                                        } else {
-                                                                            row_text
-                                                                        },
-                                                                    )
-                                                                })
+                                                                .child(animated_icon_sized(
+                                                                    if is_dir {
+                                                                        IconName::Folder
+                                                                    } else {
+                                                                        IconName::File
+                                                                    },
+                                                                    icon_motion,
+                                                                    size::ICON * icon_scale,
+                                                                    if is_dir {
+                                                                        row_accent
+                                                                    } else if is_hidden
+                                                                        && !is_selected
+                                                                    {
+                                                                        row_muted
+                                                                    } else {
+                                                                        row_text
+                                                                    },
+                                                                ))
                                                                 .child(div().ellipsize().child(name)),
                                                         )
                                                         .child(
@@ -942,6 +1615,7 @@ impl Render for ListView {
                                 .track_scroll(self.scroll_handle.clone())
                                 .size_full(),
                             )
+                            .children(exiting_elements)
                             .when_some(
                                 self.rubber_band.as_ref().filter(|rb| rb.is_drag()),
                                 |container, rb| {
@@ -1012,6 +1686,11 @@ impl Render for ListView {
                                     .cursor(CursorStyle::Arrow),
                             ),
                     ),
-            )
+            );
+
+        self.prune_list_motion(now, reduced);
+        let animating = self.has_active_list_motion(now, reduced);
+        request_frame_if_active(animating, window);
+        root
     }
 }

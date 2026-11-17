@@ -22,6 +22,8 @@ pub use search_view::SearchView;
 pub use settings_view::SettingsView;
 pub use sidebar_view::SidebarView;
 
+use std::time::Instant;
+
 use gpui::{
     div, prelude::*, px, App, Context, CursorStyle, DragMoveEvent, EmptyView, Entity, Pixels,
     SharedString, Window,
@@ -36,7 +38,11 @@ use crate::actions::remote_sync::RemotePollerHost;
 use crate::actions::{
     DisconnectRemote, ManageServers, OpenSettings, ReconnectRemote, RefreshListing, TogglePreview,
 };
-use crate::layout::PanelLayout;
+use crate::layout::{PanelLayout, PREVIEW_DEFAULT, SIDEBAR_DEFAULT};
+use crate::motion::{
+    color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
+    ScalarTransition, SETTLE, STATUS_POP_START_SCALE,
+};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{size, space, Fonts, TextRole};
@@ -58,6 +64,13 @@ pub struct MainView {
     pub settings: Entity<SettingsView>,
     pub context_menu: Entity<ContextMenuView>,
     pub remote_sync: Entity<RemotePollerHost>,
+    panel_initialized: bool,
+    drag_bypass_once: bool,
+    last_window_width: Pixels,
+    sidebar_width_anim: ScalarTransition,
+    preview_width_anim: ScalarTransition,
+    last_status_revision: u64,
+    status_pop_started_at: Option<Instant>,
 }
 
 impl MainView {
@@ -165,6 +178,7 @@ impl MainView {
         })
         .detach();
 
+        let initial_status_rev = app_state.read(cx).status_revision;
         Self {
             app_state,
             header,
@@ -179,6 +193,19 @@ impl MainView {
             settings,
             context_menu,
             remote_sync,
+            panel_initialized: false,
+            drag_bypass_once: false,
+            last_window_width: px(0.),
+            sidebar_width_anim: ScalarTransition::settled(
+                SIDEBAR_DEFAULT / px(1.),
+                MotionKind::MovementOrScale,
+            ),
+            preview_width_anim: ScalarTransition::settled(
+                PREVIEW_DEFAULT / px(1.),
+                MotionKind::MovementOrScale,
+            ),
+            last_status_revision: initial_status_rev,
+            status_pop_started_at: None,
         }
     }
 }
@@ -226,6 +253,7 @@ impl MainView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.drag_bypass_once = true;
         let pointer = event.event.position.x - event.bounds.left();
         let width = event.bounds.size.width;
         self.resize_panels(cx, |panels| panels.drag_sidebar(pointer, width));
@@ -237,6 +265,7 @@ impl MainView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.drag_bypass_once = true;
         let pointer = event.bounds.right() - event.event.position.x;
         let width = event.bounds.size.width;
         self.resize_panels(cx, |panels| panels.drag_preview(pointer, width));
@@ -487,12 +516,110 @@ impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
-        let state = self.app_state.read(cx);
-        let panels = state.panels.resolve(window.viewport_size().width);
-        let entry_count = state.entries.len();
-        let selected_count = state.selection.len();
-        let selected_bytes = state.selected_total_size();
-        let status_msg = state.status_message.clone();
+        let now = Instant::now();
+        let window_width = window.viewport_size().width;
+
+        let (
+            panels,
+            entry_count,
+            selected_count,
+            selected_bytes,
+            status_msg,
+            status_revision,
+            status_is_completion,
+            reduced,
+            panel_preview_setting,
+        ) = {
+            let state = self.app_state.read(cx);
+            (
+                state.panels.resolve(window_width),
+                state.entries.len(),
+                state.selection.len(),
+                state.selected_total_size(),
+                state.status_message.clone(),
+                state.status_revision,
+                state.status_is_completion,
+                is_reduced_motion(state.settings.motion_preference),
+                state.panels.preview,
+            )
+        };
+
+        let target_sidebar_px = panels.sidebar / px(1.);
+        let target_preview_px = panels.preview.map_or(0.0, |w| w / px(1.));
+
+        if !self.panel_initialized
+            || self.drag_bypass_once
+            || window_width != self.last_window_width
+        {
+            self.sidebar_width_anim =
+                ScalarTransition::settled(target_sidebar_px, MotionKind::MovementOrScale);
+            self.preview_width_anim =
+                ScalarTransition::settled(target_preview_px, MotionKind::MovementOrScale);
+            self.panel_initialized = true;
+            self.drag_bypass_once = false;
+            self.last_window_width = window_width;
+        } else {
+            self.sidebar_width_anim.retarget(
+                target_sidebar_px,
+                SETTLE,
+                Curve::Spring,
+                MotionKind::MovementOrScale,
+                now,
+                reduced,
+            );
+            self.preview_width_anim.retarget(
+                target_preview_px,
+                SETTLE,
+                Curve::Spring,
+                MotionKind::MovementOrScale,
+                now,
+                reduced,
+            );
+        }
+
+        let display_sidebar = self.sidebar_width_anim.value_at(now, reduced);
+        let display_preview = self.preview_width_anim.value_at(now, reduced);
+
+        if status_revision != self.last_status_revision {
+            self.last_status_revision = status_revision;
+            if status_is_completion && !reduced {
+                self.status_pop_started_at = Some(now);
+            } else {
+                self.status_pop_started_at = None;
+            }
+        }
+
+        let mut status_pop_scale = 1.0_f32;
+        let mut status_pop_opacity = 1.0_f32;
+        let mut status_pop_offset = 0.0_f32;
+        let mut status_pop_active = false;
+        if let Some(start) = self.status_pop_started_at {
+            let elapsed = now.saturating_duration_since(start);
+            if reduced || elapsed >= SETTLE {
+                self.status_pop_started_at = None;
+            } else {
+                let t = (elapsed.as_secs_f32() / SETTLE.as_secs_f32()).clamp(0.0, 1.0);
+                let spring = Curve::Spring.sample(t);
+                status_pop_scale = lerp_f32(STATUS_POP_START_SCALE, 1.0, spring).max(0.5);
+                status_pop_opacity = Curve::EaseOut.sample(t);
+                status_pop_offset = (1.0 - spring) * 5.0;
+                status_pop_active = true;
+            }
+        }
+
+        let animating = self.sidebar_width_anim.is_active_at(now, reduced)
+            || self.preview_width_anim.is_active_at(now, reduced)
+            || status_pop_active;
+        request_frame_if_active(animating, window);
+
+        let status_color: gpui::Hsla = if status_is_completion {
+            color_lerp(theme.secondary, theme.text_muted, 0.2)
+        } else if status_msg.is_some() {
+            theme.warning.into()
+        } else {
+            theme.text_muted.into()
+        };
+        let inner_preview_width = panels.preview.unwrap_or(panel_preview_setting);
 
         div()
             .flex()
@@ -540,8 +667,9 @@ impl Render for MainView {
                         div()
                             .relative()
                             .flex_shrink_0()
-                            .w(panels.sidebar)
+                            .w(px(display_sidebar.max(0.0)))
                             .h_full()
+                            .overflow_hidden()
                             .child(self.sidebar.clone())
                             .child(resize_handle(
                                 "sidebar-edge",
@@ -560,14 +688,20 @@ impl Render for MainView {
                             .child(self.list.clone())
                             .child(self.jobs.clone()),
                     )
-                    .when_some(panels.preview, |row, width| {
+                    .when(display_preview > 1.0, |row| {
                         row.child(
                             div()
                                 .relative()
                                 .flex_shrink_0()
-                                .w(width)
+                                .w(px(display_preview))
                                 .h_full()
-                                .child(self.preview.clone())
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .w(inner_preview_width)
+                                        .h_full()
+                                        .child(self.preview.clone()),
+                                )
                                 .child(resize_handle(
                                     "preview-edge",
                                     PreviewEdge,
@@ -600,11 +734,13 @@ impl Render for MainView {
                     )
                     .child(
                         div()
-                            .text_color(if status_msg.is_some() {
-                                theme.warning
-                            } else {
-                                theme.text_muted
+                            .relative()
+                            .top(px(status_pop_offset))
+                            .opacity(status_pop_opacity)
+                            .when(status_pop_active, |el| {
+                                el.text_size(px(12.0 * status_pop_scale))
                             })
+                            .text_color(status_color)
                             .child(status_msg.unwrap_or_default()),
                     ),
             )

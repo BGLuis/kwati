@@ -478,7 +478,6 @@ fn finish_transfer(
     report: TransferReport,
 ) -> Result<CopyOutcome, String> {
     unregister_job_cancel(job_id);
-    state.remove_job(job_id);
 
     let (noun, past) = if transfer.is_move() {
         ("Move", "Moved")
@@ -487,14 +486,18 @@ fn finish_transfer(
     };
 
     if let Some(err) = report.error {
+        state.remove_job(job_id);
         let msg = format!("{noun} failed: {err}");
         state.set_status(msg.clone());
         return Err(msg);
     }
     if report.outcome == CopyOutcome::Cancelled {
+        state.remove_job(job_id);
         state.set_status(format!("{noun} operation cancelled"));
         return Ok(report.outcome);
     }
+
+    state.complete_job(job_id);
 
     if report.transferred > 0 {
         let first_target = transfer
@@ -503,6 +506,15 @@ fn finish_transfer(
             .and_then(|src| src.file_name())
             .map(|name| transfer.dest_dir.join(name));
         let viewing_destination = state.current_location == transfer.dest_dir;
+
+        for src in &transfer.sources {
+            if let Some(name) = src.file_name() {
+                state.mark_highlighted_insert(transfer.dest_dir.join(name));
+            }
+        }
+        if transfer.is_move() {
+            state.mark_recent_deletions(transfer.sources.iter().cloned());
+        }
 
         if !report.undo_to.is_empty() {
             state.undo_stack.push(if transfer.is_move() {
@@ -527,7 +539,7 @@ fn finish_transfer(
             clear_clipboard();
         }
     }
-    state.set_status(format!("{past} {} item(s)", report.transferred));
+    state.set_completion_status(format!("{past} {} item(s)", report.transferred));
     Ok(report.outcome)
 }
 
@@ -697,6 +709,7 @@ pub fn apply_rename_result(state: &mut AppState, source: &Location, target: &Loc
     }
 
     if source.parent().as_ref() == Some(&state.current_location) {
+        state.mark_highlighted_insert(target.clone());
         state.reload_entries();
     }
 
@@ -704,7 +717,7 @@ pub fn apply_rename_result(state: &mut AppState, source: &Location, target: &Loc
 
     let old_name = location_display_name(source);
     let new_name = location_display_name(target);
-    state.set_status(format!("Renamed '{}' to '{}'", old_name, new_name));
+    state.set_completion_status(format!("Renamed '{}' to '{}'", old_name, new_name));
 }
 
 /// Renames a local or remote entry via its [`Backend`], updating `state`.
@@ -761,11 +774,12 @@ pub fn apply_create_folder_result(state: &mut AppState, parent: &Location, targe
     }
 
     if parent == &state.current_location {
+        state.mark_highlighted_insert(target.clone());
         state.reload_entries();
     }
 
     state.select_location(target.clone());
-    state.set_status(format!(
+    state.set_completion_status(format!(
         "Created folder '{}'",
         location_display_name(target)
     ));
@@ -853,6 +867,7 @@ pub fn apply_trash_report(state: &mut AppState, report: TrashReport) -> TrashOut
                 original_paths: local_paths,
             });
         }
+        state.mark_recent_deletions(report.trashed.iter().cloned());
         for loc in &report.trashed {
             state.selection.deselect(loc);
         }
@@ -869,7 +884,7 @@ pub fn apply_trash_report(state: &mut AppState, report: TrashReport) -> TrashOut
         return TrashOutcome::Unavailable(report.unavailable);
     }
 
-    state.set_status(format!("Moved {} item(s) to trash", report.trashed.len()));
+    state.set_completion_status(format!("Moved {} item(s) to trash", report.trashed.len()));
     TrashOutcome::Trashed(report.trashed.len())
 }
 
@@ -946,6 +961,7 @@ pub fn delete_locations_permanently_with_backends(
 /// Applies a [`DeleteReport`] to `state`, updating selection, listing, and status.
 pub fn apply_delete_report(state: &mut AppState, report: DeleteReport) -> Result<usize, String> {
     if !report.deleted.is_empty() {
+        state.mark_recent_deletions(report.deleted.iter().cloned());
         for loc in &report.deleted {
             state.selection.deselect(loc);
         }
@@ -957,7 +973,7 @@ pub fn apply_delete_report(state: &mut AppState, report: DeleteReport) -> Result
         state.set_status(msg.clone());
         Err(msg)
     } else {
-        state.set_status(format!(
+        state.set_completion_status(format!(
             "Permanently deleted {} item(s)",
             report.deleted.len()
         ));

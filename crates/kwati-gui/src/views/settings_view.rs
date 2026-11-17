@@ -1,14 +1,22 @@
 //! Grouped, data-driven Settings modal view (#29, #34, #50, #52).
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use gpui::{
     div, prelude::*, px, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Subscription,
     Window,
 };
-use kwati_core::{Settings, SortColumn, SortDirection};
+use kwati_core::{MotionPreference, Settings, SortColumn, SortDirection};
 
-use crate::components::{icon, IconName, TextInput};
+use crate::components::{
+    animated_icon, animated_toggle_switch, icon, modal_scrim_color, wrap_modal_card_entrance,
+    IconMotion, IconName, TextInput,
+};
+use crate::motion::{
+    is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker, INSTANT, QUICK,
+    SETTLE,
+};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole};
@@ -27,6 +35,7 @@ pub enum SettingKey {
     ShowHidden,
     DefaultSortColumn,
     DefaultSortDirection,
+    MotionPreference,
     ListTimeoutSecs,
     RefreshIntervalSecs,
     RemotePollEnabled,
@@ -41,6 +50,7 @@ pub enum SettingControlKind {
     Toggle,
     SortColumn,
     SortDirection,
+    MotionPreference,
     Number {
         min: u32,
         max: u32,
@@ -85,6 +95,13 @@ pub const SETTINGS_ROWS: &[SettingRowSpec] = &[
         label: "Ordenação padrão (direção)",
         description: "Ordem crescente ou decrescente da listagem.",
         kind: SettingControlKind::SortDirection,
+    },
+    SettingRowSpec {
+        key: SettingKey::MotionPreference,
+        section: SettingsSectionId::General,
+        label: "Animações e movimento",
+        description: "Controla movimento e escalas; o modo reduzido mantém apenas cor e opacidade.",
+        kind: SettingControlKind::MotionPreference,
     },
     SettingRowSpec {
         key: SettingKey::ListTimeoutSecs,
@@ -173,11 +190,21 @@ fn spec_for(key: SettingKey) -> Option<&'static SettingRowSpec> {
     SETTINGS_ROWS.iter().find(|r| r.key == key)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SettingsMotionKey {
+    ModalOpen,
+    Toggle(SettingKey),
+    HeaderSettingsIcon,
+    Button(usize),
+}
+
 pub struct SettingsView {
     pub app_state: Entity<AppState>,
     pub focus_handle: FocusHandle,
     inputs: HashMap<SettingKey, Entity<TextInput>>,
+    last_input_texts: HashMap<SettingKey, String>,
     errors: HashMap<SettingKey, String>,
+    motion: MotionTracker<SettingsMotionKey>,
     last_open: bool,
     is_syncing: bool,
     _subscriptions: Vec<Subscription>,
@@ -188,10 +215,12 @@ impl SettingsView {
         let initial = app_state.read(cx).settings.clone();
         let last_open = app_state.read(cx).settings_open;
         let mut inputs = HashMap::new();
+        let mut last_input_texts = HashMap::new();
         let mut subscriptions = Vec::new();
 
         for &key in NUMERIC_KEYS {
             let val = numeric_value(&initial, key).unwrap_or(1).to_string();
+            last_input_texts.insert(key, val.clone());
             let input = cx.new(|cx| {
                 let mut field = TextInput::with_placeholder("", cx);
                 field.set_text(val, cx);
@@ -202,6 +231,10 @@ impl SettingsView {
                     return;
                 }
                 let text = input.read(cx).text().to_string();
+                if this.last_input_texts.get(&key) == Some(&text) {
+                    return;
+                }
+                this.last_input_texts.insert(key, text.clone());
                 let _ = this.apply_numeric_text(key, &text, cx);
             });
             inputs.insert(key, input);
@@ -211,8 +244,20 @@ impl SettingsView {
         let state_sub = cx.observe(&app_state, |this, app_state, cx| {
             let open = app_state.read(cx).settings_open;
             if open && !this.last_open {
+                let now = Instant::now();
                 this.errors.clear();
                 this.sync_inputs_from_state(cx);
+                this.motion.set_immediate(
+                    SettingsMotionKey::ModalOpen,
+                    0.0,
+                    MotionKind::MovementOrScale,
+                );
+                this.motion.trigger_pulse(
+                    SettingsMotionKey::HeaderSettingsIcon,
+                    QUICK,
+                    MotionKind::MovementOrScale,
+                    now,
+                );
             }
             this.last_open = open;
             cx.notify();
@@ -223,7 +268,9 @@ impl SettingsView {
             app_state,
             focus_handle: cx.focus_handle(),
             inputs,
+            last_input_texts,
             errors: HashMap::new(),
+            motion: MotionTracker::new(),
             last_open,
             is_syncing: false,
             _subscriptions: subscriptions,
@@ -235,9 +282,21 @@ impl SettingsView {
     }
 
     pub fn open(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
         self.errors.clear();
         self.app_state.update(cx, |state, _| state.open_settings());
         self.sync_inputs_from_state(cx);
+        self.motion.set_immediate(
+            SettingsMotionKey::ModalOpen,
+            0.0,
+            MotionKind::MovementOrScale,
+        );
+        self.motion.trigger_pulse(
+            SettingsMotionKey::HeaderSettingsIcon,
+            QUICK,
+            MotionKind::MovementOrScale,
+            now,
+        );
         self.last_open = true;
         cx.notify();
     }
@@ -270,6 +329,7 @@ impl SettingsView {
             if let (Some(input), Some(val)) = (self.inputs.get(&key), numeric_value(&settings, key))
             {
                 let text = val.to_string();
+                self.last_input_texts.insert(key, text.clone());
                 input.update(cx, |field, cx| {
                     if field.text() != text {
                         field.set_text(text, cx);
@@ -287,6 +347,7 @@ impl SettingsView {
         raw: &str,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        self.last_input_texts.insert(key, raw.to_string());
         if let Some(input) = self.inputs.get(&key) {
             self.is_syncing = true;
             input.update(cx, |field, cx| field.set_text(raw.to_string(), cx));
@@ -314,6 +375,9 @@ impl SettingsView {
             Ok(_) | Err(_) => {
                 let msg = format!("Informe um número inteiro entre {min} e {max}.");
                 self.errors.insert(key, msg.clone());
+                if let Some(input) = self.inputs.get(&key).cloned() {
+                    input.update(cx, |field, cx| field.trigger_shake(cx));
+                }
                 cx.notify();
                 return Err(msg);
             }
@@ -341,11 +405,17 @@ impl SettingsView {
         match result {
             Ok(()) => {
                 self.errors.remove(&key);
+                if let Some(input) = self.inputs.get(&key).cloned() {
+                    input.update(cx, |field, cx| field.set_invalid(false, cx));
+                }
                 cx.notify();
                 Ok(())
             }
             Err(err) => {
                 self.errors.insert(key, err.clone());
+                if let Some(input) = self.inputs.get(&key).cloned() {
+                    input.update(cx, |field, cx| field.trigger_shake(cx));
+                }
                 cx.notify();
                 Err(err)
             }
@@ -422,6 +492,21 @@ impl SettingsView {
         res
     }
 
+    pub fn set_motion_preference(
+        &mut self,
+        pref: MotionPreference,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let res = self.app_state.update(cx, |state, _| {
+            state.update_settings(|s| {
+                s.motion_preference = pref;
+                Ok(())
+            })
+        });
+        cx.notify();
+        res
+    }
+
     pub fn reset_to_defaults(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         let res = self.app_state.update(cx, |state, _| {
             state.reset_settings()?;
@@ -448,7 +533,13 @@ impl SettingsView {
         }
     }
 
-    fn render_row(&self, spec: &SettingRowSpec, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_row(
+        &mut self,
+        spec: &SettingRowSpec,
+        now: Instant,
+        reduced: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
         let settings = self.app_state.read(cx).settings.clone();
@@ -462,31 +553,51 @@ impl SettingsView {
                     _ => false,
                 };
                 let key = spec.key;
+                let slide_t = self.motion.step_scalar(
+                    SettingsMotionKey::Toggle(key),
+                    if active { 1.0 } else { 0.0 },
+                    if active { 1.0 } else { 0.0 },
+                    QUICK,
+                    Curve::Spring,
+                    MotionKind::OpacityOrColor,
+                    now,
+                    reduced,
+                );
+                let press_t = self
+                    .motion
+                    .pulse_progress(&SettingsMotionKey::Button(key as usize), now, reduced)
+                    .map_or(0.0, |p| (p * std::f32::consts::PI).sin());
+
                 div()
-                    .id(("setting-toggle", key as usize))
-                    .px(space::S12)
-                    .py(space::S4)
-                    .rounded(radius::CONTROL)
-                    .border_1()
-                    .border_color(if active { theme.accent } else { theme.border })
-                    .bg(if active {
-                        theme.accent
-                    } else {
-                        theme.surface_raised
-                    })
-                    .text_label()
-                    .text_color(if active {
-                        theme.on_accent
-                    } else {
-                        theme.text_muted
-                    })
-                    .cursor_pointer()
-                    .child(if active { "Ativado" } else { "Desativado" })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            let _ = this.toggle_bool_setting(key, cx);
-                        }),
+                    .flex()
+                    .items_center()
+                    .gap(space::S8)
+                    .child(
+                        div()
+                            .text_label()
+                            .text_color(if active { theme.text } else { theme.text_muted })
+                            .child(if active { "Ativado" } else { "Desativado" }),
+                    )
+                    .child(
+                        animated_toggle_switch(
+                            ("setting-toggle", key as usize),
+                            slide_t,
+                            press_t,
+                            &theme,
+                            reduced,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.motion.trigger_pulse(
+                                    SettingsMotionKey::Button(key as usize),
+                                    INSTANT,
+                                    MotionKind::MovementOrScale,
+                                    Instant::now(),
+                                );
+                                let _ = this.toggle_bool_setting(key, cx);
+                            }),
+                        ),
                     )
                     .into_any_element()
             }
@@ -573,25 +684,55 @@ impl SettingsView {
                     }))
                     .into_any_element()
             }
+            SettingControlKind::MotionPreference => {
+                let current = settings.motion_preference;
+                let choices = [
+                    (MotionPreference::System, "Automático"),
+                    (MotionPreference::Full, "Completo"),
+                    (MotionPreference::Reduced, "Reduzido"),
+                ];
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(space::S4)
+                    .children(choices.into_iter().enumerate().map(|(ix, (pref, label))| {
+                        let selected = current == pref;
+                        div()
+                            .id(("motion-pref-opt", ix))
+                            .px(space::S8)
+                            .py(space::S4)
+                            .rounded(radius::CONTROL)
+                            .border_1()
+                            .border_color(if selected { theme.accent } else { theme.border })
+                            .bg(if selected {
+                                theme.selection
+                            } else {
+                                theme.surface_raised
+                            })
+                            .text_label()
+                            .text_color(if selected {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            })
+                            .cursor_pointer()
+                            .child(label)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    let _ = this.set_motion_preference(pref, cx);
+                                }),
+                            )
+                    }))
+                    .into_any_element()
+            }
             SettingControlKind::Number { unit, .. } => {
                 let input = self.inputs.get(&spec.key).cloned();
                 div()
                     .flex()
                     .items_center()
                     .gap(space::S8)
-                    .children(input.map(|field| {
-                        div()
-                            .w(px(76.))
-                            .text_data(&fonts)
-                            .border_1()
-                            .border_color(if error.is_some() {
-                                theme.danger
-                            } else {
-                                theme.border
-                            })
-                            .rounded(radius::CONTROL)
-                            .child(field)
-                    }))
+                    .children(input.map(|field| div().w(px(76.)).text_data(&fonts).child(field)))
                     .child(div().text_label().text_color(theme.text_muted).child(unit))
                     .into_any_element()
             }
@@ -634,12 +775,166 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_open(cx) {
             return div().into_any_element();
         }
 
+        let now = Instant::now();
         let theme = Theme::get(cx);
+        let reduced = is_reduced_motion(self.app_state.read(cx).settings.motion_preference);
+
+        let open_t = self.motion.step_scalar(
+            SettingsMotionKey::ModalOpen,
+            0.0,
+            1.0,
+            SETTLE,
+            Curve::Linear,
+            MotionKind::OpacityOrColor,
+            now,
+            reduced,
+        );
+        let icon_motion = self
+            .motion
+            .pulse_progress(&SettingsMotionKey::HeaderSettingsIcon, now, reduced)
+            .map_or(IconMotion::Rest, IconMotion::Pulse);
+
+        let sections = SETTINGS_SECTIONS
+            .iter()
+            .map(|&(section_id, title)| {
+                let rows: Vec<&SettingRowSpec> = SETTINGS_ROWS
+                    .iter()
+                    .filter(|r| r.section == section_id)
+                    .collect();
+                let rendered_rows: Vec<_> = rows
+                    .into_iter()
+                    .map(|spec| self.render_row(spec, now, reduced, cx))
+                    .collect();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::S4)
+                    .child(div().text_label().text_color(theme.accent).child(title))
+                    .children(rendered_rows)
+            })
+            .collect::<Vec<_>>();
+
+        let card = div()
+            .id("settings-modal-card")
+            .w(px(580.))
+            .max_h(px(640.))
+            .rounded(radius::DIALOG)
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // Header
+            .child(
+                div()
+                    .px(space::S16)
+                    .py(space::S12)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(space::S8)
+                            .child(animated_icon(IconName::Settings, icon_motion, theme.accent))
+                            .child(
+                                div()
+                                    .text_title()
+                                    .text_color(theme.text)
+                                    .child("Configurações"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("settings-header-close")
+                            .p(space::S4)
+                            .rounded(radius::CONTROL)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.surface_raised))
+                            .child(icon(IconName::Close).text_color(theme.text_muted))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.close(cx)),
+                            ),
+                    ),
+            )
+            // Grouped sections
+            .child(
+                div()
+                    .id("settings-scroll-body")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .px(space::S16)
+                    .py(space::S12)
+                    .flex()
+                    .flex_col()
+                    .gap(space::S16)
+                    .children(sections),
+            )
+            // Footer
+            .child(
+                div()
+                    .px(space::S16)
+                    .py(space::S12)
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .id("settings-reset")
+                            .h(size::CONTROL)
+                            .px(space::S12)
+                            .rounded(radius::CONTROL)
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.surface_raised)
+                            .flex()
+                            .items_center()
+                            .text_body()
+                            .text_color(theme.text)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.border))
+                            .child("Restaurar padrões")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    let _ = this.reset_to_defaults(cx);
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("settings-close")
+                            .h(size::CONTROL)
+                            .px(space::S12)
+                            .rounded(radius::CONTROL)
+                            .bg(theme.accent)
+                            .flex()
+                            .items_center()
+                            .text_body()
+                            .text_color(theme.on_accent)
+                            .cursor_pointer()
+                            .child("Fechar")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.close(cx)),
+                            ),
+                    ),
+            )
+            .into_any_element();
+
+        request_frame_if_active(self.motion.has_active(now, reduced), window);
 
         div()
             .id("settings-modal-scrim")
@@ -648,138 +943,11 @@ impl Render for SettingsView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(theme.scrim)
+            .bg(modal_scrim_color(&theme, open_t))
             .occlude()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(
-                div()
-                    .id("settings-modal-card")
-                    .w(px(580.))
-                    .max_h(px(640.))
-                    .rounded(radius::DIALOG)
-                    .bg(theme.surface)
-                    .border_1()
-                    .border_color(theme.border)
-                    .flex()
-                    .flex_col()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    // Header
-                    .child(
-                        div()
-                            .px(space::S16)
-                            .py(space::S12)
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(space::S8)
-                                    .child(icon(IconName::Settings).text_color(theme.accent))
-                                    .child(
-                                        div()
-                                            .text_title()
-                                            .text_color(theme.text)
-                                            .child("Configurações"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("settings-header-close")
-                                    .p(space::S4)
-                                    .rounded(radius::CONTROL)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme.surface_raised))
-                                    .child(icon(IconName::Close).text_color(theme.text_muted))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.close(cx)),
-                                    ),
-                            ),
-                    )
-                    // Grouped sections
-                    .child(
-                        div()
-                            .id("settings-scroll-body")
-                            .flex_1()
-                            .overflow_y_scroll()
-                            .px(space::S16)
-                            .py(space::S12)
-                            .flex()
-                            .flex_col()
-                            .gap(space::S16)
-                            .children(SETTINGS_SECTIONS.iter().map(|&(section_id, title)| {
-                                let rows: Vec<&SettingRowSpec> = SETTINGS_ROWS
-                                    .iter()
-                                    .filter(|r| r.section == section_id)
-                                    .collect();
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(space::S4)
-                                    .child(div().text_label().text_color(theme.accent).child(title))
-                                    .children(
-                                        rows.into_iter().map(|spec| self.render_row(spec, cx)),
-                                    )
-                            })),
-                    )
-                    // Footer
-                    .child(
-                        div()
-                            .px(space::S16)
-                            .py(space::S12)
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .id("settings-reset")
-                                    .h(size::CONTROL)
-                                    .px(space::S12)
-                                    .rounded(radius::CONTROL)
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .bg(theme.surface_raised)
-                                    .flex()
-                                    .items_center()
-                                    .text_body()
-                                    .text_color(theme.text)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme.border))
-                                    .child("Restaurar padrões")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            let _ = this.reset_to_defaults(cx);
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("settings-close")
-                                    .h(size::CONTROL)
-                                    .px(space::S12)
-                                    .rounded(radius::CONTROL)
-                                    .bg(theme.accent)
-                                    .flex()
-                                    .items_center()
-                                    .text_body()
-                                    .text_color(theme.on_accent)
-                                    .cursor_pointer()
-                                    .child("Fechar")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.close(cx)),
-                                    ),
-                            ),
-                    ),
-            )
+            .child(wrap_modal_card_entrance(card, px(580.), open_t, reduced))
             .into_any_element()
     }
 }

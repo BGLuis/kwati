@@ -1,5 +1,7 @@
 //! Context menu view for file list entries and empty space (#55).
 
+use std::time::Instant;
+
 use gpui::{
     anchored, deferred, div, point, prelude::*, px, Context, CursorStyle, Entity, EventEmitter,
     FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Window,
@@ -7,6 +9,11 @@ use gpui::{
 use kwati_core::{volume_kind, Location, VolumeKind};
 
 use crate::actions::operations::get_location_clipboard;
+use crate::components::{animated_icon, popup_entrance_metrics, IconMotion, IconName};
+use crate::motion::{
+    color_lerp, is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker,
+    INSTANT, MENU_CASCADE_STEP, QUICK,
+};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole};
@@ -168,6 +175,9 @@ pub struct ContextMenuView {
     position: Point<Pixels>,
     entries: Vec<ContextMenuEntry>,
     focused_index: Option<usize>,
+    hovered_index: Option<usize>,
+    opened_at: Option<Instant>,
+    motion: MotionTracker<usize>,
 }
 
 impl EventEmitter<ContextMenuEvent> for ContextMenuView {}
@@ -187,6 +197,9 @@ impl ContextMenuView {
             position: point(px(0.), px(0.)),
             entries: Vec::new(),
             focused_index: None,
+            hovered_index: None,
+            opened_at: None,
+            motion: MotionTracker::new(),
         }
     }
 
@@ -214,6 +227,9 @@ impl ContextMenuView {
         self.entries = build_context_menu_entries(&selected, has_clipboard);
         self.position = position;
         self.focused_index = self.first_enabled_index();
+        self.hovered_index = None;
+        self.opened_at = Some(Instant::now());
+        self.motion.clear();
         self.is_open = true;
         self.focus_handle.focus(window);
         cx.notify();
@@ -227,6 +243,9 @@ impl ContextMenuView {
         self.is_open = false;
         self.entries.clear();
         self.focused_index = None;
+        self.hovered_index = None;
+        self.opened_at = None;
+        self.motion.clear();
         cx.emit(ContextMenuEvent::Closed);
         cx.notify();
     }
@@ -303,19 +322,42 @@ impl ContextMenuView {
     }
 }
 
+fn menu_action_icon(action: ContextMenuAction) -> Option<IconName> {
+    match action {
+        ContextMenuAction::Open => Some(IconName::Folder),
+        ContextMenuAction::Copy => Some(IconName::Copy),
+        ContextMenuAction::Remove => Some(IconName::Trash),
+        ContextMenuAction::NewFolder => Some(IconName::Folder),
+        ContextMenuAction::Refresh => Some(IconName::Refresh),
+        ContextMenuAction::Rename | ContextMenuAction::Cut | ContextMenuAction::Paste => None,
+    }
+}
+
 impl Render for ContextMenuView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_open {
             return div().into_any_element();
         }
 
+        let now = Instant::now();
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
+        let reduced = is_reduced_motion(self.app_state.read(cx).settings.motion_preference);
         let focused = self.focused_index;
+
+        let open_elapsed = self
+            .opened_at
+            .map_or(QUICK, |t| now.saturating_duration_since(t));
+        let open_dur = if reduced { INSTANT } else { QUICK };
+        let open_t = (open_elapsed.as_secs_f32() / open_dur.as_secs_f32()).clamp(0.0, 1.0);
+        let (card_scale, card_opacity) = popup_entrance_metrics(open_t, reduced);
+
+        const CARD_W: f32 = 210.0;
+        let visible_w = px(CARD_W * card_scale);
 
         let mut card = div()
             .id("context-menu-card")
-            .w(px(210.))
+            .w(px(CARD_W))
             .py(space::S4)
             .px(space::S4)
             .rounded(radius::CONTROL)
@@ -327,6 +369,9 @@ impl Render for ContextMenuView {
             .gap(space::S2)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+
+        let mut cascade_animating = open_t < 1.0;
+        let mut item_slot: usize = 0;
 
         for (ix, entry) in self.entries.iter().enumerate() {
             match entry {
@@ -344,6 +389,46 @@ impl Render for ContextMenuView {
                     let enabled = *enabled;
                     let destructive = *destructive;
                     let is_focused = focused == Some(ix);
+                    let is_hovered = self.hovered_index == Some(ix);
+                    let active_t = self.motion.step_scalar(
+                        ix,
+                        0.0,
+                        if enabled && (is_focused || is_hovered) {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                        INSTANT,
+                        Curve::EaseOut,
+                        MotionKind::OpacityOrColor,
+                        now,
+                        reduced,
+                    );
+                    let icon_t = self.motion.step_scalar(
+                        10_000 + ix,
+                        0.0,
+                        if enabled && is_hovered { 1.0 } else { 0.0 },
+                        QUICK,
+                        Curve::Spring,
+                        MotionKind::MovementOrScale,
+                        now,
+                        reduced,
+                    );
+
+                    let (item_opacity, item_dx) = if reduced {
+                        (card_opacity, 0.0)
+                    } else {
+                        let delay = MENU_CASCADE_STEP.saturating_mul(item_slot as u32);
+                        let since_delay = open_elapsed.saturating_sub(delay);
+                        let p = (since_delay.as_secs_f32() / QUICK.as_secs_f32()).clamp(0.0, 1.0);
+                        if p < 1.0 {
+                            cascade_animating = true;
+                        }
+                        let spring = Curve::Spring.sample(p);
+                        (Curve::EaseOut.sample(p), -6.0 * (1.0 - spring))
+                    };
+                    item_slot += 1;
+
                     let label_color = if !enabled {
                         theme.text_muted
                     } else if destructive {
@@ -351,22 +436,46 @@ impl Render for ContextMenuView {
                     } else {
                         theme.text
                     };
+                    let row_bg = color_lerp(theme.surface_raised, theme.selection, active_t);
+
+                    let icon_el = menu_action_icon(action).map(|icon_name| {
+                        let motion = if matches!(icon_name, IconName::Refresh) {
+                            if icon_t > 0.01 && icon_t < 0.99 {
+                                IconMotion::Pulse(icon_t)
+                            } else {
+                                IconMotion::Rest
+                            }
+                        } else {
+                            IconMotion::State(icon_t)
+                        };
+                        animated_icon(icon_name, motion, label_color)
+                    });
 
                     let row = div()
                         .id(("context-menu-item", ix))
+                        .relative()
+                        .left(px(item_dx))
+                        .opacity(item_opacity)
                         .h(size::ROW)
                         .px(space::S8)
                         .rounded(radius::CONTROL)
+                        .bg(row_bg)
                         .flex()
                         .flex_row()
                         .items_center()
                         .justify_between()
                         .text_body()
                         .text_color(label_color)
-                        .when(is_focused && enabled, |el| el.bg(theme.selection))
                         .when(enabled, |el| {
                             el.cursor(CursorStyle::PointingHand)
-                                .hover(|s| s.bg(theme.selection))
+                                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                    if *hovered {
+                                        this.hovered_index = Some(ix);
+                                    } else if this.hovered_index == Some(ix) {
+                                        this.hovered_index = None;
+                                    }
+                                    cx.notify();
+                                }))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -375,7 +484,14 @@ impl Render for ContextMenuView {
                                     }),
                                 )
                         })
-                        .child(*label)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(space::S8)
+                                .children(icon_el)
+                                .child(*label),
+                        )
                         .when_some(*shortcut, |el, key| {
                             el.child(
                                 div()
@@ -389,6 +505,17 @@ impl Render for ContextMenuView {
                 }
             }
         }
+
+        request_frame_if_active(
+            cascade_animating || self.motion.has_active(now, reduced),
+            window,
+        );
+
+        let animated_card = div()
+            .w(visible_w)
+            .overflow_hidden()
+            .opacity(card_opacity)
+            .child(card);
 
         deferred(
             div()
@@ -417,7 +544,7 @@ impl Render for ContextMenuView {
                     anchored()
                         .position(self.position)
                         .snap_to_window_with_margin(px(8.))
-                        .child(card),
+                        .child(animated_card),
                 ),
         )
         .with_priority(1)

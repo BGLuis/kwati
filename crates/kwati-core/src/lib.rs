@@ -42,9 +42,9 @@ pub use remote_poll::{RemotePoller, MIN_POLL_INTERVAL};
 pub use search::{RemoteSearchOptions, SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use secrets::{KeyringSecrets, Secrets, SecretsError};
 pub use settings::{
-    default_path as settings_path, Settings, SettingsWarning, DEFAULT_REFRESH_INTERVAL_SECS,
-    DEFAULT_REMOTE_POLL_INTERVAL_SECS, DEFAULT_REMOTE_SEARCH_DEPTH, DEFAULT_REMOTE_SEARCH_PARALLEL,
-    MIN_REMOTE_POLL_INTERVAL_SECS,
+    default_path as settings_path, MotionPreference, Settings, SettingsWarning,
+    DEFAULT_REFRESH_INTERVAL_SECS, DEFAULT_REMOTE_POLL_INTERVAL_SECS, DEFAULT_REMOTE_SEARCH_DEPTH,
+    DEFAULT_REMOTE_SEARCH_PARALLEL, MIN_REMOTE_POLL_INTERVAL_SECS,
 };
 pub use sftp::{known_hosts_path, HostKeyChanged, HostKeyUnknown, KnownHosts, SftpBackend};
 pub use smb::SmbBackend;

@@ -340,7 +340,7 @@ impl RemoteSyncController {
     /// Refreshes `state` while preserving existing selection by `Location`.
     pub fn refresh_preserving_selection(state: &mut AppState) {
         let previously_selected = state.selected_locations();
-        state.reload_entries();
+        state.reload_entries_from_background();
         if state.selected_locations().is_empty() && !previously_selected.is_empty() {
             for loc in previously_selected {
                 if state
