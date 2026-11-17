@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use gpui::{AppContext as _, TestAppContext};
 use kwati_core::{
-    AuthMethod, ConnectionProfile, Location, Protocol, Settings, SortColumn, SortDirection,
-    SortOrder,
+    group_for_type_key, AuthMethod, ConnectionProfile, IconConfig, IconGroup, IconSource, Location,
+    Protocol, Settings, SortColumn, SortDirection, SortOrder, ICON_TYPE_SPECS,
 };
 use kwati_gui::state::AppState;
 use kwati_gui::views::header_view::{
@@ -403,6 +403,117 @@ fn network_view_reads_timeout_from_state_and_triggers_retry_and_cancel(cx: &mut 
             state.status_message.as_deref(),
             Some("Network operation cancelled")
         );
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui::test]
+fn settings_view_icons_overrides_presets_and_reset_keep_saved_presets(cx: &mut TestAppContext) {
+    let dir = temp_dir("settings_icons_full");
+    let settings_file = dir.join("settings.toml");
+    let icons_file = dir.join("icons.toml");
+    let custom_png = dir.join("custom.png");
+    let pdf_svg = dir.join("pdf.svg");
+    std::fs::write(&custom_png, b"png").unwrap();
+    std::fs::write(&pdf_svg, b"<svg/>").unwrap();
+
+    assert!(SettingsView::is_valid_icon_image_path(&custom_png));
+    assert!(SettingsView::is_valid_icon_image_path(
+        &dir.join("UPPER.SVG")
+    ));
+    assert!(!SettingsView::is_valid_icon_image_path(
+        &dir.join("notes.txt")
+    ));
+
+    // Verify per-type specs carry their owning group next to them for the per-type list.
+    let pdf_spec = ICON_TYPE_SPECS
+        .iter()
+        .find(|s| s.key == "file-pdf")
+        .expect("file-pdf spec");
+    assert_eq!(pdf_spec.group, IconGroup::Documents);
+    assert_eq!(group_for_type_key("file-pdf"), IconGroup::Documents);
+
+    let state = cx.new(|_| {
+        AppState::new(Location::Local(dir.clone()))
+            .with_settings_path(Some(settings_file.clone()))
+            .with_icons_path(Some(icons_file.clone()))
+    });
+    let (view, cx) = cx.add_window_view(|_, cx| SettingsView::new(state.clone(), cx));
+
+    view.update_in(cx, |view, window, cx| {
+        view.open(cx);
+        view.set_installed_themes_for_test(Vec::new(), cx);
+        view.focus(window, cx);
+
+        // Base + group + type overrides
+        view.set_icon_base(IconSource::Theme("Breeze".into()), cx)
+            .unwrap();
+        view.set_icon_group_override(
+            IconGroup::Images,
+            Some(IconSource::Image(custom_png.clone())),
+            cx,
+        )
+        .unwrap();
+        view.set_icon_type_override("file-pdf", Some(IconSource::Image(pdf_svg.clone())), cx)
+            .unwrap();
+
+        // Save preset, modify, apply, rename, delete
+        view.save_icon_preset("Escritorio", cx).unwrap();
+        view.set_icon_type_override("file-pdf", None, cx).unwrap();
+    });
+
+    // Reset to inherit removes the per-type override from icons.toml
+    let disk = IconConfig::load_from(&icons_file).unwrap();
+    assert!(!disk.active.types.contains_key("file-pdf"));
+    assert_eq!(
+        disk.active.groups.get(&IconGroup::Images),
+        Some(&IconSource::Image(custom_png.clone()))
+    );
+    assert!(disk.presets.contains_key("Escritorio"));
+
+    view.update(cx, |view, cx| {
+        view.apply_icon_preset("Escritorio", cx).unwrap();
+    });
+    let disk_after_apply = IconConfig::load_from(&icons_file).unwrap();
+    assert_eq!(
+        disk_after_apply.active.types.get("file-pdf"),
+        Some(&IconSource::Image(pdf_svg.clone()))
+    );
+
+    view.update(cx, |view, cx| {
+        view.rename_icon_preset("Escritorio", "Trabalho", cx)
+            .unwrap();
+    });
+    let disk_after_rename = IconConfig::load_from(&icons_file).unwrap();
+    assert!(!disk_after_rename.presets.contains_key("Escritorio"));
+    assert!(disk_after_rename.presets.contains_key("Trabalho"));
+
+    // Restaurar padrões returns every icon to built-in and keeps saved presets
+    view.update(cx, |view, cx| {
+        view.reset_to_defaults(cx).unwrap();
+    });
+    let disk_after_reset = IconConfig::load_from(&icons_file).unwrap();
+    assert_eq!(disk_after_reset.active.base, IconSource::BuiltIn);
+    assert!(disk_after_reset.active.groups.is_empty());
+    assert!(disk_after_reset.active.types.is_empty());
+    assert!(disk_after_reset.presets.contains_key("Trabalho"));
+
+    view.update(cx, |view, cx| {
+        assert!(view.delete_icon_preset("Trabalho", cx).unwrap());
+    });
+    let disk_after_delete = IconConfig::load_from(&icons_file).unwrap();
+    assert!(!disk_after_delete.presets.contains_key("Trabalho"));
+
+    // Verify keyboard focus order was populated on render and Tab cycles focus into the modal
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert!(view.focus_handles_count() > 10);
+    });
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes("escape");
+    state.read_with(cx, |state, _| {
+        assert!(!state.settings_open);
     });
 
     let _ = std::fs::remove_dir_all(&dir);
