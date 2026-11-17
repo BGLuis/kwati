@@ -26,6 +26,9 @@ actions!(
         ToggleHidden,
         TogglePreview,
         OpenContextMenu,
+        SetViewDetails,
+        SetViewGrid,
+        SetViewCompact,
     ]
 );
 

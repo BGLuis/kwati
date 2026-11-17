@@ -28,8 +28,9 @@ use gpui::{
     div, prelude::*, px, App, Context, CursorStyle, DragMoveEvent, EmptyView, Entity, Pixels,
     SharedString, Window,
 };
-use kwati_core::Location;
+use kwati_core::{Location, SortColumn, SortDirection, ViewMode};
 
+use crate::actions::navigation::{SetViewCompact, SetViewDetails, SetViewGrid};
 use crate::actions::operations::{
     self, copy_locations_to_clipboard, cut_locations_to_clipboard, execute_undo,
     get_location_clipboard,
@@ -38,6 +39,7 @@ use crate::actions::remote_sync::RemotePollerHost;
 use crate::actions::{
     DisconnectRemote, ManageServers, OpenSettings, ReconnectRemote, RefreshListing, TogglePreview,
 };
+use crate::components::Ellipsize;
 use crate::layout::{PanelLayout, PREVIEW_DEFAULT, SIDEBAR_DEFAULT};
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
@@ -46,7 +48,7 @@ use crate::motion::{
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{size, space, Fonts, TextRole};
-use crate::views::list_view::format_size;
+use crate::views::list_view::{format_modified, format_size};
 use crate::views::search_view::ToggleSearch;
 
 /// The root shell view of kwati-gui.
@@ -510,6 +512,14 @@ impl MainView {
             cx.notify();
         });
     }
+
+    fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, cx| {
+            state.set_view_mode(mode);
+            cx.notify();
+        });
+        cx.notify();
+    }
 }
 
 impl Render for MainView {
@@ -524,6 +534,7 @@ impl Render for MainView {
             entry_count,
             selected_count,
             selected_bytes,
+            view_metadata,
             status_msg,
             status_revision,
             status_is_completion,
@@ -536,6 +547,7 @@ impl Render for MainView {
                 state.entries.len(),
                 state.selection.len(),
                 state.selected_total_size(),
+                format_status_selection_metadata(state),
                 state.status_message.clone(),
                 state.status_revision,
                 state.status_is_completion,
@@ -647,6 +659,15 @@ impl Render for MainView {
             .on_action(cx.listener(|this, _: &TogglePreview, _, cx| {
                 this.resize_panels(cx, PanelLayout::toggle_preview)
             }))
+            .on_action(cx.listener(|this, _: &SetViewDetails, _, cx| {
+                this.set_view_mode(ViewMode::Details, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &SetViewGrid, _, cx| this.set_view_mode(ViewMode::Grid, cx)),
+            )
+            .on_action(cx.listener(|this, _: &SetViewCompact, _, cx| {
+                this.set_view_mode(ViewMode::CompactList, cx)
+            }))
             // Top Header (Address Bar + Nav)
             .child(self.header.clone())
             // Network banner (if active)
@@ -728,9 +749,14 @@ impl Render for MainView {
                     .child(
                         div()
                             .flex()
+                            .items_center()
+                            .min_w_0()
                             .gap_4()
                             .child(format!("{} items", entry_count))
-                            .child(format_selection_summary(selected_count, selected_bytes)),
+                            .child(format_selection_summary(selected_count, selected_bytes))
+                            .when(!view_metadata.is_empty(), |el| {
+                                el.child(div().ellipsize().child(view_metadata))
+                            }),
                     )
                     .child(
                         div()
@@ -761,6 +787,45 @@ pub fn format_selection_summary(count: usize, total_bytes: u64) -> String {
             "{count} selected ({})",
             format_size(Some(total_bytes), false)
         )
+    }
+}
+
+/// Formats selection/sort metadata shown in the status bar when Size and Modified columns
+/// are hidden (`CompactList` and `Grid`).
+pub fn format_status_selection_metadata(state: &AppState) -> String {
+    if state.view_mode == ViewMode::Details {
+        return String::new();
+    }
+    let selected = state.selected_entries();
+    if selected.len() == 1 {
+        let entry = selected[0];
+        let name = entry.display_name();
+        let size_or_kind = if entry.is_dir() {
+            "Folder".to_string()
+        } else {
+            format_size(entry.size, false)
+        };
+        return match entry.modified {
+            Some(modified) => format!(
+                "{name} · {size_or_kind} · {}",
+                format_modified(Some(modified))
+            ),
+            None => format!("{name} · {size_or_kind}"),
+        };
+    }
+    let col = match state.sort_column {
+        SortColumn::Name => "Name",
+        SortColumn::Size => "Size",
+        SortColumn::Date => "Modified",
+    };
+    let dir = match state.sort_direction {
+        SortDirection::Ascending => "▲",
+        SortDirection::Descending => "▼",
+    };
+    if state.show_hidden {
+        format!("Sort: {col} {dir} · Hidden")
+    } else {
+        format!("Sort: {col} {dir}")
     }
 }
 

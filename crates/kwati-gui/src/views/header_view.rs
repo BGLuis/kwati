@@ -11,9 +11,9 @@ use gpui::{
     MouseDownEvent, SharedString, Stateful, Window,
 };
 
-use kwati_core::{ConnectionState, Location};
+use kwati_core::{ConnectionState, Location, ViewMode};
 
-use crate::actions::navigation::TogglePreview;
+use crate::actions::navigation::{SetViewCompact, SetViewDetails, SetViewGrid, TogglePreview};
 use crate::actions::{DisconnectRemote, OpenSettings, ReconnectRemote, RefreshListing};
 use crate::components::interactive::hover_bg;
 use crate::components::{animated_icon_sized, IconMotion, IconName, TextInput, Tooltip};
@@ -35,6 +35,9 @@ enum HeaderControl {
     Refresh,
     Reconnect,
     Disconnect,
+    ViewDetails,
+    ViewGrid,
+    ViewCompact,
     Search,
     Preview,
     Settings,
@@ -334,6 +337,96 @@ impl HeaderView {
         }
     }
 
+    pub fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, cx| {
+            state.set_view_mode(mode);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn view_switcher_segment(
+        &self,
+        spec: (
+            &'static str,
+            HeaderControl,
+            ViewMode,
+            IconName,
+            &'static str,
+        ),
+        active: bool,
+        motion: (f32, f32),
+        reduced: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (id, ctrl, mode, icon_name, tooltip_label) = spec;
+        let (hover_t, press_t) = motion;
+        let bg = if active {
+            theme.selection.into()
+        } else {
+            hover_bg(transparent_black(), hover_t, theme)
+        };
+        let color = if active {
+            theme.text
+        } else {
+            color_lerp(theme.text_muted, theme.text, hover_t).into()
+        };
+        let scale = if reduced {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, press_t.clamp(0.0, 1.0))
+        };
+
+        div()
+            .id(id)
+            .w(gpui::px(26.))
+            .h(gpui::px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .rounded(gpui::px(2.))
+            .bg(bg)
+            .cursor(CursorStyle::PointingHand)
+            .tooltip(Tooltip::text(tooltip_label))
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                this.set_hover(ctrl, *hovered, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.set_press(ctrl, true, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.set_press(ctrl, false, cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.set_press(ctrl, false, cx);
+                }),
+            )
+            .on_click(move |_, window, cx| {
+                let action: Box<dyn gpui::Action> = match mode {
+                    ViewMode::Details => Box::new(SetViewDetails),
+                    ViewMode::Grid => Box::new(SetViewGrid),
+                    ViewMode::CompactList => Box::new(SetViewCompact),
+                };
+                window.dispatch_action(action, cx);
+            })
+            .child(animated_icon_sized(
+                icon_name,
+                IconMotion::Rest,
+                size::ICON * scale,
+                color,
+            ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn icon_button(
         &self,
@@ -431,6 +524,7 @@ impl Render for HeaderView {
             can_go_forward,
             preview_open,
             settings_open,
+            view_mode,
             remote_info,
             show_network_badge,
             can_go_up,
@@ -447,6 +541,7 @@ impl Render for HeaderView {
                 state.history.can_go_forward(),
                 state.panels.preview_open,
                 state.settings_open,
+                state.view_mode,
                 remote_header_info(state),
                 is_network_mount_badge_visible(state),
                 can_go_up,
@@ -497,6 +592,12 @@ impl Render for HeaderView {
             now,
             reduced,
         );
+        let (view_details_hover, view_details_press) =
+            self.control_factors(HeaderControl::ViewDetails, true, now, reduced);
+        let (view_grid_hover, view_grid_press) =
+            self.control_factors(HeaderControl::ViewGrid, true, now, reduced);
+        let (view_compact_hover, view_compact_press) =
+            self.control_factors(HeaderControl::ViewCompact, true, now, reduced);
         let (search_hover, search_press) =
             self.control_factors(HeaderControl::Search, true, now, reduced);
         let (preview_hover, preview_press) =
@@ -593,6 +694,61 @@ impl Render for HeaderView {
                     }),
                 )
             });
+
+        let view_switcher = div()
+            .id("header-view-switcher")
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_none()
+            .p(space::S2)
+            .gap(space::S2)
+            .rounded(radius::CONTROL)
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border_strong)
+            .child(self.view_switcher_segment(
+                (
+                    "view-mode-details",
+                    HeaderControl::ViewDetails,
+                    ViewMode::Details,
+                    IconName::ViewList,
+                    "Details view (Ctrl+1)",
+                ),
+                view_mode == ViewMode::Details,
+                (view_details_hover, view_details_press),
+                reduced,
+                &theme,
+                cx,
+            ))
+            .child(self.view_switcher_segment(
+                (
+                    "view-mode-grid",
+                    HeaderControl::ViewGrid,
+                    ViewMode::Grid,
+                    IconName::ViewGrid,
+                    "Grid view (Ctrl+2)",
+                ),
+                view_mode == ViewMode::Grid,
+                (view_grid_hover, view_grid_press),
+                reduced,
+                &theme,
+                cx,
+            ))
+            .child(self.view_switcher_segment(
+                (
+                    "view-mode-compact",
+                    HeaderControl::ViewCompact,
+                    ViewMode::CompactList,
+                    IconName::ViewCompact,
+                    "Compact list view (Ctrl+3)",
+                ),
+                view_mode == ViewMode::CompactList,
+                (view_compact_hover, view_compact_press),
+                reduced,
+                &theme,
+                cx,
+            ));
 
         let search_btn = self
             .icon_button(
@@ -887,6 +1043,7 @@ impl Render for HeaderView {
                     }))
                     .child(self.address_input.clone()),
             )
+            .child(view_switcher)
             .child(search_btn)
             .child(preview_btn)
             .child(settings_btn)

@@ -7,7 +7,7 @@ use gpui::{
     div, prelude::*, px, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Subscription,
     Window,
 };
-use kwati_core::{MotionPreference, Settings, SortColumn, SortDirection};
+use kwati_core::{MotionPreference, Settings, SortColumn, SortDirection, ViewMode};
 
 use crate::components::{
     animated_icon, animated_toggle_switch, icon, modal_scrim_color, wrap_modal_card_entrance,
@@ -35,6 +35,7 @@ pub enum SettingKey {
     ShowHidden,
     DefaultSortColumn,
     DefaultSortDirection,
+    ViewMode,
     MotionPreference,
     ListTimeoutSecs,
     RefreshIntervalSecs,
@@ -50,6 +51,7 @@ pub enum SettingControlKind {
     Toggle,
     SortColumn,
     SortDirection,
+    ViewMode,
     MotionPreference,
     Number {
         min: u32,
@@ -95,6 +97,13 @@ pub const SETTINGS_ROWS: &[SettingRowSpec] = &[
         label: "Ordenação padrão (direção)",
         description: "Ordem crescente ou decrescente da listagem.",
         kind: SettingControlKind::SortDirection,
+    },
+    SettingRowSpec {
+        key: SettingKey::ViewMode,
+        section: SettingsSectionId::General,
+        label: "Modo de visualização",
+        description: "Exibe arquivos como detalhes, grade de ícones ou lista compacta.",
+        kind: SettingControlKind::ViewMode,
     },
     SettingRowSpec {
         key: SettingKey::MotionPreference,
@@ -492,6 +501,15 @@ impl SettingsView {
         res
     }
 
+    pub fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) -> Result<(), String> {
+        let res = self.app_state.update(cx, |state, _| {
+            state.set_view_mode(mode);
+            Ok(())
+        });
+        cx.notify();
+        res
+    }
+
     pub fn set_motion_preference(
         &mut self,
         pref: MotionPreference,
@@ -516,6 +534,7 @@ impl SettingsView {
                 defaults.default_sort.column,
                 defaults.default_sort.direction,
             );
+            state.set_view_mode(defaults.view_mode);
             Ok(())
         });
         if res.is_ok() {
@@ -679,6 +698,48 @@ impl SettingsView {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     let _ = this.set_sort_direction(dir, cx);
+                                }),
+                            )
+                    }))
+                    .into_any_element()
+            }
+            SettingControlKind::ViewMode => {
+                let current = settings.view_mode;
+                let choices = [
+                    (ViewMode::Details, "Detalhes"),
+                    (ViewMode::Grid, "Grade"),
+                    (ViewMode::CompactList, "Compacto"),
+                ];
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(space::S4)
+                    .children(choices.into_iter().enumerate().map(|(ix, (mode, label))| {
+                        let selected = current == mode;
+                        div()
+                            .id(("view-mode-opt", ix))
+                            .px(space::S8)
+                            .py(space::S4)
+                            .rounded(radius::CONTROL)
+                            .border_1()
+                            .border_color(if selected { theme.accent } else { theme.border })
+                            .bg(if selected {
+                                theme.selection
+                            } else {
+                                theme.surface_raised
+                            })
+                            .text_label()
+                            .text_color(if selected {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            })
+                            .cursor_pointer()
+                            .child(label)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    let _ = this.set_view_mode(mode, cx);
                                 }),
                             )
                     }))

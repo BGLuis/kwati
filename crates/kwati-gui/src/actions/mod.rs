@@ -38,6 +38,13 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("menu", navigation::OpenContextMenu, Some("ListView")),
         KeyBinding::new("f5", navigation::Refresh, None),
         KeyBinding::new("alt-p", navigation::TogglePreview, None),
+        // View modes
+        KeyBinding::new("ctrl-1", navigation::SetViewDetails, None),
+        KeyBinding::new("cmd-1", navigation::SetViewDetails, None),
+        KeyBinding::new("ctrl-2", navigation::SetViewGrid, None),
+        KeyBinding::new("cmd-2", navigation::SetViewGrid, None),
+        KeyBinding::new("ctrl-3", navigation::SetViewCompact, None),
+        KeyBinding::new("cmd-3", navigation::SetViewCompact, None),
         // File operations
         KeyBinding::new("ctrl-c", operations::Copy, None),
         KeyBinding::new("cmd-c", operations::Copy, None),
