@@ -1935,16 +1935,6 @@ fn selector_pill(label: &str, active: bool, theme: &Theme) -> gpui::Div {
         .child(label.to_owned())
 }
 
-#[allow(dead_code)]
-fn checkbox_row(
-    id: &'static str,
-    checked: bool,
-    label: &str,
-    theme: &Theme,
-) -> gpui::Stateful<gpui::Div> {
-    animated_checkbox_row(id, if checked { 1.0 } else { 0.0 }, label, theme, false)
-}
-
 fn action_button(label: &str, tone: ButtonTone, theme: &Theme) -> gpui::Div {
     let (bg, fg) = match tone {
         ButtonTone::Primary => (theme.accent, theme.on_accent),

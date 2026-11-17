@@ -1,12 +1,11 @@
 //! Shared motion chrome primitives: press-scale/hover buttons, toggle switches, checkboxes, and modal cards.
 
-use gpui::{
-    div, prelude::*, px, AnyElement, Bounds, Div, Hsla, Pixels, SharedString, Stateful, Styled,
-    Window,
-};
+use gpui::{div, prelude::*, px, AnyElement, Div, Hsla, Pixels, Stateful, Styled};
 
 use crate::components::icon::{animated_icon_sized, IconMotion, IconName};
-use crate::motion::{color_lerp, lerp_f32, Curve, DIALOG_RISE_PX, DIALOG_START_SCALE, PRESS_SCALE};
+use crate::motion::{
+    color_lerp, lerp_f32, Curve, DIALOG_RISE_PX, DIALOG_START_SCALE, MENU_START_SCALE, PRESS_SCALE,
+};
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, TextRole};
 
@@ -197,7 +196,7 @@ pub fn wrap_modal_card_entrance(
         )
 }
 
-/// Computes `(visible_scale, opacity)` for menu and tooltip entrance from `0.6`.
+/// Computes `(visible_scale, opacity)` for menu and tooltip entrance from [`MENU_START_SCALE`].
 #[inline]
 pub fn popup_entrance_metrics(t: f32, reduced: bool) -> (f32, f32) {
     let t = t.clamp(0.0, 1.0);
@@ -205,19 +204,7 @@ pub fn popup_entrance_metrics(t: f32, reduced: bool) -> (f32, f32) {
     let scale = if reduced {
         1.0
     } else {
-        lerp_f32(0.6, 1.0, Curve::Spring.sample(t)).max(0.5)
+        lerp_f32(MENU_START_SCALE, 1.0, Curve::Spring.sample(t)).max(0.5)
     };
     (scale, opacity)
 }
-
-/// Helper for stable hover/press IDs passed as static labels or strings.
-pub fn press_border_radius(base: Pixels, press_t: f32, reduced: bool) -> Pixels {
-    if reduced {
-        return base;
-    }
-    let _ = Bounds::<Pixels>::default;
-    base * lerp_f32(1.0, PRESS_SCALE, press_t.clamp(0.0, 1.0))
-}
-
-#[allow(dead_code)]
-fn _unused_shared_string(_s: SharedString, _w: &mut Window) {}
