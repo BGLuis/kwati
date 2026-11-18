@@ -16,10 +16,10 @@ use kwati_core::{
 use kwati_gui::actions::register_keybindings;
 use kwati_gui::components::register_text_input_keybindings;
 use kwati_gui::state::AppState;
-use kwati_gui::tokens::size as token_size;
+use kwati_gui::tokens::{size as token_size, Fonts, BODY_SIZE};
 use kwati_gui::views::list_view::{
-    grid_columns_for_width, COMPACT_ROW_HEIGHT, GRID_GAP, GRID_PAD_X, GRID_ROW_HEIGHT,
-    GRID_TILE_HEIGHT, GRID_TILE_WIDTH,
+    fit_two_line_label, grid_columns_for_width, COMPACT_ROW_HEIGHT, GRID_GAP, GRID_PAD_X,
+    GRID_ROW_HEIGHT, GRID_TILE_HEIGHT, GRID_TILE_WIDTH,
 };
 use kwati_gui::views::settings_view::SettingsView;
 use kwati_gui::views::{format_status_selection_metadata, MainView};
@@ -560,6 +560,70 @@ fn grid_mode_virtualizes_100k_entries(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("home");
     cx.run_until_parked();
     assert_eq!(selected_names(&main, cx), ["entry_000000.txt"]);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[gpui::test]
+fn grid_two_line_labels_fit_within_tile_width_and_ellipsize_on_overflow(cx: &mut TestAppContext) {
+    let dir = fixture("grid_labels", 0);
+    let (_main, cx) = open_window(cx, &dir);
+
+    let max_width = px(92.);
+    let window_handle = cx.windows()[0];
+    cx.update_window(window_handle, |_, window, cx| {
+        let font = gpui::font(Fonts::get(cx).sans);
+        let measure = |s: &str| {
+            window
+                .text_system()
+                .shape_line(
+                    s.to_string().into(),
+                    BODY_SIZE,
+                    &[gpui::TextRun {
+                        len: s.len(),
+                        font: font.clone(),
+                        color: gpui::black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                )
+                .width
+        };
+
+        // Short name stays on one line untouched.
+        let (l1, l2) = fit_two_line_label("notes.txt", max_width, font.clone(), BODY_SIZE, window);
+        assert_eq!(l1, "notes.txt");
+        assert_eq!(l2, None);
+
+        // Multi-word name where line 1 wraps early and line 2 still overflows gets truncated with "…".
+        let (l1, l2) = fit_two_line_label(
+            "My VeryLongDocumentName.pdf",
+            max_width,
+            font.clone(),
+            BODY_SIZE,
+            window,
+        );
+        let l2 = l2.expect("should wrap onto second line");
+        assert!(measure(&l1) <= max_width, "line 1 overflowed: {l1:?}");
+        assert!(measure(&l2) <= max_width, "line 2 overflowed: {l2:?}");
+        assert!(l2.ends_with('…'), "expected ellipsis on line 2, got {l2:?}");
+
+        // Single long token without spaces also fits both lines and ends with "…".
+        let (l1, l2) = fit_two_line_label(
+            "relatorio_financeiro_anual_2026_final.pdf",
+            max_width,
+            font.clone(),
+            BODY_SIZE,
+            window,
+        );
+        let l2 = l2.expect("long token should wrap onto second line");
+        assert!(measure(&l1) <= max_width, "line 1 overflowed: {l1:?}");
+        assert!(measure(&l2) <= max_width, "line 2 overflowed: {l2:?}");
+        assert!(l2.ends_with('…'), "expected ellipsis on line 2, got {l2:?}");
+    })
+    .unwrap();
 
     let _ = fs::remove_dir_all(&dir);
 }

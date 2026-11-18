@@ -15,7 +15,9 @@ use gpui::{
 use kwati_core::preview::{read_preview, Preview};
 use kwati_core::{Entry, IconConfig, Location};
 
-use crate::components::{icon, icon_for, resolve_icon_color, resolved_icon, IconMotion, IconName};
+use crate::components::{
+    icon, icon_for, resolve_icon_color, resolved_icon, Ellipsize, IconMotion, IconName,
+};
 use crate::state::{AppState, PreviewData, PreviewKind};
 use crate::theme::Theme;
 use crate::tokens::{size, Fonts, DATA_SIZE};
@@ -578,11 +580,10 @@ impl Render for PreviewView {
                             .child(
                                 div()
                                     .flex_1()
-                                    .min_w_0()
+                                    .ellipsize()
                                     .text_size(px(14.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme.text)
-                                    .overflow_hidden()
                                     .child(file_name),
                             ),
                     )
@@ -688,6 +689,9 @@ impl Render for PreviewView {
                     ))
                     .child(
                         div()
+                            .w_full()
+                            .ellipsize()
+                            .text_center()
                             .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme.text)

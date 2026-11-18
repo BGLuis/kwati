@@ -702,7 +702,7 @@ impl Render for TrashView {
                                                                     &icon_resolver,
                                                                 )
                                                             })
-                                                            .child(div().ellipsize().child(name)),
+                                                            .child(div().flex_1().ellipsize().child(name)),
                                                     )
                                                     .child(
                                                         div()

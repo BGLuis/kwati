@@ -86,7 +86,7 @@ everywhere; no all-caps labels.
 
 ## Icons
 
-- Monochrome line icons, 16 px, 1.5 px stroke, rounded caps and joins.
+- Monochrome line icons, 16 px, 1.15 px stroke (scaled sublinearly at larger sizes), rounded caps and joins.
 - Icons take the colour of their text (`text` or `text-muted`).
 - Folder icons use `accent`; this is the only coloured file-type icon.
 - File types are told apart by icon shape, not by colour.

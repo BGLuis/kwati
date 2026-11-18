@@ -7,6 +7,7 @@ pub trait Ellipsize: Styled + Sized {
     /// clamping it to one line keeps it on one.
     fn ellipsize(self) -> Self {
         self.min_w_0()
+            .overflow_hidden()
             .whitespace_normal()
             .line_clamp(1)
             .text_ellipsis()

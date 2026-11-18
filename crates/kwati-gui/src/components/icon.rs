@@ -1,4 +1,4 @@
-//! Line icons exported from the Figma "Icons" page (16 px, 1.5 px stroke),
+//! Line icons exported from the Figma "Icons" page (16 px, 1.15 px stroke),
 //! plus animated icon renderers (`quick` 300 ms, once per trigger).
 //!
 //! The SVGs are compiled into the binary and served through [`Assets`]. gpui paints an SVG
@@ -448,7 +448,7 @@ pub fn animated_icon_sized(
             draw_network_canvas(icon_size, color, t)
         }
         _ => svg()
-            .path(name.path())
+            .path(svg_path_for_size(name.path(), icon_size))
             .size(icon_size)
             .flex_none()
             .text_color(color)
@@ -463,7 +463,7 @@ fn transformed_svg(
     transformation: Transformation,
 ) -> AnyElement {
     svg()
-        .path(name.path())
+        .path(svg_path_for_size(name.path(), icon_size))
         .size(icon_size)
         .flex_none()
         .text_color(color)
@@ -480,7 +480,7 @@ fn layered_parts<const N: usize>(
     for (part, transform) in parts {
         container = container.child(
             svg()
-                .path(part.path())
+                .path(svg_path_for_size(part.path(), icon_size))
                 .absolute()
                 .inset_0()
                 .size(icon_size)
@@ -489,6 +489,28 @@ fn layered_parts<const N: usize>(
         );
     }
     container.into_any_element()
+}
+
+const BASE_STROKE_WIDTH: f32 = 1.15;
+
+#[inline]
+fn viewbox_stroke_for_size(icon_size: Pixels) -> Option<f32> {
+    let size_px = icon_size / px(1.0);
+    if size_px <= 24.0 {
+        return None;
+    }
+    // Scale physical stroke sublinearly above 16 px so large grid/empty icons stay crisp
+    // instead of ballooning to 3-4 px thick.
+    let physical = BASE_STROKE_WIDTH * (size_px / 16.0).powf(0.55);
+    Some((physical * (16.0 / size_px)).clamp(0.5, BASE_STROKE_WIDTH))
+}
+
+#[inline]
+fn svg_path_for_size(base_path: &'static str, icon_size: Pixels) -> SharedString {
+    match viewbox_stroke_for_size(icon_size) {
+        Some(stroke) => format!("stroke:{stroke:.2}:{base_path}").into(),
+        None => SharedString::from(base_path),
+    }
 }
 
 #[inline]
@@ -501,7 +523,10 @@ fn map_pt(bounds: Bounds<Pixels>, x: f32, y: f32) -> Point<Pixels> {
 
 #[inline]
 fn scaled_stroke(bounds: Bounds<Pixels>) -> Pixels {
-    bounds.size.width * (1.5 / 16.0)
+    match viewbox_stroke_for_size(bounds.size.width) {
+        Some(stroke) => bounds.size.width * (stroke / 16.0),
+        None => bounds.size.width * (BASE_STROKE_WIDTH / 16.0),
+    }
 }
 
 fn draw_check_canvas(icon_size: Pixels, color: Hsla, progress: f32) -> AnyElement {
@@ -677,6 +702,16 @@ pub fn resolved_icon(
     }
 }
 
+fn load_builtin_svg(path: &str) -> Option<&'static [u8]> {
+    if let Some(found) = IconName::ALL.iter().find(|name| name.path() == path) {
+        return Some(found.svg());
+    }
+    IconPart::ALL
+        .iter()
+        .find(|part| part.path() == path)
+        .map(|part| part.svg())
+}
+
 /// The app's bundled assets, registered with `Application::with_assets`.
 pub struct Assets;
 
@@ -694,13 +729,27 @@ impl AssetSource for Assets {
             }
             return Ok(None);
         }
-        if let Some(found) = IconName::ALL.iter().find(|name| name.path() == path) {
-            return Ok(Some(Cow::Borrowed(found.svg())));
+        if let Some(rest) = path.strip_prefix("stroke:") {
+            if let Some((stroke_str, inner_path)) = rest.split_once(':') {
+                if stroke_str
+                    .parse::<f32>()
+                    .is_ok_and(|v| v.is_finite() && v > 0.0 && v <= 4.0)
+                {
+                    if let Some(bytes) = load_builtin_svg(inner_path) {
+                        if let Ok(text) = std::str::from_utf8(bytes) {
+                            let rewritten = text.replace(
+                                "stroke-width=\"1.15\"",
+                                &format!("stroke-width=\"{stroke_str}\""),
+                            );
+                            return Ok(Some(Cow::Owned(rewritten.into_bytes())));
+                        }
+                        return Ok(Some(Cow::Borrowed(bytes)));
+                    }
+                }
+            }
+            return Ok(None);
         }
-        Ok(IconPart::ALL
-            .iter()
-            .find(|part| part.path() == path)
-            .map(|part| Cow::Borrowed(part.svg())))
+        Ok(load_builtin_svg(path).map(Cow::Borrowed))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {

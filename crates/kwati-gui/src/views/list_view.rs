@@ -7,10 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use gpui::{
-    div, point, prelude::*, px, relative, transparent_black, uniform_list, Context, CursorStyle,
-    Div, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, Stateful,
-    UniformListScrollHandle, Window,
+    div, font, point, prelude::*, px, relative, transparent_black, uniform_list, Context,
+    CursorStyle, Div, Entity, EventEmitter, FocusHandle, Focusable, Font, Hsla, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy,
+    Stateful, TextRun, UniformListScrollHandle, Window,
 };
 use kwati_core::{
     Entry, IconPreferences, IconResolver, Location, SortColumn, SortDirection, ViewMode,
@@ -33,7 +33,7 @@ use crate::motion::{
 };
 use crate::state::{entry_location, AppState, EntryChangeOrigin, NavigationDirection};
 use crate::theme::Theme;
-use crate::tokens::{radius, size, space, Fonts, TextRole};
+use crate::tokens::{radius, size, space, Fonts, TextRole, BODY_SIZE};
 
 /// Formats a file size in human-readable units (B, KB, MB, GB, TB).
 pub fn format_size(bytes: Option<u64>, is_dir: bool) -> String {
@@ -945,7 +945,6 @@ pub const REMOTE_FILE_NOTICE: &str = "Files on remote locations cannot be opened
 
 const SIZE_COLUMN: Pixels = px(72.);
 const DATE_COLUMN: Pixels = px(128.);
-const HIDDEN_TOGGLE_COLUMN: Pixels = px(80.);
 const SCROLLBAR_WIDTH: Pixels = px(10.);
 
 pub const COMPACT_ROW_HEIGHT: Pixels = px(22.);
@@ -956,6 +955,113 @@ pub const GRID_PAD_X: Pixels = space::S12;
 pub const GRID_GAP: Pixels = space::S8;
 pub const GRID_ROW_HEIGHT: Pixels = px(104.);
 const DEFAULT_GRID_COLUMNS: usize = 4;
+// 104 px tile width - 8 px horizontal padding - 2 px border - 2 px subpixel safety margin.
+const GRID_LABEL_MAX_WIDTH: Pixels = px(92.);
+
+/// Splits `name` into at most two lines that each fit inside `max_width` at `font_size`,
+/// truncating the second line with an ellipsis (`…`) when the full name does not fit.
+pub fn fit_two_line_label(
+    name: &str,
+    max_width: Pixels,
+    font: Font,
+    font_size: Pixels,
+    window: &Window,
+) -> (String, Option<String>) {
+    let clean: std::borrow::Cow<'_, str> = if name.contains(['\r', '\n']) {
+        std::borrow::Cow::Owned(name.replace(['\r', '\n'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    };
+    if clean.is_empty() {
+        return (String::new(), None);
+    }
+
+    let text_system = window.text_system();
+    let make_run = |len: usize| {
+        [TextRun {
+            len,
+            font: font.clone(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }]
+    };
+    let line_width = |s: &str| -> Pixels {
+        if s.is_empty() {
+            return px(0.);
+        }
+        text_system
+            .shape_line(s.to_string().into(), font_size, &make_run(s.len()), None)
+            .width
+    };
+
+    if line_width(&clean) <= max_width {
+        return (clean.into_owned(), None);
+    }
+
+    let Ok(lines) = text_system.shape_text(
+        clean.as_ref().to_string().into(),
+        font_size,
+        &make_run(clean.len()),
+        Some(max_width),
+        None,
+    ) else {
+        return (clean.into_owned(), None);
+    };
+
+    let Some(first) = lines.first() else {
+        return (clean.into_owned(), None);
+    };
+    let Some(b0) = first.wrap_boundaries().first() else {
+        return (truncate_to_width(&clean, max_width, &line_width), None);
+    };
+    let Some(split_ix) = first
+        .runs()
+        .get(b0.run_ix)
+        .and_then(|r| r.glyphs.get(b0.glyph_ix))
+        .map(|g| g.index)
+    else {
+        return (clean.into_owned(), None);
+    };
+    if split_ix == 0 || split_ix >= clean.len() {
+        return (truncate_to_width(&clean, max_width, &line_width), None);
+    }
+
+    let line1 = clean[..split_ix].trim_end();
+    let rest = clean[split_ix..].trim_start();
+    if rest.is_empty() {
+        return (line1.to_string(), None);
+    }
+    if line_width(rest) <= max_width {
+        return (line1.to_string(), Some(rest.to_string()));
+    }
+    (
+        line1.to_string(),
+        Some(truncate_to_width(rest, max_width, &line_width)),
+    )
+}
+
+fn truncate_to_width(text: &str, max_width: Pixels, measure: &impl Fn(&str) -> Pixels) -> String {
+    let mut offsets: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    offsets.push(text.len());
+    let mut lo = 0usize;
+    let mut hi = offsets.len() - 1;
+    let mut best = 0usize;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate = format!("{}…", &text[..offsets[mid]]);
+        if measure(&candidate) <= max_width {
+            best = mid;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    format!("{}…", &text[..offsets[best]])
+}
 
 /// Computes how many `104 px` tiles fit horizontally inside `width` with `12 px` outer
 /// padding and `8 px` tile spacing.
@@ -1312,8 +1418,6 @@ impl ListView {
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
                     .flex()
                     .items_center()
                     .gap(space::S8)
@@ -1325,7 +1429,7 @@ impl ListView {
                         icon_prefs,
                         icon_resolver,
                     ))
-                    .child(div().ellipsize().child(name)),
+                    .child(div().flex_1().ellipsize().child(name)),
             )
             .child(
                 div()
@@ -1343,7 +1447,6 @@ impl ListView {
                     .text_color(secondary_col)
                     .child(date_str),
             )
-            .child(div().w(HIDDEN_TOGGLE_COLUMN))
             .into_any_element()
     }
 
@@ -1400,11 +1503,20 @@ impl ListView {
         entry: &Entry,
         loc: &Location,
         vis: ItemVisuals,
+        fonts: &Fonts,
         icon_prefs: &IconPreferences,
         icon_resolver: &IconResolver,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let name = entry.display_name();
+        let (line1, line2) = fit_two_line_label(
+            &name,
+            GRID_LABEL_MAX_WIDTH,
+            font(fonts.sans.clone()),
+            BODY_SIZE,
+            window,
+        );
         let base = div()
             .id(ix)
             .relative()
@@ -1417,7 +1529,7 @@ impl ListView {
             .flex_col()
             .items_center()
             .justify_start()
-            .p(space::S8)
+            .p(space::S4)
             .gap(space::S4)
             .rounded(radius::CONTROL)
             .border_1()
@@ -1450,13 +1562,32 @@ impl ListView {
                 div()
                     .w_full()
                     .min_w_0()
-                    .line_height(px(16.))
-                    .whitespace_normal()
-                    .line_clamp(2)
-                    .text_ellipsis()
+                    .flex()
+                    .flex_col()
+                    .items_center()
                     .overflow_hidden()
-                    .text_center()
-                    .child(name),
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(16.))
+                            .line_height(px(16.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_center()
+                            .child(line1),
+                    )
+                    .when_some(line2, |col, second| {
+                        col.child(
+                            div()
+                                .w_full()
+                                .h(px(16.))
+                                .line_height(px(16.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_center()
+                                .child(second),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -1854,7 +1985,7 @@ impl Render for ListView {
                                     &icon_prefs,
                                     &icon_resolver,
                                 ))
-                                .child(div().ellipsize().child(ex.name.clone())),
+                                .child(div().flex_1().ellipsize().child(ex.name.clone())),
                         )
                         .when(view_mode == ViewMode::Details, |row| {
                             row.child(
@@ -1873,7 +2004,6 @@ impl Render for ListView {
                                     .text_color(row_muted)
                                     .child(ex.date_str.clone()),
                             )
-                            .child(div().w(HIDDEN_TOGGLE_COLUMN))
                         })
                 })
                 .collect()
@@ -1969,30 +2099,85 @@ impl Render for ListView {
                         .bg(theme.surface_raised)
                         .text_color(theme.text_muted)
                         .text_label()
-                        // Name column header
+                        // Name column header (with inline hidden-files toggle on the right so rows
+                        // keep the full width instead of reserving an empty column)
                         .child(
                             div()
-                                .id("col-sort-name")
                                 .flex_1()
+                                .min_w_0()
                                 .flex()
                                 .items_center()
-                                .cursor(CursorStyle::PointingHand)
-                                .text_color(color_lerp(
-                                    theme.text_muted,
-                                    theme.text,
-                                    header_hovers[0],
-                                ))
-                                .on_hover(cx.listener(|this, hovered, _, cx| {
-                                    this.hovered_header = if *hovered { Some(0) } else { None };
-                                    cx.notify();
-                                }))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.on_sort_column_click(SortColumn::Name, cx)
-                                    }),
+                                .justify_between()
+                                .gap(space::S8)
+                                .child(
+                                    div()
+                                        .id("col-sort-name")
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .items_center()
+                                        .cursor(CursorStyle::PointingHand)
+                                        .text_color(color_lerp(
+                                            theme.text_muted,
+                                            theme.text,
+                                            header_hovers[0],
+                                        ))
+                                        .on_hover(cx.listener(|this, hovered, _, cx| {
+                                            this.hovered_header =
+                                                if *hovered { Some(0) } else { None };
+                                            cx.notify();
+                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.on_sort_column_click(SortColumn::Name, cx)
+                                            }),
+                                        )
+                                        .child(format!("Name{}", sort_indicator(SortColumn::Name))),
                                 )
-                                .child(format!("Name{}", sort_indicator(SortColumn::Name))),
+                                .child(
+                                    div()
+                                        .id("col-toggle-hidden")
+                                        .px(space::S4)
+                                        .flex_none()
+                                        .rounded(radius::CONTROL)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .bg(if show_hidden {
+                                            theme.selection.into()
+                                        } else {
+                                            color_lerp(
+                                                transparent_black(),
+                                                theme.surface_raised,
+                                                header_hovers[3],
+                                            )
+                                        })
+                                        .text_color(if show_hidden {
+                                            theme.text
+                                        } else {
+                                            color_lerp(
+                                                theme.text_muted,
+                                                theme.text,
+                                                header_hovers[3],
+                                            )
+                                            .into()
+                                        })
+                                        .on_hover(cx.listener(|this, hovered, _, cx| {
+                                            this.hovered_header =
+                                                if *hovered { Some(3) } else { None };
+                                            cx.notify();
+                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.on_toggle_hidden_click(cx)
+                                            }),
+                                        )
+                                        .child(if show_hidden {
+                                            "Hidden: On"
+                                        } else {
+                                            "Hidden: Off"
+                                        }),
+                                ),
                         )
                         // Size column header
                         .child(
@@ -2044,44 +2229,6 @@ impl Render for ListView {
                                     }),
                                 )
                                 .child(format!("Modified{}", sort_indicator(SortColumn::Date))),
-                        )
-                        // Hidden toggle button
-                        .child(
-                            div()
-                                .id("col-toggle-hidden")
-                                .w(HIDDEN_TOGGLE_COLUMN)
-                                .flex()
-                                .justify_center()
-                                .rounded(radius::CONTROL)
-                                .cursor(CursorStyle::PointingHand)
-                                .bg(if show_hidden {
-                                    theme.selection.into()
-                                } else {
-                                    color_lerp(
-                                        transparent_black(),
-                                        theme.surface_raised,
-                                        header_hovers[3],
-                                    )
-                                })
-                                .text_color(if show_hidden {
-                                    theme.text
-                                } else {
-                                    color_lerp(theme.text_muted, theme.text, header_hovers[3])
-                                        .into()
-                                })
-                                .on_hover(cx.listener(|this, hovered, _, cx| {
-                                    this.hovered_header = if *hovered { Some(3) } else { None };
-                                    cx.notify();
-                                }))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| this.on_toggle_hidden_click(cx)),
-                                )
-                                .child(if show_hidden {
-                                    "Hidden: On"
-                                } else {
-                                    "Hidden: Off"
-                                }),
                         ),
                 )
             })
@@ -2217,8 +2364,10 @@ impl Render for ListView {
                                                                         entry,
                                                                         &loc,
                                                                         vis,
+                                                                        &row_fonts,
                                                                         &icon_prefs,
                                                                         &icon_resolver,
+                                                                        window,
                                                                         cx,
                                                                     ),
                                                                 );

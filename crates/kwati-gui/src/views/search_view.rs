@@ -30,8 +30,8 @@ use kwati_core::{Location, RemoteSearchOptions, SearchHandle, SearchHit, SearchO
 use crate::components::interactive::hover_bg;
 use crate::components::TextInput;
 use crate::components::{
-    animated_icon_sized, icon, icon_for_entry, resolve_icon_color, resolved_icon, IconMotion,
-    IconName, SpecialFolders,
+    animated_icon_sized, icon, icon_for_entry, resolve_icon_color, resolved_icon, Ellipsize,
+    IconMotion, IconName, SpecialFolders,
 };
 use crate::motion::{
     color_lerp, is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker,
@@ -637,9 +637,12 @@ impl Render for SearchView {
                             cx.notify();
                         }
                     }))
+                    .gap(space::S8)
                     .child(
                         div()
                             .flex()
+                            .flex_1()
+                            .min_w_0()
                             .items_center()
                             .gap_2()
                             .child(resolved_icon(
@@ -652,6 +655,8 @@ impl Render for SearchView {
                             ))
                             .child(
                                 div()
+                                    .flex_shrink()
+                                    .ellipsize()
                                     .text_color(theme.text)
                                     .font_weight(if is_selected {
                                         FontWeight::SEMIBOLD
@@ -662,6 +667,8 @@ impl Render for SearchView {
                             )
                             .child(
                                 div()
+                                    .flex_1()
+                                    .ellipsize()
                                     .text_size(px(11.))
                                     .text_color(theme.text_muted)
                                     .child(format!("({})", rel_path)),
@@ -669,6 +676,7 @@ impl Render for SearchView {
                     )
                     .child(
                         div()
+                            .flex_none()
                             .text_size(px(10.))
                             .text_color(theme.text_muted)
                             .child(format!("score {}", hit.score)),

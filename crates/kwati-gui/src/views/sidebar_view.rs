@@ -823,7 +823,7 @@ impl SidebarView {
                             theme.text
                         },
                     ))
-                    .child(div().ellipsize().child(vol.name)),
+                    .child(div().flex_1().ellipsize().child(vol.name)),
             )
             .when(vol.is_removable && vol.is_mounted, |el| {
                 el.child(
@@ -1548,7 +1548,7 @@ impl Render for SidebarView {
                     } else {
                         animated_icon_sized(place.icon, icon_motion, size::ICON * scale, color)
                     })
-                    .child(div().ellipsize().child(place.name))
+                    .child(div().flex_1().ellipsize().child(place.name))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -1671,6 +1671,7 @@ impl Render for SidebarView {
                             })
                             .child(
                                 div()
+                                    .flex_1()
                                     .ellipsize()
                                     .text_color(if is_missing { theme.danger } else { theme.text })
                                     .child(bm.name.clone()),
@@ -1837,7 +1838,7 @@ impl Render for SidebarView {
                                 size::ICON * scale,
                                 theme.text,
                             ))
-                            .child(div().ellipsize().child(server.name.clone())),
+                            .child(div().flex_1().ellipsize().child(server.name.clone())),
                     )
                     .child(
                         div()
@@ -2051,7 +2052,7 @@ impl Render for SidebarView {
                         &icon_prefs,
                         &icon_resolver,
                     ))
-                    .child(div().ellipsize().child(share.name.clone()))
+                    .child(div().flex_1().ellipsize().child(share.name.clone()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -2108,7 +2109,7 @@ impl Render for SidebarView {
                     size::ICON * scale,
                     theme.text,
                 ))
-                .child(div().ellipsize().child("Trash"))
+                .child(div().flex_1().ellipsize().child("Trash"))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
