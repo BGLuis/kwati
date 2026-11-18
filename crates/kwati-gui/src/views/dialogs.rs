@@ -11,16 +11,19 @@ use gpui::{
     div, prelude::*, px, transparent_black, App, Context, Entity, FocusHandle, KeyDownEvent,
     MouseButton, Window,
 };
-use kwati_core::{volume_kind, Backend, Confirmed, ConflictPolicy, Location, VolumeKind};
+use kwati_core::{
+    volume_kind, Backend, Confirmed, ConflictPolicy, Location, TrashItem, VolumeKind,
+};
 
 use crate::actions::open_with::{
     applications_for, launch_application, launch_custom_command, AppInfo,
 };
 use crate::actions::operations::{
-    apply_create_folder_result, apply_delete_report, apply_rename_result, apply_trash_report,
-    check_paste_conflict_at, create_folder_on_backend, delete_locations_permanently_with_backends,
-    location_display_name, rename_location_on_backend, start_transfer, trash_locations_on_backends,
-    validate_entry_name, Transfer, TrashOutcome,
+    apply_create_folder_result, apply_delete_report, apply_empty_trash_result, apply_rename_result,
+    apply_trash_report, check_paste_conflict_at, create_folder_on_backend,
+    delete_locations_permanently_with_backends, format_restore_conflict_message,
+    location_display_name, purge_trash_items_op, rename_location_on_backend, start_transfer,
+    trash_locations_on_backends, validate_entry_name, Transfer, TrashOutcome,
 };
 use crate::components::{
     animated_icon, modal_scrim_color, wrap_modal_card_entrance, IconMotion, IconName, TextInput,
@@ -48,6 +51,13 @@ pub enum DialogKind {
     },
     ConfirmDelete {
         locations: Vec<Location>,
+    },
+    ConfirmEmptyTrash {
+        items: Vec<TrashItem>,
+    },
+    RestoreConflict {
+        item_name: String,
+        destination: PathBuf,
     },
     ConflictResolution {
         sources: Vec<Location>,
@@ -109,6 +119,18 @@ pub fn confirm_delete_message(locations: &[Location]) -> String {
     )
 }
 
+/// Formats the empty-trash confirmation prompt warning that it cannot be undone.
+pub fn confirm_empty_trash_message(count: usize) -> String {
+    if count == 1 {
+        "Permanently delete 1 item in the trash? This action cannot be undone.".to_string()
+    } else {
+        format!(
+            "Permanently delete all {} items in the trash? This action cannot be undone.",
+            count
+        )
+    }
+}
+
 impl DialogsView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(TextInput::new);
@@ -145,12 +167,14 @@ impl DialogsView {
         }
         match key {
             "escape" => self.close(cx),
-            // Enter never confirms a permanent deletion, and a name conflict has no default
-            // policy: both need a deliberate click.
+            // Enter never confirms a permanent deletion or emptying trash, and a name conflict
+            // has no default policy: all need a deliberate click.
             "enter"
                 if !matches!(
                     self.current_dialog,
-                    DialogKind::ConfirmDelete { .. } | DialogKind::ConflictResolution { .. }
+                    DialogKind::ConfirmDelete { .. }
+                        | DialogKind::ConfirmEmptyTrash { .. }
+                        | DialogKind::ConflictResolution { .. }
                 ) =>
             {
                 self.submit(cx)
@@ -223,6 +247,30 @@ impl DialogsView {
     ) {
         let locations: Vec<Location> = targets.into_iter().map(Into::into).collect();
         self.show(DialogKind::ConfirmDelete { locations }, cx);
+    }
+
+    /// Opens the Empty Trash confirmation modal stating that the action cannot be undone.
+    pub fn open_confirm_empty_trash(&mut self, items: Vec<TrashItem>, cx: &mut Context<Self>) {
+        if items.is_empty() {
+            return;
+        }
+        self.show(DialogKind::ConfirmEmptyTrash { items }, cx);
+    }
+
+    /// Opens an informational dialog describing a restore destination conflict.
+    pub fn open_restore_conflict(
+        &mut self,
+        item_name: String,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.show(
+            DialogKind::RestoreConflict {
+                item_name,
+                destination,
+            },
+            cx,
+        );
     }
 
     /// Chooses the appropriate deletion confirmation prompt: trash for local-disk entries,
@@ -431,8 +479,52 @@ impl DialogsView {
         .detach();
     }
 
-    /// Submits the current active dialog (NewFolder, Rename, ConfirmTrash, or OpenWith).
-    /// `ConfirmDelete` is intentionally ignored here and requires [`Self::confirm_permanent_delete`].
+    /// Permanently empties the trash items shown in [`DialogKind::ConfirmEmptyTrash`] after the
+    /// user explicitly clicks the confirmation button.
+    pub fn confirm_empty_trash(&mut self, cx: &mut Context<Self>) {
+        if self.pending_op {
+            return;
+        }
+        let DialogKind::ConfirmEmptyTrash { items } = &self.current_dialog else {
+            return;
+        };
+        let targets = items.clone();
+        if targets.is_empty() {
+            self.close(cx);
+            return;
+        }
+
+        let confirmed = Confirmed::user_confirmed();
+        let purged_ids: Vec<_> = targets.iter().map(|item| item.id.clone()).collect();
+
+        self.pending_op = true;
+        self.op_generation = self.op_generation.wrapping_add(1);
+        let gen = self.op_generation;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { purge_trash_items_op(&targets, confirmed) })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                if this.op_generation != gen {
+                    return;
+                }
+                this.pending_op = false;
+                this.app_state.update(cx, |state, _| {
+                    let _ = apply_empty_trash_result(state, &purged_ids, result);
+                });
+                this.close(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Submits the current active dialog (NewFolder, Rename, ConfirmTrash, RestoreConflict, or OpenWith).
+    /// `ConfirmDelete` and `ConfirmEmptyTrash` are intentionally ignored here and require
+    /// [`Self::confirm_permanent_delete`] / [`Self::confirm_empty_trash`].
     pub fn submit(&mut self, cx: &mut Context<Self>) {
         if self.pending_op {
             return;
@@ -632,10 +724,11 @@ impl DialogsView {
                 })
                 .detach();
             }
-            DialogKind::ConfirmDelete { .. } => {
-                // Never confirm permanent deletion via generic submit; requires clicking the button.
+            DialogKind::ConfirmDelete { .. } | DialogKind::ConfirmEmptyTrash { .. } => {
+                // Never confirm permanent deletion or emptying trash via generic submit;
+                // requires clicking the destructive confirmation button.
             }
-            DialogKind::ConflictResolution { .. } => {
+            DialogKind::RestoreConflict { .. } | DialogKind::ConflictResolution { .. } => {
                 self.close(cx);
             }
             DialogKind::OpenWith {
@@ -727,8 +820,13 @@ impl Render for DialogsView {
         let is_conflict_dialog =
             matches!(self.current_dialog, DialogKind::ConflictResolution { .. });
         let is_delete_dialog = matches!(self.current_dialog, DialogKind::ConfirmDelete { .. });
+        let is_empty_trash_dialog =
+            matches!(self.current_dialog, DialogKind::ConfirmEmptyTrash { .. });
+        let is_restore_conflict_dialog =
+            matches!(self.current_dialog, DialogKind::RestoreConflict { .. });
         let is_trash_dialog = matches!(self.current_dialog, DialogKind::ConfirmTrash { .. });
         let is_open_with = matches!(self.current_dialog, DialogKind::OpenWith { .. });
+        let is_destructive_dialog = is_delete_dialog || is_empty_trash_dialog;
 
         let (title, error_msg, is_input_dialog, prompt_text) = match &self.current_dialog {
             DialogKind::NewFolder { error, .. } => {
@@ -745,6 +843,22 @@ impl Render for DialogsView {
                 false,
                 Some(confirm_delete_message(locations)),
             ),
+            DialogKind::ConfirmEmptyTrash { items } => (
+                "Empty Trash?",
+                None,
+                false,
+                Some(confirm_empty_trash_message(items.len())),
+            ),
+            DialogKind::RestoreConflict {
+                item_name,
+                destination,
+            } => {
+                let msg = format!(
+                    "{}. Remove or rename the existing item and try again.",
+                    format_restore_conflict_message(item_name, destination)
+                );
+                ("Cannot Restore Item", None, false, Some(msg))
+            }
             DialogKind::ConflictResolution { conflict_name, .. } => {
                 let msg = format!(
                     "Target '{}' already exists in the destination folder. Choose conflict policy:",
@@ -763,7 +877,7 @@ impl Render for DialogsView {
             DialogKind::None => ("", None, false, None),
         };
 
-        let trash_icon = if is_delete_dialog || is_trash_dialog {
+        let trash_icon = if is_destructive_dialog || is_trash_dialog {
             Some(animated_icon(
                 IconName::Trash,
                 IconMotion::State(confirm_hover_t),
@@ -989,20 +1103,23 @@ impl Render for DialogsView {
                         .flex_row()
                         .justify_end()
                         .gap_2()
-                        .child(
-                            div()
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .bg(theme.surface_raised)
-                                .text_color(theme.text_muted)
-                                .cursor_pointer()
-                                .child("Cancel")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| this.close(cx)),
-                                ),
-                        )
+                        .when(!is_restore_conflict_dialog, |row| {
+                            row.child(
+                                div()
+                                    .id("dialog-cancel-btn")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(theme.surface_raised)
+                                    .text_color(theme.text_muted)
+                                    .cursor_pointer()
+                                    .child("Cancel")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.close(cx)),
+                                    ),
+                            )
+                        })
                         .child(
                             div()
                                 .id("dialog-confirm-btn")
@@ -1012,7 +1129,7 @@ impl Render for DialogsView {
                                 .px_3()
                                 .py_1()
                                 .rounded_md()
-                                .bg(if is_delete_dialog {
+                                .bg(if is_destructive_dialog {
                                     theme.danger
                                 } else {
                                     theme.accent
@@ -1022,6 +1139,10 @@ impl Render for DialogsView {
                                 .children(trash_icon)
                                 .child(if is_delete_dialog {
                                     "Permanently Delete"
+                                } else if is_empty_trash_dialog {
+                                    "Empty Trash"
+                                } else if is_restore_conflict_dialog {
+                                    "OK"
                                 } else if is_open_with {
                                     "Open"
                                 } else {
@@ -1037,6 +1158,8 @@ impl Render for DialogsView {
                                         this.confirm_hovered = false;
                                         if is_delete_dialog {
                                             this.confirm_permanent_delete(cx);
+                                        } else if is_empty_trash_dialog {
+                                            this.confirm_empty_trash(cx);
                                         } else {
                                             this.submit(cx);
                                         }

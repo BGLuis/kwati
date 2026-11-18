@@ -167,6 +167,9 @@ pub struct ListView {
     exiting_rows: Vec<ExitingRow>,
     exiting_scroll_top: usize,
     motion: MotionTracker<ListMotionKey>,
+    requested_frame_in_render: bool,
+    animation_frame_requests: usize,
+    last_frame_requested_view: Option<gpui::EntityId>,
 }
 
 impl EventEmitter<ListViewEvent> for ListView {}
@@ -212,12 +215,33 @@ impl ListView {
             exiting_rows: Vec::new(),
             exiting_scroll_top: 0,
             motion: MotionTracker::new(),
+            requested_frame_in_render: false,
+            animation_frame_requests: 0,
+            last_frame_requested_view: None,
         }
     }
 
     /// Active column count when rendering in [`ViewMode::Grid`].
     pub fn grid_columns(&self) -> usize {
         self.grid_columns
+    }
+
+    pub fn animation_frame_requests(&self) -> usize {
+        self.animation_frame_requests
+    }
+
+    pub fn last_frame_requested_view(&self) -> Option<gpui::EntityId> {
+        self.last_frame_requested_view
+    }
+
+    pub fn row_hover_value(&self, loc: &Location, now: Instant, reduced: bool) -> f32 {
+        self.motion
+            .scalar_or(&ListMotionKey::Hover(loc.clone()), 0.0, now, reduced)
+    }
+
+    pub fn row_select_value(&self, loc: &Location, now: Instant, reduced: bool) -> f32 {
+        self.motion
+            .scalar_or(&ListMotionKey::SelectBg(loc.clone()), 0.0, now, reduced)
     }
 
     fn current_view_mode(&self, cx: &gpui::App) -> ViewMode {
@@ -1018,7 +1042,7 @@ impl ListView {
         );
         let select_t = self.motion.step_scalar(
             ListMotionKey::SelectBg(loc.clone()),
-            if is_selected { 1.0 } else { 0.0 },
+            0.0,
             if is_selected { 1.0 } else { 0.0 },
             INSTANT,
             Curve::EaseOut,
@@ -1583,15 +1607,13 @@ impl ListView {
     }
 
     fn has_active_list_motion(&self, now: Instant, reduced: bool) -> bool {
-        if reduced {
-            return false;
-        }
         self.motion.has_active(now, reduced)
-            || self.nav_anim.is_some()
-            || !self.reorder_offsets.is_empty()
-            || !self.flash_inserts.is_empty()
-            || !self.calm_inserts.is_empty()
-            || !self.exiting_rows.is_empty()
+            || (!reduced
+                && (self.nav_anim.is_some()
+                    || !self.reorder_offsets.is_empty()
+                    || !self.flash_inserts.is_empty()
+                    || !self.calm_inserts.is_empty()
+                    || !self.exiting_rows.is_empty()))
     }
 }
 
@@ -2062,7 +2084,7 @@ impl Render for ListView {
                                     cx.processor(
                                         move |this: &mut ListView,
                                               range: std::ops::Range<usize>,
-                                              _window,
+                                              window,
                                               cx| {
                                             let mut items: Vec<gpui::AnyElement> =
                                                 Vec::with_capacity(range.len());
@@ -2169,6 +2191,17 @@ impl Render for ListView {
                                                     }
                                                 }
                                             }
+                                            if !this.requested_frame_in_render
+                                                && request_frame_if_active(
+                                                    this.motion.has_active(now, reduced),
+                                                    window,
+                                                )
+                                            {
+                                                this.requested_frame_in_render = true;
+                                                this.animation_frame_requests += 1;
+                                                this.last_frame_requested_view =
+                                                    Some(window.current_view());
+                                            }
                                             items
                                         },
                                     ),
@@ -2251,7 +2284,11 @@ impl Render for ListView {
 
         self.prune_list_motion(now, reduced);
         let animating = self.has_active_list_motion(now, reduced);
-        request_frame_if_active(animating, window);
+        self.requested_frame_in_render = request_frame_if_active(animating, window);
+        if self.requested_frame_in_render {
+            self.animation_frame_requests += 1;
+            self.last_frame_requested_view = Some(window.current_view());
+        }
         root
     }
 }
