@@ -9,7 +9,8 @@ pub mod tooltip;
 pub use ellipsize::Ellipsize;
 pub use file_icons::{icon_for, icon_for_entry, icon_for_with, SpecialFolders};
 pub use icon::{
-    animated_icon, animated_icon_sized, icon, resolved_icon, Assets, IconMotion, IconName, IconPart,
+    animated_icon, animated_icon_sized, icon, resolve_icon_color, resolved_icon, Assets,
+    IconMotion, IconName, IconPart,
 };
 pub use interactive::{
     animated_checkbox_row, animated_toggle_switch, focus_ring_color, hover_bg, modal_scrim_color,

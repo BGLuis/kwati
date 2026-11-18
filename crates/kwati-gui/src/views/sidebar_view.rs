@@ -18,8 +18,8 @@ use kwati_core::{
 
 use crate::actions::{open_system_trash, ManageServers};
 use crate::components::{
-    animated_icon_sized, icon, icon_for_with, resolved_icon, Ellipsize, IconMotion, IconName,
-    SpecialFolders, TextInput, Tooltip,
+    animated_icon_sized, icon, icon_for_with, resolve_icon_color, resolved_icon, Ellipsize,
+    IconMotion, IconName, SpecialFolders, TextInput, Tooltip,
 };
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
@@ -973,9 +973,9 @@ impl SidebarView {
                     lerp_f32(1.0, PRESS_SCALE, press_t)
                 };
                 let color = if place.icon.is_folder() {
-                    theme.accent
+                    resolve_icon_color(place.icon.key_name(), &icon_prefs, &theme)
                 } else {
-                    theme.text
+                    theme.text.into()
                 };
                 let glyph_motion =
                     if !reduced && place.icon.is_folder() && (is_active || hover_t > 0.01) {
@@ -1049,15 +1049,13 @@ impl SidebarView {
                 let (glyph_name, glyph_color, label) = if bm.is_missing() {
                     (
                         IconName::Alert,
-                        theme.danger,
+                        theme.danger.into(),
                         format!("{} (missing)", bm.name),
                     )
                 } else {
-                    (
-                        icon_for_with(&bm.path, true, &specials),
-                        theme.accent,
-                        bm.name.clone(),
-                    )
+                    let glyph = icon_for_with(&bm.path, true, &specials);
+                    let col = resolve_icon_color(glyph.key_name(), &icon_prefs, &theme);
+                    (glyph, col, bm.name.clone())
                 };
                 let glyph_motion =
                     if !reduced && glyph_name.is_folder() && (is_active || hover_t > 0.01) {
@@ -1238,7 +1236,7 @@ impl SidebarView {
                         IconName::FolderNetwork,
                         IconMotion::Rest,
                         size::ICON * scale,
-                        theme.accent,
+                        resolve_icon_color(IconName::FolderNetwork.key_name(), &icon_prefs, &theme),
                         &icon_prefs,
                         &icon_resolver,
                     ))
@@ -1517,9 +1515,9 @@ impl Render for SidebarView {
                         IconMotion::Rest
                     };
                 let color = if place.icon.is_folder() {
-                    theme.accent
+                    resolve_icon_color(place.icon.key_name(), &icon_prefs, &theme)
                 } else {
-                    theme.text
+                    theme.text.into()
                 };
                 let p_clone = place.path.clone();
 
@@ -1661,11 +1659,12 @@ impl Render for SidebarView {
                                     theme.danger,
                                 )
                             } else {
+                                let glyph = icon_for_with(&bm.path, true, &specials);
                                 resolved_icon(
-                                    icon_for_with(&bm.path, true, &specials),
+                                    glyph,
                                     folder_motion,
                                     size::ICON * scale,
-                                    theme.accent,
+                                    resolve_icon_color(glyph.key_name(), &icon_prefs, &theme),
                                     &icon_prefs,
                                     &icon_resolver,
                                 )
@@ -2048,7 +2047,7 @@ impl Render for SidebarView {
                         IconName::FolderNetwork,
                         IconMotion::Rest,
                         size::ICON * scale,
-                        theme.accent,
+                        resolve_icon_color(IconName::FolderNetwork.key_name(), &icon_prefs, &theme),
                         &icon_prefs,
                         &icon_resolver,
                     ))

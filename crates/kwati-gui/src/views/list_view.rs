@@ -23,7 +23,8 @@ use crate::actions::navigation::{
 use crate::actions::operations::get_location_clipboard;
 use crate::components::interactive::focus_ring_color;
 use crate::components::{
-    icon_for_entry, resolved_icon, Ellipsize, IconMotion, IconName, ScrollbarState, SpecialFolders,
+    icon_for_entry, resolve_icon_color, resolved_icon, Ellipsize, IconMotion, IconName,
+    ScrollbarState, SpecialFolders,
 };
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
@@ -1022,6 +1023,7 @@ impl ListView {
         now: Instant,
         reduced: bool,
         theme: &Theme,
+        icon_prefs: &IconPreferences,
     ) -> ItemVisuals {
         let is_hovered = self.hovered_location.as_ref() == Some(loc);
         let is_pressed = self.pressed_location.as_ref() == Some(loc);
@@ -1175,13 +1177,15 @@ impl ListView {
             IconMotion::Rest
         };
         let glyph = icon_for_entry(&entry.path, is_dir, is_remote, specials);
-        let glyph_col: Hsla = if is_dir {
-            theme.accent.into()
-        } else if is_hidden && !is_selected {
-            theme.text_muted.into()
-        } else {
-            theme.text.into()
-        };
+        let mut glyph_col = resolve_icon_color(glyph.key_name(), icon_prefs, theme);
+        if !is_dir && is_hidden && !is_selected {
+            let neutral: Hsla = theme.text.into();
+            if glyph_col == neutral {
+                glyph_col = theme.text_muted.into();
+            } else {
+                glyph_col.a *= 0.65;
+            }
+        }
         let text_col: Hsla = if is_hidden && !is_selected {
             theme.text_muted.into()
         } else {
@@ -1780,7 +1784,7 @@ impl Render for ListView {
         let is_remote = matches!(current, Location::Remote { .. });
         let entries_clone = entries;
         let special_folders = SpecialFolders::from_system();
-        let (row_text, row_muted, row_accent) = (theme.text, theme.text_muted, theme.accent);
+        let (row_text, row_muted) = (theme.text, theme.text_muted);
         let row_fonts = fonts.clone();
 
         let sort_indicator = |col: SortColumn| -> &'static str {
@@ -1810,13 +1814,15 @@ impl Render for ListView {
                         (self.exiting_scroll_top as isize - current_top as isize) as f32 * row_h_px;
                     let top_px = ex.top_px + scroll_shift_px;
                     let glyph = ex.icon;
-                    let glyph_col = if ex.is_dir {
-                        row_accent
-                    } else if ex.is_hidden {
-                        row_muted
-                    } else {
-                        row_text
-                    };
+                    let mut glyph_col = resolve_icon_color(glyph.key_name(), &icon_prefs, &theme);
+                    if !ex.is_dir && ex.is_hidden {
+                        let neutral: Hsla = row_text.into();
+                        if glyph_col == neutral {
+                            glyph_col = row_muted.into();
+                        } else {
+                            glyph_col.a *= 0.65;
+                        }
+                    }
 
                     div()
                         .absolute()
@@ -2136,6 +2142,7 @@ impl Render for ListView {
                                                                 now,
                                                                 reduced,
                                                                 &theme_for_rows,
+                                                                &icon_prefs,
                                                             );
                                                             if view_mode == ViewMode::Details {
                                                                 items.push(
@@ -2202,6 +2209,7 @@ impl Render for ListView {
                                                                         now,
                                                                         reduced,
                                                                         &theme_for_rows,
+                                                                        &icon_prefs,
                                                                     );
                                                                 row_tiles.push(
                                                                     this.render_grid_tile(

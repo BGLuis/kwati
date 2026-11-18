@@ -1,4 +1,5 @@
 use gpui::{rgb, rgba, App, Global, Rgba, WindowAppearance};
+use kwati_core::IconColor;
 
 /// Colour tokens from the Kwatí design standard (`DESIGN.md`, "Colour").
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -85,6 +86,26 @@ impl Theme {
             danger: rgb(0xF2857C),
             warning: rgb(0xE0B050),
             scrim: rgba(0x00000099),
+        }
+    }
+
+    pub fn is_dark(&self) -> bool {
+        (0.2126 * self.bg.r + 0.7152 * self.bg.g + 0.0722 * self.bg.b) < 0.5
+    }
+
+    /// Resolves an [`IconColor`] token or hex/adaptive color against this theme.
+    pub fn resolve_icon_color(&self, color: IconColor) -> Rgba {
+        match color {
+            IconColor::Text => self.text,
+            IconColor::Muted => self.text_muted,
+            IconColor::Accent => self.accent,
+            IconColor::Secondary => self.secondary,
+            IconColor::Danger => self.danger,
+            IconColor::Warning => self.warning,
+            IconColor::Hex(hex) => rgb(hex & 0x00FF_FFFF),
+            IconColor::Adaptive { light, dark } => {
+                rgb((if self.is_dark() { dark } else { light }) & 0x00FF_FFFF)
+            }
         }
     }
 }

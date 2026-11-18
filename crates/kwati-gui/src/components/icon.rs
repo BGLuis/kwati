@@ -16,6 +16,7 @@ use gpui::{
 use kwati_core::{IconPreferences, IconResolver, ResolvedIcon};
 
 use crate::motion::Curve;
+use crate::theme::Theme;
 use crate::tokens::size;
 
 macro_rules! icons {
@@ -634,6 +635,14 @@ fn draw_network_canvas(icon_size: Pixels, color: Hsla, progress: f32) -> AnyElem
     .size(icon_size)
     .flex_none()
     .into_any_element()
+}
+
+/// Resolves the foreground color for `type_key` from `prefs` (type -> group -> base -> default)
+/// and adapts theme tokens / light-dark pairs to the active `theme`.
+pub fn resolve_icon_color(type_key: &str, prefs: &IconPreferences, theme: &Theme) -> Hsla {
+    theme
+        .resolve_icon_color(prefs.effective_color(type_key))
+        .into()
 }
 
 /// Renders an icon driven by `motion` at an explicit square size using `color`, or loads a

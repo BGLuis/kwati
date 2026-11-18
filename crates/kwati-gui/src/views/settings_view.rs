@@ -14,8 +14,8 @@ use kwati_core::{
 };
 
 use crate::components::{
-    animated_icon, animated_toggle_switch, icon, modal_scrim_color, resolved_icon,
-    wrap_modal_card_entrance, IconMotion, IconName, TextInput,
+    animated_icon, animated_toggle_switch, icon, modal_scrim_color, resolve_icon_color,
+    resolved_icon, wrap_modal_card_entrance, IconMotion, IconName, TextInput,
 };
 use crate::motion::{
     is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker, INSTANT, QUICK,
@@ -1375,11 +1375,7 @@ impl SettingsView {
 
         // 2. Live preview row
         let preview_items = SAMPLE_PREVIEW_ICONS.iter().map(|&(builtin, label)| {
-            let color = if builtin.is_folder() {
-                theme.accent
-            } else {
-                theme.text
-            };
+            let color = resolve_icon_color(builtin.key_name(), &prefs, &theme);
             div()
                 .flex()
                 .items_center()
@@ -1430,11 +1426,13 @@ impl SettingsView {
         for (ix, &group) in IconGroup::ALL.iter().enumerate() {
             let override_src = prefs.groups.get(&group);
             let rep = representative_icon_for_group(group);
-            let color = if rep.is_folder() {
-                theme.accent
-            } else {
-                theme.text
-            };
+            let color = prefs
+                .group_colors
+                .get(&group)
+                .copied()
+                .or(prefs.base_color)
+                .map(|c| theme.resolve_icon_color(c).into())
+                .unwrap_or_else(|| resolve_icon_color(rep.key_name(), &prefs, &theme));
             let mut controls = vec![
                 self.render_action_pill(
                     ("icon-grp-inherit", ix),
@@ -1559,11 +1557,7 @@ impl SettingsView {
         let mut type_rows = Vec::with_capacity(ICON_TYPE_SPECS.len());
         for (ix, spec) in ICON_TYPE_SPECS.iter().enumerate() {
             let builtin = IconName::from_key_name(spec.key).unwrap_or(IconName::File);
-            let color = if builtin.is_folder() {
-                theme.accent
-            } else {
-                theme.text
-            };
+            let color = resolve_icon_color(spec.key, &prefs, &theme);
             let override_src = prefs.types.get(spec.key);
             let type_key = spec.key;
 

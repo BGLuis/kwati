@@ -2,6 +2,7 @@
 //! legibility in either theme must fail here, not in a screenshot review.
 
 use gpui::{Rgba, TestAppContext, WindowAppearance};
+use kwati_core::{default_icon_color, ICON_TYPE_SPECS};
 use kwati_gui::theme::Theme;
 
 fn luminance(c: Rgba) -> f32 {
@@ -105,4 +106,26 @@ fn views_read_the_theme_of_the_system(cx: &mut TestAppContext) {
         Theme::apply_appearance(cx.window_appearance(), cx);
         assert_eq!(Theme::get(cx), Theme::light());
     });
+}
+
+#[test]
+fn default_icon_colours_reach_4_5_on_every_surface() {
+    for (theme_name, t) in themes() {
+        let surfaces = [
+            ("bg", t.bg),
+            ("surface", t.surface),
+            ("surface_raised", t.surface_raised),
+        ];
+        for spec in ICON_TYPE_SPECS {
+            let fg = t.resolve_icon_color(default_icon_color(spec.key));
+            for (bg_name, bg) in surfaces {
+                let ratio = contrast(fg, bg);
+                assert!(
+                    ratio >= 4.5,
+                    "{theme_name}: icon '{}' on {bg_name} is {ratio:.2}:1",
+                    spec.key
+                );
+            }
+        }
+    }
 }

@@ -2,10 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui::{px, size, AppContext as _, AssetSource, TestAppContext};
-use kwati_core::{IconPreferences, IconResolver, IconSource, Location, ResolvedIcon};
-use kwati_gui::components::{Assets, IconName};
+use gpui::{px, rgb, size, AppContext as _, AssetSource, Hsla, TestAppContext};
+use kwati_core::{
+    IconColor, IconConfig, IconGroup, IconPreferences, IconResolver, IconSource, Location,
+    ResolvedIcon,
+};
+use kwati_gui::components::{resolve_icon_color, Assets, IconName};
 use kwati_gui::state::AppState;
+use kwati_gui::theme::Theme;
 use kwati_gui::views::MainView;
 
 struct TempDir {
@@ -201,4 +205,73 @@ fn icon_theme_renders_custom_and_deleted_images_without_panic(cx: &mut TestAppCo
 
     cx.simulate_resize(size(px(1024.), px(720.)));
     cx.run_until_parked();
+}
+
+#[test]
+fn resolve_icon_color_gives_pdf_red_by_default_and_honors_user_overrides() {
+    let dir = TempDir::new("color_overrides");
+    let icons_path = dir.path.join("icons.toml");
+
+    let light = Theme::light();
+    let dark = Theme::dark();
+    let defaults = IconPreferences::default();
+
+    // PDF defaults to a red hue in both themes, distinct from generic file/text color.
+    let pdf_light = resolve_icon_color(IconName::FilePdf.key_name(), &defaults, &light);
+    let pdf_dark = resolve_icon_color(IconName::FilePdf.key_name(), &defaults, &dark);
+    let text_light: Hsla = light.text.into();
+    let text_dark: Hsla = dark.text.into();
+    assert_ne!(pdf_light, text_light);
+    assert_ne!(pdf_dark, text_dark);
+    assert_eq!(pdf_light, rgb(0xB3261E).into());
+    assert_eq!(pdf_dark, rgb(0xF2746B).into());
+
+    // Folders default to theme accent.
+    assert_eq!(
+        resolve_icon_color(IconName::Folder.key_name(), &defaults, &dark),
+        dark.accent.into()
+    );
+
+    // AppState setters persist color overrides to icons.toml and follow precedence.
+    let mut state =
+        AppState::new(Location::Local(dir.path.clone())).with_icons_path(Some(icons_path.clone()));
+    state.set_icon_base_color(Some(IconColor::Muted)).unwrap();
+    assert_eq!(
+        resolve_icon_color(
+            IconName::FileCode.key_name(),
+            &state.icon_config.active,
+            &dark
+        ),
+        dark.text_muted.into()
+    );
+
+    state
+        .set_icon_group_color_override(IconGroup::Documents, Some(IconColor::rgb(0x2563EB)))
+        .unwrap();
+    assert_eq!(
+        resolve_icon_color(
+            IconName::FilePdf.key_name(),
+            &state.icon_config.active,
+            &dark
+        ),
+        rgb(0x2563EB).into()
+    );
+
+    state
+        .set_icon_type_color_override("file-pdf", Some(IconColor::rgb(0xDC2626)))
+        .unwrap();
+    assert_eq!(
+        resolve_icon_color(
+            IconName::FilePdf.key_name(),
+            &state.icon_config.active,
+            &dark
+        ),
+        rgb(0xDC2626).into()
+    );
+
+    let reloaded = IconConfig::load_from(&icons_path).unwrap();
+    assert_eq!(
+        resolve_icon_color(IconName::FilePdf.key_name(), &reloaded.active, &dark),
+        rgb(0xDC2626).into()
+    );
 }

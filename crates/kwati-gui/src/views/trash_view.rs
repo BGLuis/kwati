@@ -24,7 +24,10 @@ use crate::actions::operations::{
     apply_restore_trash_outcome, restore_trash_items_op, RestoreTrashOutcome,
 };
 use crate::components::interactive::focus_ring_color;
-use crate::components::{animated_icon_sized, Ellipsize, IconMotion, IconName, ScrollbarState};
+use crate::components::{
+    animated_icon_sized, icon_for_entry, resolve_icon_color, resolved_icon, Ellipsize, IconMotion,
+    IconName, ScrollbarState, SpecialFolders,
+};
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
     MotionTracker, INSTANT, PRESS_SCALE,
@@ -381,7 +384,17 @@ impl Render for TrashView {
             .logical_scroll_top()
             .0;
 
-        let (items, selection, sort_column, sort_direction, trash_loading, reduced, focused_id) = {
+        let (
+            items,
+            selection,
+            sort_column,
+            sort_direction,
+            trash_loading,
+            reduced,
+            focused_id,
+            icon_prefs,
+            icon_resolver,
+        ) = {
             let state = self.app_state.read(cx);
             let focused_id = state.trash_selection_anchor.clone().or_else(|| {
                 state
@@ -397,6 +410,8 @@ impl Render for TrashView {
                 state.trash_loading,
                 is_reduced_motion(state.settings.motion_preference),
                 focused_id,
+                state.icon_config.active.clone(),
+                state.icon_resolver.clone(),
             )
         };
 
@@ -666,12 +681,27 @@ impl Render for TrashView {
                                                             .flex()
                                                             .items_center()
                                                             .gap(space::S8)
-                                                            .child(animated_icon_sized(
-                                                                IconName::File,
-                                                                IconMotion::Rest,
-                                                                size::ICON * icon_scale,
-                                                                row_text,
-                                                            ))
+                                                            .child({
+                                                                let item_icon = icon_for_entry(
+                                                                    &PathBuf::from(&item.name),
+                                                                    false,
+                                                                    true,
+                                                                    &SpecialFolders::default(),
+                                                                );
+                                                                let item_col = resolve_icon_color(
+                                                                    item_icon.key_name(),
+                                                                    &icon_prefs,
+                                                                    &theme_for_rows,
+                                                                );
+                                                                resolved_icon(
+                                                                    item_icon,
+                                                                    IconMotion::Rest,
+                                                                    size::ICON * icon_scale,
+                                                                    item_col,
+                                                                    &icon_prefs,
+                                                                    &icon_resolver,
+                                                                )
+                                                            })
                                                             .child(div().ellipsize().child(name)),
                                                     )
                                                     .child(

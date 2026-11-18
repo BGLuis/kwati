@@ -534,12 +534,186 @@ fn parse_icon_source_value(val: &Value) -> Result<IconSource, String> {
     }
 }
 
-/// Active icon resolution preferences: base source + optional per-group and per-type overrides.
+/// Color specification for built-in and symbolic icons (#112).
+///
+/// Supports semantic palette tokens (`"text"`, `"muted"`, `"accent"`, `"secondary"`,
+/// `"danger"`, `"warning"`), fixed hex RGB values (`"#RRGGBB"`), or light/dark theme pairs
+/// (`{ light = "#RRGGBB", dark = "#RRGGBB" }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IconColor {
+    Text,
+    Muted,
+    Accent,
+    Secondary,
+    Danger,
+    Warning,
+    /// Explicit 24-bit RGB color (`0xRRGGBB`).
+    Hex(u32),
+    /// Theme-adaptive 24-bit RGB pair (`0xRRGGBB` for light and dark themes).
+    Adaptive {
+        light: u32,
+        dark: u32,
+    },
+}
+
+impl IconColor {
+    pub const fn rgb(hex: u32) -> Self {
+        Self::Hex(hex & 0x00FF_FFFF)
+    }
+
+    pub const fn adaptive(light: u32, dark: u32) -> Self {
+        Self::Adaptive {
+            light: light & 0x00FF_FFFF,
+            dark: dark & 0x00FF_FFFF,
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        match lower.as_str() {
+            "text" => return Ok(Self::Text),
+            "muted" | "text_muted" | "text-muted" => return Ok(Self::Muted),
+            "accent" => return Ok(Self::Accent),
+            "secondary" => return Ok(Self::Secondary),
+            "danger" => return Ok(Self::Danger),
+            "warning" => return Ok(Self::Warning),
+            _ => {}
+        }
+        parse_hex_rgb(trimmed).map(Self::Hex)
+    }
+}
+
+impl std::fmt::Display for IconColor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text => f.write_str("text"),
+            Self::Muted => f.write_str("muted"),
+            Self::Accent => f.write_str("accent"),
+            Self::Secondary => f.write_str("secondary"),
+            Self::Danger => f.write_str("danger"),
+            Self::Warning => f.write_str("warning"),
+            Self::Hex(rgb) => write!(f, "#{:06X}", rgb & 0x00FF_FFFF),
+            Self::Adaptive { light, dark } => write!(
+                f,
+                "light=#{:06X}, dark=#{:06X}",
+                light & 0x00FF_FFFF,
+                dark & 0x00FF_FFFF
+            ),
+        }
+    }
+}
+
+impl Serialize for IconColor {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text => serializer.serialize_str("text"),
+            Self::Muted => serializer.serialize_str("muted"),
+            Self::Accent => serializer.serialize_str("accent"),
+            Self::Secondary => serializer.serialize_str("secondary"),
+            Self::Danger => serializer.serialize_str("danger"),
+            Self::Warning => serializer.serialize_str("warning"),
+            Self::Hex(rgb) => serializer.serialize_str(&format!("#{:06X}", rgb & 0x00FF_FFFF)),
+            Self::Adaptive { light, dark } => {
+                let mut t = Table::new();
+                t.insert(
+                    "light".into(),
+                    Value::String(format!("#{:06X}", light & 0x00FF_FFFF)),
+                );
+                t.insert(
+                    "dark".into(),
+                    Value::String(format!("#{:06X}", dark & 0x00FF_FFFF)),
+                );
+                t.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for IconColor {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let val = Value::deserialize(deserializer)?;
+        parse_icon_color_value(&val).map_err(serde::de::Error::custom)
+    }
+}
+
+fn parse_hex_rgb(raw: &str) -> Result<u32, String> {
+    let hex = raw.trim().strip_prefix('#').unwrap_or_else(|| raw.trim());
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "expected color token or \"#RRGGBB\" hex color, got \"{raw}\""
+        ));
+    }
+    u32::from_str_radix(hex, 16)
+        .map(|v| v & 0x00FF_FFFF)
+        .map_err(|e| format!("invalid hex color \"{raw}\": {e}"))
+}
+
+fn parse_icon_color_value(val: &Value) -> Result<IconColor, String> {
+    match val {
+        Value::String(s) => IconColor::parse(s),
+        Value::Table(t) => {
+            let light_str = t
+                .get("light")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "adaptive icon color must contain string \"light\"".to_string())?;
+            let dark_str = t
+                .get("dark")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "adaptive icon color must contain string \"dark\"".to_string())?;
+            Ok(IconColor::adaptive(
+                parse_hex_rgb(light_str)?,
+                parse_hex_rgb(dark_str)?,
+            ))
+        }
+        _ => Err("icon color must be a string or { light, dark } table".into()),
+    }
+}
+
+/// Returns the default theme-aware [`IconColor`] for `type_key` (normalizing aliases first).
+///
+/// Every color pair maintains at least 4.5:1 contrast on light and dark primary surfaces.
+pub fn default_icon_color(type_key: &str) -> IconColor {
+    let key = normalize_type_key(type_key);
+    if key == "folder" || key.starts_with("folder-") {
+        return IconColor::Accent;
+    }
+    match key.as_str() {
+        "file-pdf" => IconColor::adaptive(0xB3261E, 0xF2746B),
+        "file-document" => IconColor::adaptive(0x1E5AA8, 0x7AAEF2),
+        "file-spreadsheet" => IconColor::adaptive(0x2D6A3E, 0x74C289),
+        "file-presentation" => IconColor::adaptive(0xA64214, 0xF09459),
+        "file-markdown" => IconColor::adaptive(0x435399, 0x92A4F0),
+        "file-ebook" => IconColor::adaptive(0x7A3E8F, 0xC88CE0),
+        "file-image" => IconColor::adaptive(0x0F6E6E, 0x5EC7BD),
+        "file-vector" => IconColor::adaptive(0x9C2D6D, 0xE384BB),
+        "file-code" => IconColor::adaptive(0x146487, 0x6BBCE0),
+        "file-script" => IconColor::Secondary,
+        "file-web" => IconColor::adaptive(0x964B00, 0xE8A84C),
+        "file-data" | "file-key" => IconColor::Warning,
+        "file-config" | "file-log" | "file-partial" => IconColor::Muted,
+        "file-database" => IconColor::adaptive(0x5B42A3, 0xA895F0),
+        "file-archive" => IconColor::adaptive(0x8F5314, 0xE09C52),
+        "file-package" => IconColor::adaptive(0x9E431E, 0xE0824F),
+        "file-disk-image" => IconColor::adaptive(0x465C70, 0x92B2CC),
+        "file-audio" => IconColor::adaptive(0x763D99, 0xC48EE8),
+        "file-video" => IconColor::adaptive(0xA32956, 0xEA7CA4),
+        "file-binary" => IconColor::adaptive(0x2B6B5F, 0x6EBFA8),
+        "file-font" => IconColor::adaptive(0x824163, 0xD48AB0),
+        "file-symlink" => IconColor::adaptive(0x0F6B82, 0x68C3D9),
+        _ => IconColor::Text,
+    }
+}
+
+/// Active icon resolution preferences: base source/color + optional per-group and per-type overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IconPreferences {
     pub base: IconSource,
     pub groups: BTreeMap<IconGroup, IconSource>,
     pub types: BTreeMap<String, IconSource>,
+    pub base_color: Option<IconColor>,
+    pub group_colors: BTreeMap<IconGroup, IconColor>,
+    pub type_colors: BTreeMap<String, IconColor>,
 }
 
 impl IconPreferences {
@@ -558,6 +732,26 @@ impl IconPreferences {
             return src;
         }
         &self.base
+    }
+
+    /// Returns the effective [`IconColor`] for `type_key` using precedence:
+    /// type color override -> group color override -> base color override -> [`default_icon_color`].
+    pub fn effective_color(&self, type_key: &str) -> IconColor {
+        let canonical = normalize_type_key(type_key);
+        if let Some(&color) = self.type_colors.get(&canonical) {
+            return color;
+        }
+        if let Some(&color) = self.type_colors.get(type_key) {
+            return color;
+        }
+        let group = group_for_type_key(&canonical);
+        if let Some(&color) = self.group_colors.get(&group) {
+            return color;
+        }
+        if let Some(color) = self.base_color {
+            return color;
+        }
+        default_icon_color(&canonical)
     }
 
     pub fn set_group_override(&mut self, group: IconGroup, source: Option<IconSource>) {
@@ -584,30 +778,49 @@ impl IconPreferences {
         }
     }
 
+    pub fn set_base_color(&mut self, color: Option<IconColor>) {
+        self.base_color = color;
+    }
+
+    pub fn set_group_color_override(&mut self, group: IconGroup, color: Option<IconColor>) {
+        match color {
+            Some(c) => {
+                self.group_colors.insert(group, c);
+            }
+            None => {
+                self.group_colors.remove(&group);
+            }
+        }
+    }
+
+    pub fn set_type_color_override(&mut self, type_key: &str, color: Option<IconColor>) {
+        let canonical = normalize_type_key(type_key);
+        match color {
+            Some(c) => {
+                self.type_colors.insert(canonical, c);
+            }
+            None => {
+                self.type_colors.remove(&canonical);
+                self.type_colors.remove(type_key);
+            }
+        }
+    }
+
     fn to_toml_table(&self) -> Table {
         let mut table = Table::new();
         table.insert(
             "base".into(),
             Value::try_from(&self.base).unwrap_or(Value::String("built-in".into())),
         );
-        if !self.groups.is_empty() {
-            let mut groups = Table::new();
-            for (group, src) in &self.groups {
-                if let Ok(val) = Value::try_from(src) {
-                    groups.insert(group.as_str().into(), val);
-                }
+        if let Some(base_color) = &self.base_color {
+            if let Ok(val) = Value::try_from(base_color) {
+                table.insert("base_color".into(), val);
             }
-            table.insert("groups".into(), Value::Table(groups));
         }
-        if !self.types.is_empty() {
-            let mut types = Table::new();
-            for (key, src) in &self.types {
-                if let Ok(val) = Value::try_from(src) {
-                    types.insert(key.clone(), val);
-                }
-            }
-            table.insert("types".into(), Value::Table(types));
-        }
+        insert_group_map(&mut table, "groups", &self.groups);
+        insert_type_map(&mut table, "types", &self.types);
+        insert_group_map(&mut table, "group_colors", &self.group_colors);
+        insert_type_map(&mut table, "type_colors", &self.type_colors);
         table
     }
 
@@ -617,43 +830,104 @@ impl IconPreferences {
             Some(val) => parse_icon_source_value(val)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
         };
+        let base_color = match table.get("base_color") {
+            None => None,
+            Some(val) => Some(
+                parse_icon_color_value(val)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            ),
+        };
 
-        let mut groups = BTreeMap::new();
-        if let Some(val) = table.get("groups") {
-            let tbl = val.as_table().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "groups must be a table")
-            })?;
-            for (k, v) in tbl {
-                let group = IconGroup::parse(k).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unknown icon group '{k}'"),
-                    )
-                })?;
-                let src = parse_icon_source_value(v)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                groups.insert(group, src);
-            }
-        }
-
-        let mut types = BTreeMap::new();
-        if let Some(val) = table.get("types") {
-            let tbl = val.as_table().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "types must be a table")
-            })?;
-            for (k, v) in tbl {
-                let src = parse_icon_source_value(v)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                types.insert(normalize_type_key(k), src);
-            }
-        }
+        let groups = parse_group_map(table, "groups", parse_icon_source_value)?;
+        let types = parse_type_map(table, "types", parse_icon_source_value)?;
+        let group_colors = parse_group_map(table, "group_colors", parse_icon_color_value)?;
+        let type_colors = parse_type_map(table, "type_colors", parse_icon_color_value)?;
 
         Ok(Self {
             base,
             groups,
             types,
+            base_color,
+            group_colors,
+            type_colors,
         })
     }
+}
+
+fn insert_group_map<V: Serialize>(table: &mut Table, field: &str, map: &BTreeMap<IconGroup, V>) {
+    if map.is_empty() {
+        return;
+    }
+    let mut out = Table::new();
+    for (group, v) in map {
+        if let Ok(val) = Value::try_from(v) {
+            out.insert(group.as_str().into(), val);
+        }
+    }
+    table.insert(field.into(), Value::Table(out));
+}
+
+fn insert_type_map<V: Serialize>(table: &mut Table, field: &str, map: &BTreeMap<String, V>) {
+    if map.is_empty() {
+        return;
+    }
+    let mut out = Table::new();
+    for (key, v) in map {
+        if let Ok(val) = Value::try_from(v) {
+            out.insert(key.clone(), val);
+        }
+    }
+    table.insert(field.into(), Value::Table(out));
+}
+
+fn parse_group_map<V>(
+    table: &Table,
+    field: &str,
+    parse_val: fn(&Value) -> Result<V, String>,
+) -> io::Result<BTreeMap<IconGroup, V>> {
+    let mut out = BTreeMap::new();
+    let Some(val) = table.get(field) else {
+        return Ok(out);
+    };
+    let tbl = val.as_table().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} must be a table"),
+        )
+    })?;
+    for (k, v) in tbl {
+        let group = IconGroup::parse(k).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown icon group '{k}'"),
+            )
+        })?;
+        let parsed = parse_val(v).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        out.insert(group, parsed);
+    }
+    Ok(out)
+}
+
+fn parse_type_map<V>(
+    table: &Table,
+    field: &str,
+    parse_val: fn(&Value) -> Result<V, String>,
+) -> io::Result<BTreeMap<String, V>> {
+    let mut out = BTreeMap::new();
+    let Some(val) = table.get(field) else {
+        return Ok(out);
+    };
+    let tbl = val.as_table().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} must be a table"),
+        )
+    })?;
+    for (k, v) in tbl {
+        let parsed = parse_val(v).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        out.insert(normalize_type_key(k), parsed);
+    }
+    Ok(out)
 }
 
 /// Full persisted icon configuration (`<config dir>/kwati/icons.toml`), holding the active
@@ -1524,5 +1798,113 @@ images = { image = "/tmp/images.png" }
             cfg.active.effective_source("file-pdf"),
             &IconSource::Image(PathBuf::from("/tmp/pdf.png"))
         );
+    }
+
+    #[test]
+    fn icon_color_defaults_precedence_and_toml_roundtrip() {
+        let dir = TestDir::new("colors");
+        let path = dir.path.join("icons.toml");
+
+        let mut prefs = IconPreferences::default();
+        // Built-in defaults give semantic colors (e.g. red for PDF, accent for folders, text for generic file).
+        assert_eq!(prefs.effective_color("folder"), IconColor::Accent);
+        assert_eq!(prefs.effective_color("folder-downloads"), IconColor::Accent);
+        assert_eq!(
+            prefs.effective_color("file-pdf"),
+            IconColor::adaptive(0xB3261E, 0xF2746B)
+        );
+        assert_ne!(prefs.effective_color("file-pdf"), IconColor::Text);
+        assert_eq!(prefs.effective_color("file"), IconColor::Text);
+
+        // Precedence: type > group > base > default.
+        prefs.set_base_color(Some(IconColor::Muted));
+        assert_eq!(prefs.effective_color("file-code"), IconColor::Muted);
+        assert_eq!(prefs.effective_color("file-pdf"), IconColor::Muted);
+
+        prefs.set_group_color_override(IconGroup::Documents, Some(IconColor::rgb(0x1E88E5)));
+        assert_eq!(
+            prefs.effective_color("file-markdown"),
+            IconColor::rgb(0x1E88E5)
+        );
+        assert_eq!(prefs.effective_color("file-pdf"), IconColor::rgb(0x1E88E5));
+        assert_eq!(prefs.effective_color("file-code"), IconColor::Muted);
+
+        prefs.set_type_color_override("file-pdf", Some(IconColor::rgb(0xE53935)));
+        assert_eq!(prefs.effective_color("file-pdf"), IconColor::rgb(0xE53935));
+
+        // Removing type override falls back to group; removing group falls back to base; removing base falls back to default.
+        prefs.set_type_color_override("file-pdf", None);
+        assert_eq!(prefs.effective_color("file-pdf"), IconColor::rgb(0x1E88E5));
+
+        prefs.set_group_color_override(IconGroup::Documents, None);
+        assert_eq!(prefs.effective_color("file-pdf"), IconColor::Muted);
+
+        prefs.set_base_color(None);
+        assert_eq!(
+            prefs.effective_color("file-pdf"),
+            default_icon_color("file-pdf")
+        );
+
+        // Save in preset + round-trip via icons.toml, including adaptive and hex colors.
+        let mut cfg = IconConfig::default();
+        cfg.active.set_base_color(Some(IconColor::Text));
+        cfg.active
+            .set_group_color_override(IconGroup::Code, Some(IconColor::Secondary));
+        cfg.active
+            .set_type_color_override(".pdf", Some(IconColor::adaptive(0x991B1B, 0xFCA5A5)));
+        cfg.save_preset("Vermelho").unwrap();
+        cfg.save_to(&path).unwrap();
+
+        let mut loaded = IconConfig::load_from(&path).unwrap();
+        assert_eq!(loaded, cfg);
+        assert_eq!(
+            loaded.active.effective_color("file-pdf"),
+            IconColor::adaptive(0x991B1B, 0xFCA5A5)
+        );
+        assert_eq!(
+            loaded.active.effective_color("file-code"),
+            IconColor::Secondary
+        );
+        assert_eq!(loaded.active.effective_color("file"), IconColor::Text);
+
+        // Reset clears active colors back to defaults while preserving saved presets.
+        loaded.reset_active();
+        assert_eq!(
+            loaded.active.effective_color("file-pdf"),
+            default_icon_color("file-pdf")
+        );
+        loaded.apply_preset("Vermelho").unwrap();
+        assert_eq!(
+            loaded.active.effective_color("file-pdf"),
+            IconColor::adaptive(0x991B1B, 0xFCA5A5)
+        );
+
+        // Hand-written TOML color aliases and validation.
+        fs::write(
+            &path,
+            r##"
+base_color = "text_muted"
+
+[group_colors]
+audio_video = "#8e44ad"
+
+[type_colors]
+".pdf" = "#d32f2f"
+"##,
+        )
+        .unwrap();
+        let hand = IconConfig::load_from(&path).unwrap();
+        assert_eq!(hand.active.base_color, Some(IconColor::Muted));
+        assert_eq!(
+            hand.active.effective_color("file-audio"),
+            IconColor::rgb(0x8E44AD)
+        );
+        assert_eq!(
+            hand.active.effective_color("file-pdf"),
+            IconColor::rgb(0xD32F2F)
+        );
+
+        assert!(IconColor::parse("#GGGGGG").is_err());
+        assert!(IconColor::parse("unknown-token").is_err());
     }
 }

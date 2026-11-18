@@ -11,9 +11,9 @@ use gpui::{AsyncApp, Context, Task, WeakEntity};
 use kwati_core::{
     default_icons_path, list_trash, settings_path, sort_entries_by, volume_kind, Backend,
     BackendError, Bookmark, ConnectionProfile, ConnectionState, DirWatcher, Entry, History,
-    HostKeyUnknown, IconConfig, IconGroup, IconResolver, IconSource, ListOptions, LocalBackend,
-    Location, ReconnectingBackend, Selection, Settings, SettingsWarning, SortColumn, SortDirection,
-    SortOrder, TrashItem, ViewMode, VolumeKind,
+    HostKeyUnknown, IconColor, IconConfig, IconGroup, IconResolver, IconSource, ListOptions,
+    LocalBackend, Location, ReconnectingBackend, Selection, Settings, SettingsWarning, SortColumn,
+    SortDirection, SortOrder, TrashItem, ViewMode, VolumeKind,
 };
 
 use crate::layout::PanelLayout;
@@ -545,6 +545,35 @@ impl AppState {
     ) -> Result<(), String> {
         self.update_icon_config(|cfg| {
             cfg.active.set_type_override(type_key, source);
+            Ok(())
+        })
+    }
+
+    pub fn set_icon_base_color(&mut self, color: Option<IconColor>) -> Result<(), String> {
+        self.update_icon_config(|cfg| {
+            cfg.active.set_base_color(color);
+            Ok(())
+        })
+    }
+
+    pub fn set_icon_group_color_override(
+        &mut self,
+        group: IconGroup,
+        color: Option<IconColor>,
+    ) -> Result<(), String> {
+        self.update_icon_config(|cfg| {
+            cfg.active.set_group_color_override(group, color);
+            Ok(())
+        })
+    }
+
+    pub fn set_icon_type_color_override(
+        &mut self,
+        type_key: &str,
+        color: Option<IconColor>,
+    ) -> Result<(), String> {
+        self.update_icon_config(|cfg| {
+            cfg.active.set_type_color_override(type_key, color);
             Ok(())
         })
     }
