@@ -12,7 +12,7 @@ use kwati_core::{
     list_trash, settings_path, sort_entries_by, volume_kind, Backend, BackendError, Bookmark,
     ConnectionProfile, ConnectionState, DirWatcher, Entry, History, HostKeyUnknown, ListOptions,
     LocalBackend, Location, ReconnectingBackend, Selection, Settings, SettingsWarning, SortColumn,
-    SortDirection, SortOrder, TrashItem, VolumeKind,
+    SortDirection, SortOrder, TrashItem, ViewMode, VolumeKind,
 };
 
 use crate::layout::PanelLayout;
@@ -283,6 +283,7 @@ pub struct AppState {
     pub sort_column: SortColumn,
     pub sort_direction: SortDirection,
     pub show_hidden: bool,
+    pub view_mode: ViewMode,
     pub panels: PanelLayout,
     pub dir_watcher: Option<DirWatcher>,
     settings_path: Option<PathBuf>,
@@ -303,6 +304,7 @@ impl AppState {
     /// Creates an isolated in-memory state suitable for headless tests (no disk config/keyring I/O).
     pub fn new(initial_location: Location) -> Self {
         let settings = Settings::default();
+        let view_mode = settings.view_mode;
         set_active_motion_preference(settings.motion_preference);
         Self {
             history: History::with_initial(initial_location.clone()),
@@ -342,6 +344,7 @@ impl AppState {
             sort_column: SortColumn::Name,
             sort_direction: SortDirection::Ascending,
             show_hidden: false,
+            view_mode,
             panels: PanelLayout::default(),
             dir_watcher: None,
             settings_path: None,
@@ -382,6 +385,7 @@ impl AppState {
         self.show_hidden = settings.show_hidden;
         self.sort_column = settings.default_sort.column;
         self.sort_direction = settings.default_sort.direction;
+        self.view_mode = settings.view_mode;
         set_active_motion_preference(settings.motion_preference);
         self.settings = settings;
         self.settings_warnings = warnings;
@@ -444,6 +448,7 @@ impl AppState {
             *settings = Settings::default();
             Ok(())
         })?;
+        self.view_mode = self.settings.view_mode;
         self.settings_warnings.clear();
         Ok(())
     }
@@ -1149,6 +1154,30 @@ impl AppState {
         self.set_entries(entries);
     }
 
+    /// Sets the active listing view mode and persists it when configured.
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        if self.settings.view_mode != mode {
+            if let Err(err) = self.update_settings(|s| {
+                s.view_mode = mode;
+                Ok(())
+            }) {
+                self.set_status(err);
+            }
+        }
+        self.view_mode = mode;
+    }
+
+    /// Cycles through `Details -> Grid -> CompactList -> Details` and persists the choice.
+    pub fn cycle_view_mode(&mut self) -> ViewMode {
+        let next = match self.view_mode {
+            ViewMode::Details => ViewMode::Grid,
+            ViewMode::Grid => ViewMode::CompactList,
+            ViewMode::CompactList => ViewMode::Details,
+        };
+        self.set_view_mode(next);
+        next
+    }
+
     /// Navigates up to the parent directory, returning true if parent exists.
     pub fn go_up(&mut self) -> bool {
         match self.current_location.parent() {
@@ -1713,6 +1742,39 @@ impl AppState {
         }
         let ix = self.selected_index().unwrap_or(0);
         let target = (ix + page_size).min(self.entries.len() - 1);
+        self.select_index(target);
+        Some(target)
+    }
+
+    /// Moves selection up by one grid row (`cols` items), staying on the first row when already there.
+    pub fn select_up_by(&mut self, cols: usize) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let cols = cols.max(1);
+        let target = match self.selected_index() {
+            Some(ix) if ix >= cols => ix - cols,
+            Some(ix) => ix,
+            None => self.entries.len() - 1,
+        };
+        self.select_index(target);
+        Some(target)
+    }
+
+    /// Moves selection down by one grid row (`cols` items), clamping to the last entry when
+    /// moving from a higher row onto a shorter final row, and staying put on the last row.
+    pub fn select_down_by(&mut self, cols: usize) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let cols = cols.max(1);
+        let last_ix = self.entries.len() - 1;
+        let last_row = last_ix / cols;
+        let target = match self.selected_index() {
+            Some(ix) if ix / cols < last_row => (ix + cols).min(last_ix),
+            Some(ix) => ix,
+            None => 0,
+        };
         self.select_index(target);
         Some(target)
     }
