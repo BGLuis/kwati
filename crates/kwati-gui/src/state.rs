@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,11 +9,11 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{AsyncApp, Context, Task, WeakEntity};
 use kwati_core::{
-    default_icons_path, settings_path, sort_entries_by, volume_kind, Backend, BackendError,
-    Bookmark, ConnectionProfile, ConnectionState, DirWatcher, Entry, History, HostKeyUnknown,
-    IconConfig, IconGroup, IconResolver, IconSource, ListOptions, LocalBackend, Location,
-    ReconnectingBackend, Selection, Settings, SettingsWarning, SortColumn, SortDirection,
-    SortOrder, VolumeKind,
+    default_icons_path, list_trash, settings_path, sort_entries_by, volume_kind, Backend,
+    BackendError, Bookmark, ConnectionProfile, ConnectionState, DirWatcher, Entry, History,
+    HostKeyUnknown, IconConfig, IconGroup, IconResolver, IconSource, ListOptions, LocalBackend,
+    Location, ReconnectingBackend, Selection, Settings, SettingsWarning, SortColumn, SortDirection,
+    SortOrder, TrashItem, ViewMode, VolumeKind,
 };
 
 use crate::layout::PanelLayout;
@@ -232,11 +234,28 @@ struct Foreground {
     this: WeakEntity<AppState>,
 }
 
+/// Sort columns supported by the trash browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrashSortColumn {
+    Name,
+    OriginalLocation,
+    #[default]
+    DeletedAt,
+}
+
 /// Root application state shared across views and background tasks.
 pub struct AppState {
     pub current_location: Location,
     pub entries: Arc<Vec<Entry>>,
     pub selection: Selection,
+    pub trash_active: bool,
+    pub trash_items: Arc<Vec<TrashItem>>,
+    pub trash_selection: HashSet<OsString>,
+    pub trash_selection_anchor: Option<OsString>,
+    pub trash_loading: bool,
+    pub trash_revision: u64,
+    pub trash_sort_column: TrashSortColumn,
+    pub trash_sort_direction: SortDirection,
     pub history: History,
     pub settings: Settings,
     pub settings_open: bool,
@@ -267,6 +286,7 @@ pub struct AppState {
     pub sort_column: SortColumn,
     pub sort_direction: SortDirection,
     pub show_hidden: bool,
+    pub view_mode: ViewMode,
     pub panels: PanelLayout,
     pub dir_watcher: Option<DirWatcher>,
     settings_path: Option<PathBuf>,
@@ -280,6 +300,7 @@ pub struct AppState {
     read_failure_shown: bool,
     // Replacing either task drops, and so cancels, the one it supersedes.
     load_task: Option<Task<()>>,
+    trash_task: Option<Task<()>>,
     watch_task: Option<Task<()>>,
 }
 
@@ -287,12 +308,21 @@ impl AppState {
     /// Creates an isolated in-memory state suitable for headless tests (no disk config/keyring I/O).
     pub fn new(initial_location: Location) -> Self {
         let settings = Settings::default();
+        let view_mode = settings.view_mode;
         set_active_motion_preference(settings.motion_preference);
         Self {
             history: History::with_initial(initial_location.clone()),
             current_location: initial_location,
             entries: Arc::new(Vec::new()),
             selection: Selection::new(),
+            trash_active: false,
+            trash_items: Arc::new(Vec::new()),
+            trash_selection: HashSet::new(),
+            trash_selection_anchor: None,
+            trash_loading: false,
+            trash_revision: 0,
+            trash_sort_column: TrashSortColumn::DeletedAt,
+            trash_sort_direction: SortDirection::Descending,
             settings,
             settings_open: false,
             settings_warnings: Vec::new(),
@@ -320,6 +350,7 @@ impl AppState {
             sort_column: SortColumn::Name,
             sort_direction: SortDirection::Ascending,
             show_hidden: false,
+            view_mode,
             panels: PanelLayout::default(),
             dir_watcher: None,
             settings_path: None,
@@ -330,6 +361,7 @@ impl AppState {
             connect_generation: 0,
             read_failure_shown: false,
             load_task: None,
+            trash_task: None,
             watch_task: None,
         }
     }
@@ -372,6 +404,7 @@ impl AppState {
         self.show_hidden = settings.show_hidden;
         self.sort_column = settings.default_sort.column;
         self.sort_direction = settings.default_sort.direction;
+        self.view_mode = settings.view_mode;
         set_active_motion_preference(settings.motion_preference);
         self.settings = settings;
         self.settings_warnings = warnings;
@@ -434,6 +467,7 @@ impl AppState {
             *settings = Settings::default();
             Ok(())
         })?;
+        self.view_mode = self.settings.view_mode;
         self.settings_warnings.clear();
         Ok(())
     }
@@ -672,6 +706,10 @@ impl AppState {
     /// Reloads the entries of the current location using current sort and hidden options,
     /// preserving selection by `Location`.
     pub fn reload_entries(&mut self) {
+        if self.trash_active {
+            self.reload_trash();
+            return;
+        }
         self.pending_change_origin = EntryChangeOrigin::UserAction;
         self.begin_load(self.current_location.clone(), Arrival::Reload);
     }
@@ -685,6 +723,249 @@ impl AppState {
     /// Refreshes the current listing (alias for [`Self::reload_entries`]).
     pub fn refresh_current(&mut self) {
         self.reload_entries();
+    }
+
+    /// Opens the in-app trash browser and starts loading trashed items.
+    pub fn open_trash(&mut self) {
+        self.load_task = None;
+        self.pending_navigation = None;
+        self.trash_active = true;
+        self.trash_selection.clear();
+        self.trash_selection_anchor = None;
+        self.preview_state = None;
+        self.reload_trash();
+    }
+
+    /// Leaves the trash browser and refreshes the underlying folder listing.
+    pub fn exit_trash(&mut self) {
+        if !self.trash_active {
+            return;
+        }
+        self.trash_active = false;
+        self.trash_task = None;
+        self.trash_loading = false;
+        self.trash_selection.clear();
+        self.trash_selection_anchor = None;
+        self.reload_entries();
+    }
+
+    /// Reloads the system trash items (on the background executor when attached).
+    pub fn reload_trash(&mut self) {
+        let Some(foreground) = &self.foreground else {
+            self.finish_trash_load(list_trash());
+            return;
+        };
+        self.trash_loading = true;
+        let this = foreground.this.clone();
+        let background = foreground.cx.background_executor().clone();
+        self.trash_task = Some(foreground.cx.spawn(async move |cx| {
+            let result = background.spawn(async move { list_trash() }).await;
+            this.update(cx, |state, cx| {
+                state.finish_trash_load(result);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn finish_trash_load(&mut self, result: io::Result<Vec<TrashItem>>) {
+        self.trash_loading = false;
+        match result {
+            Ok(mut items) => {
+                sort_trash_items(
+                    &mut items,
+                    self.trash_sort_column,
+                    self.trash_sort_direction,
+                );
+                self.set_trash_items(items);
+                if std::mem::take(&mut self.read_failure_shown) {
+                    self.clear_status();
+                }
+            }
+            Err(err) => {
+                self.read_failure_shown = true;
+                self.set_status(format!("Cannot list trash: {err}"));
+            }
+        }
+    }
+
+    /// Replaces the listed trash items while preserving selection by `TrashItem::id`.
+    pub fn set_trash_items(&mut self, items: Vec<TrashItem>) {
+        self.trash_revision = self.trash_revision.wrapping_add(1);
+        let valid_ids: HashSet<OsString> = items.iter().map(|i| i.id.clone()).collect();
+        self.trash_selection.retain(|id| valid_ids.contains(id));
+        if !self
+            .trash_selection_anchor
+            .as_ref()
+            .is_some_and(|a| valid_ids.contains(a))
+        {
+            self.trash_selection_anchor = None;
+        }
+        self.trash_items = Arc::new(items);
+    }
+
+    /// Toggles sorting on a trash view column.
+    pub fn toggle_trash_sort(&mut self, column: TrashSortColumn) {
+        if self.trash_sort_column == column {
+            self.trash_sort_direction = match self.trash_sort_direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            };
+        } else {
+            self.trash_sort_column = column;
+            self.trash_sort_direction = match column {
+                TrashSortColumn::DeletedAt => SortDirection::Descending,
+                TrashSortColumn::Name | TrashSortColumn::OriginalLocation => {
+                    SortDirection::Ascending
+                }
+            };
+        }
+        let mut items = (*self.trash_items).clone();
+        sort_trash_items(
+            &mut items,
+            self.trash_sort_column,
+            self.trash_sort_direction,
+        );
+        self.set_trash_items(items);
+    }
+
+    pub fn selected_trash_items(&self) -> Vec<TrashItem> {
+        self.trash_items
+            .iter()
+            .filter(|item| self.trash_selection.contains(&item.id))
+            .cloned()
+            .collect()
+    }
+
+    pub fn selected_trash_index(&self) -> Option<usize> {
+        self.trash_items
+            .iter()
+            .position(|item| self.trash_selection.contains(&item.id))
+    }
+
+    pub fn select_trash_only(&mut self, id: OsString) {
+        self.trash_selection.clear();
+        self.trash_selection_anchor = Some(id.clone());
+        self.trash_selection.insert(id);
+    }
+
+    pub fn toggle_trash_item(&mut self, id: OsString) {
+        if !self.trash_selection.remove(&id) {
+            self.trash_selection.insert(id.clone());
+            self.trash_selection_anchor = Some(id);
+        }
+    }
+
+    pub fn select_trash_index(&mut self, index: usize) {
+        if let Some(item) = self.trash_items.get(index) {
+            self.select_trash_only(item.id.clone());
+        }
+    }
+
+    pub fn select_trash_range_to(&mut self, target_index: usize, keep_existing: bool) {
+        let Some(target_item) = self.trash_items.get(target_index) else {
+            return;
+        };
+        let target_id = target_item.id.clone();
+        let anchor_idx = self
+            .trash_selection_anchor
+            .as_ref()
+            .and_then(|anchor| self.trash_items.iter().position(|item| &item.id == anchor));
+        let (start, end, preserved_anchor) = match anchor_idx {
+            Some(a_idx) => {
+                let anchor_id = self.trash_items[a_idx].id.clone();
+                if a_idx <= target_index {
+                    (a_idx, target_index, anchor_id)
+                } else {
+                    (target_index, a_idx, anchor_id)
+                }
+            }
+            None => (target_index, target_index, target_id),
+        };
+        if !keep_existing {
+            self.trash_selection.clear();
+        }
+        for item in &self.trash_items[start..=end] {
+            self.trash_selection.insert(item.id.clone());
+        }
+        self.trash_selection_anchor = Some(preserved_anchor);
+    }
+
+    pub fn select_all_trash_items(&mut self) {
+        for item in self.trash_items.iter() {
+            self.trash_selection.insert(item.id.clone());
+        }
+        if self.trash_selection_anchor.is_none() {
+            if let Some(first) = self.trash_items.first() {
+                self.trash_selection_anchor = Some(first.id.clone());
+            }
+        }
+    }
+
+    pub fn clear_trash_selection(&mut self) {
+        self.trash_selection.clear();
+        self.trash_selection_anchor = None;
+    }
+
+    pub fn select_next_trash(&mut self) -> Option<usize> {
+        if self.trash_items.is_empty() {
+            return None;
+        }
+        let next_ix = match self.selected_trash_index() {
+            Some(ix) => (ix + 1).min(self.trash_items.len() - 1),
+            None => 0,
+        };
+        self.select_trash_index(next_ix);
+        Some(next_ix)
+    }
+
+    pub fn select_previous_trash(&mut self) -> Option<usize> {
+        if self.trash_items.is_empty() {
+            return None;
+        }
+        let prev_ix = match self.selected_trash_index() {
+            Some(ix) => ix.saturating_sub(1),
+            None => self.trash_items.len() - 1,
+        };
+        self.select_trash_index(prev_ix);
+        Some(prev_ix)
+    }
+
+    pub fn select_first_trash(&mut self) -> Option<usize> {
+        if self.trash_items.is_empty() {
+            return None;
+        }
+        self.select_trash_index(0);
+        Some(0)
+    }
+
+    pub fn select_last_trash(&mut self) -> Option<usize> {
+        if self.trash_items.is_empty() {
+            return None;
+        }
+        let last_ix = self.trash_items.len() - 1;
+        self.select_trash_index(last_ix);
+        Some(last_ix)
+    }
+
+    pub fn select_page_up_trash(&mut self, page_size: usize) -> Option<usize> {
+        if self.trash_items.is_empty() {
+            return None;
+        }
+        let ix = self.selected_trash_index().unwrap_or(0);
+        let target = ix.saturating_sub(page_size);
+        self.select_trash_index(target);
+        Some(target)
+    }
+
+    pub fn select_page_down_trash(&mut self, page_size: usize) -> Option<usize> {
+        if self.trash_items.is_empty() {
+            return None;
+        }
+        let ix = self.selected_trash_index().unwrap_or(0);
+        let target = (ix + page_size).min(self.trash_items.len() - 1);
+        self.select_trash_index(target);
+        Some(target)
     }
 
     /// Cancels any in-flight directory load without altering the current listing.
@@ -704,6 +985,10 @@ impl AppState {
 
     /// Navigates back in history, returning true if there was a previous location.
     pub fn go_back(&mut self) -> bool {
+        if self.trash_active {
+            self.exit_trash();
+            return true;
+        }
         let Some(index) = self.history.index().checked_sub(1) else {
             return false;
         };
@@ -859,6 +1144,9 @@ impl AppState {
                 self.history.forward();
             }
         }
+        self.trash_active = false;
+        self.trash_task = None;
+        self.trash_loading = false;
         self.current_location = target;
         self.selection.clear();
         self.preview_state = None;
@@ -992,6 +1280,30 @@ impl AppState {
         let mut entries = (*self.entries).clone();
         sort_entries_by(&mut entries, self.sort_column, self.sort_direction);
         self.set_entries(entries);
+    }
+
+    /// Sets the active listing view mode and persists it when configured.
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        if self.settings.view_mode != mode {
+            if let Err(err) = self.update_settings(|s| {
+                s.view_mode = mode;
+                Ok(())
+            }) {
+                self.set_status(err);
+            }
+        }
+        self.view_mode = mode;
+    }
+
+    /// Cycles through `Details -> Grid -> CompactList -> Details` and persists the choice.
+    pub fn cycle_view_mode(&mut self) -> ViewMode {
+        let next = match self.view_mode {
+            ViewMode::Details => ViewMode::Grid,
+            ViewMode::Grid => ViewMode::CompactList,
+            ViewMode::CompactList => ViewMode::Details,
+        };
+        self.set_view_mode(next);
+        next
     }
 
     /// Navigates up to the parent directory, returning true if parent exists.
@@ -1562,6 +1874,39 @@ impl AppState {
         Some(target)
     }
 
+    /// Moves selection up by one grid row (`cols` items), staying on the first row when already there.
+    pub fn select_up_by(&mut self, cols: usize) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let cols = cols.max(1);
+        let target = match self.selected_index() {
+            Some(ix) if ix >= cols => ix - cols,
+            Some(ix) => ix,
+            None => self.entries.len() - 1,
+        };
+        self.select_index(target);
+        Some(target)
+    }
+
+    /// Moves selection down by one grid row (`cols` items), clamping to the last entry when
+    /// moving from a higher row onto a shorter final row, and staying put on the last row.
+    pub fn select_down_by(&mut self, cols: usize) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let cols = cols.max(1);
+        let last_ix = self.entries.len() - 1;
+        let last_row = last_ix / cols;
+        let target = match self.selected_index() {
+            Some(ix) if ix / cols < last_row => (ix + cols).min(last_ix),
+            Some(ix) => ix,
+            None => 0,
+        };
+        self.select_index(target);
+        Some(target)
+    }
+
     /// Opens the currently selected entry: if directory, enters it; returns true if navigated.
     pub fn open_selected_entry(&mut self) -> bool {
         if let Some(ix) = self.selected_index() {
@@ -1676,6 +2021,36 @@ fn into_io(err: BackendError) -> io::Error {
         BackendError::Io(err) => err,
         BackendError::Unsupported => io::ErrorKind::Unsupported.into(),
     }
+}
+
+/// Sorts trash items by `column` and `direction`.
+pub fn sort_trash_items(
+    items: &mut [TrashItem],
+    column: TrashSortColumn,
+    direction: SortDirection,
+) {
+    items.sort_by(|a, b| {
+        let ord = match column {
+            TrashSortColumn::Name => a
+                .name
+                .to_string_lossy()
+                .to_lowercase()
+                .cmp(&b.name.to_string_lossy().to_lowercase()),
+            TrashSortColumn::OriginalLocation => a
+                .original_parent
+                .to_string_lossy()
+                .to_lowercase()
+                .cmp(&b.original_parent.to_string_lossy().to_lowercase()),
+            TrashSortColumn::DeletedAt => a.time_deleted.cmp(&b.time_deleted),
+        };
+        let directed = match direction {
+            SortDirection::Ascending => ord,
+            SortDirection::Descending => ord.reverse(),
+        };
+        directed
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 /// The reason without the `I/O error:` prefix `BackendError` adds.

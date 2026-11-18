@@ -26,6 +26,9 @@ actions!(
         ToggleHidden,
         TogglePreview,
         OpenContextMenu,
+        SetViewDetails,
+        SetViewGrid,
+        SetViewCompact,
     ]
 );
 
@@ -50,6 +53,33 @@ pub fn open_with_system(path: &Path) -> io::Result<()> {
     {
         let mut cmd = std::process::Command::new("xdg-open");
         cmd.arg(path);
+        crate::actions::spawn_detached(&mut cmd)
+    }
+}
+
+/// Opens the operating system's native trash / recycle bin window.
+pub fn open_system_trash() -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("osascript");
+        cmd.args([
+            "-e",
+            "tell application \"Finder\" to open trash",
+            "-e",
+            "tell application \"Finder\" to activate",
+        ]);
+        crate::actions::spawn_detached(&mut cmd)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("explorer.exe");
+        cmd.arg("shell:RecycleBinFolder");
+        crate::actions::spawn_detached(&mut cmd)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg("trash:///");
         crate::actions::spawn_detached(&mut cmd)
     }
 }

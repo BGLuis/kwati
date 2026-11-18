@@ -9,6 +9,7 @@ pub mod remote_dialogs;
 pub mod search_view;
 pub mod settings_view;
 pub mod sidebar_view;
+pub mod trash_view;
 
 pub use context_menu::{ContextMenuAction, ContextMenuEntry, ContextMenuEvent, ContextMenuView};
 pub use dialogs::{DialogKind, DialogsView};
@@ -21,6 +22,7 @@ pub use remote_dialogs::{RemoteDialogKind, RemoteDialogsView};
 pub use search_view::SearchView;
 pub use settings_view::SettingsView;
 pub use sidebar_view::SidebarView;
+pub use trash_view::{TrashView, TrashViewEvent};
 
 use std::time::Instant;
 
@@ -28,8 +30,9 @@ use gpui::{
     div, prelude::*, px, App, Context, CursorStyle, DragMoveEvent, EmptyView, Entity, Pixels,
     SharedString, Window,
 };
-use kwati_core::Location;
+use kwati_core::{Location, SortColumn, SortDirection, ViewMode};
 
+use crate::actions::navigation::{SetViewCompact, SetViewDetails, SetViewGrid};
 use crate::actions::operations::{
     self, copy_locations_to_clipboard, cut_locations_to_clipboard, execute_undo,
     get_location_clipboard,
@@ -38,6 +41,7 @@ use crate::actions::remote_sync::RemotePollerHost;
 use crate::actions::{
     DisconnectRemote, ManageServers, OpenSettings, ReconnectRemote, RefreshListing, TogglePreview,
 };
+use crate::components::Ellipsize;
 use crate::layout::{PanelLayout, PREVIEW_DEFAULT, SIDEBAR_DEFAULT};
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
@@ -46,7 +50,7 @@ use crate::motion::{
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{size, space, Fonts, TextRole};
-use crate::views::list_view::format_size;
+use crate::views::list_view::{format_modified, format_size};
 use crate::views::search_view::ToggleSearch;
 
 /// The root shell view of kwati-gui.
@@ -55,6 +59,7 @@ pub struct MainView {
     pub header: Entity<HeaderView>,
     pub sidebar: Entity<SidebarView>,
     pub list: Entity<ListView>,
+    pub trash: Entity<TrashView>,
     pub preview: Entity<PreviewView>,
     pub jobs: Entity<JobsView>,
     pub search: Entity<SearchView>,
@@ -78,6 +83,7 @@ impl MainView {
         let header = cx.new(|cx| HeaderView::new(app_state.clone(), cx));
         let sidebar = cx.new(|cx| SidebarView::new(app_state.clone(), cx));
         let list = cx.new(|cx| ListView::new(app_state.clone(), cx));
+        let trash = cx.new(|cx| TrashView::new(app_state.clone(), cx));
         let preview = cx.new(|cx| PreviewView::new(app_state.clone(), cx));
         let jobs = cx.new(|cx| JobsView::new(app_state.clone(), cx));
         let search = cx.new(|cx| SearchView::new(app_state.clone(), cx));
@@ -88,17 +94,28 @@ impl MainView {
         let context_menu = cx.new(|cx| ContextMenuView::new(app_state.clone(), cx));
         let remote_sync = cx.new(|cx| RemotePollerHost::new(app_state.clone(), cx));
 
-        cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
+        let mut was_trash_active = app_state.read(cx).trash_active;
+        cx.observe_in(&app_state, window, move |this, app_state, window, cx| {
+            let now_trash_active = app_state.read(cx).trash_active;
+            if now_trash_active != was_trash_active {
+                was_trash_active = now_trash_active;
+                if !this.any_modal_or_search_open(cx) {
+                    this.focus_active_content(window, cx);
+                }
+            }
+            cx.notify();
+        })
+        .detach();
 
-        // The list owns the keyboard whenever no modal or search bar is open; only restore focus
-        // on an actual open -> closed transition so unrelated updates do not steal focus.
+        // The list (or trash view) owns the keyboard whenever no modal or search bar is open; only
+        // restore focus on an actual open -> closed transition so unrelated updates do not steal focus.
         let mut dialog_was_open = false;
         cx.observe_in(&dialogs, window, move |this, dialogs, window, cx| {
             let now_open = dialogs.read(cx).current_dialog != DialogKind::None;
             if !dialog_was_open && now_open {
                 dialogs.update(cx, |dialogs, cx| dialogs.focus(window, cx));
             } else if dialog_was_open && !now_open && !this.any_modal_or_search_open(cx) {
-                this.list.read(cx).focus_handle.focus(window);
+                this.focus_active_content(window, cx);
             }
             dialog_was_open = now_open;
             cx.notify();
@@ -109,7 +126,7 @@ impl MainView {
         cx.observe_in(&remote_dialogs, window, move |this, remote, window, cx| {
             let now_open = remote.read(cx).is_open(cx);
             if remote_was_open && !now_open && !this.any_modal_or_search_open(cx) {
-                this.list.read(cx).focus_handle.focus(window);
+                this.focus_active_content(window, cx);
             }
             remote_was_open = now_open;
             cx.notify();
@@ -120,7 +137,7 @@ impl MainView {
         cx.observe_in(&settings, window, move |this, settings, window, cx| {
             let now_open = settings.read(cx).is_open(cx);
             if settings_was_open && !now_open && !this.any_modal_or_search_open(cx) {
-                this.list.read(cx).focus_handle.focus(window);
+                this.focus_active_content(window, cx);
             }
             settings_was_open = now_open;
             cx.notify();
@@ -131,14 +148,18 @@ impl MainView {
         cx.observe_in(&search, window, move |this, search, window, cx| {
             let now_active = search.read(cx).is_active();
             if search_was_active && !now_active && !this.any_modal_or_search_open(cx) {
-                this.list.read(cx).focus_handle.focus(window);
+                this.focus_active_content(window, cx);
             }
             search_was_active = now_active;
             cx.notify();
         })
         .detach();
 
-        list.read(cx).focus_handle.focus(window);
+        if app_state.read(cx).trash_active {
+            trash.read(cx).focus_handle.focus(window);
+        } else {
+            list.read(cx).focus_handle.focus(window);
+        }
         // Read the appearance from the window: asking the platform (`cx.window_appearance()`)
         // from inside this callback re-borrows gpui's Wayland client and panics.
         cx.observe_window_appearance(window, |_, window, cx| {
@@ -163,11 +184,34 @@ impl MainView {
         })
         .detach();
 
+        cx.subscribe_in(&trash, window, |this, _, event, window, cx| {
+            match event {
+                TrashViewEvent::ConfirmEmptyTrash { items } => {
+                    let items = items.clone();
+                    this.open_dialog(window, cx, |dialogs, cx| {
+                        dialogs.open_confirm_empty_trash(items, cx);
+                    });
+                }
+                TrashViewEvent::RestoreConflict {
+                    item_name,
+                    destination,
+                } => {
+                    let item_name = item_name.clone();
+                    let destination = destination.clone();
+                    this.open_dialog(window, cx, |dialogs, cx| {
+                        dialogs.open_restore_conflict(item_name, destination, cx);
+                    });
+                }
+            }
+            cx.notify();
+        })
+        .detach();
+
         cx.subscribe_in(&context_menu, window, |this, _, event, window, cx| {
             match *event {
                 ContextMenuEvent::Closed => {
                     if !this.any_modal_or_search_open(cx) {
-                        this.list.read(cx).focus_handle.focus(window);
+                        this.focus_active_content(window, cx);
                     }
                 }
                 ContextMenuEvent::Execute(action) => {
@@ -184,6 +228,7 @@ impl MainView {
             header,
             sidebar,
             list,
+            trash,
             preview,
             jobs,
             search,
@@ -211,6 +256,14 @@ impl MainView {
 }
 
 impl MainView {
+    fn focus_active_content(&self, window: &mut Window, cx: &App) {
+        if self.app_state.read(cx).trash_active {
+            self.trash.read(cx).focus_handle.focus(window);
+        } else {
+            self.list.read(cx).focus_handle.focus(window);
+        }
+    }
+
     fn any_blocking_modal_open(&self, cx: &App) -> bool {
         self.dialogs.read(cx).current_dialog != DialogKind::None
             || self.remote_dialogs.read(cx).is_open(cx)
@@ -510,6 +563,14 @@ impl MainView {
             cx.notify();
         });
     }
+
+    fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, cx| {
+            state.set_view_mode(mode);
+            cx.notify();
+        });
+        cx.notify();
+    }
 }
 
 impl Render for MainView {
@@ -521,9 +582,11 @@ impl Render for MainView {
 
         let (
             panels,
+            trash_active,
             entry_count,
             selected_count,
             selected_bytes,
+            view_metadata,
             status_msg,
             status_revision,
             status_is_completion,
@@ -531,11 +594,26 @@ impl Render for MainView {
             panel_preview_setting,
         ) = {
             let state = self.app_state.read(cx);
+            let (count, sel_count, sel_bytes) = if state.trash_active {
+                (state.trash_items.len(), state.trash_selection.len(), 0)
+            } else {
+                (
+                    state.entries.len(),
+                    state.selection.len(),
+                    state.selected_total_size(),
+                )
+            };
             (
                 state.panels.resolve(window_width),
-                state.entries.len(),
-                state.selection.len(),
-                state.selected_total_size(),
+                state.trash_active,
+                count,
+                sel_count,
+                sel_bytes,
+                if state.trash_active {
+                    String::new()
+                } else {
+                    format_status_selection_metadata(state)
+                },
                 state.status_message.clone(),
                 state.status_revision,
                 state.status_is_completion,
@@ -647,6 +725,15 @@ impl Render for MainView {
             .on_action(cx.listener(|this, _: &TogglePreview, _, cx| {
                 this.resize_panels(cx, PanelLayout::toggle_preview)
             }))
+            .on_action(cx.listener(|this, _: &SetViewDetails, _, cx| {
+                this.set_view_mode(ViewMode::Details, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &SetViewGrid, _, cx| this.set_view_mode(ViewMode::Grid, cx)),
+            )
+            .on_action(cx.listener(|this, _: &SetViewCompact, _, cx| {
+                this.set_view_mode(ViewMode::CompactList, cx)
+            }))
             // Top Header (Address Bar + Nav)
             .child(self.header.clone())
             // Network banner (if active)
@@ -685,7 +772,11 @@ impl Render for MainView {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(self.list.clone())
+                            .child(if trash_active {
+                                self.trash.clone().into_any_element()
+                            } else {
+                                self.list.clone().into_any_element()
+                            })
                             .child(self.jobs.clone()),
                     )
                     .when(display_preview > 1.0, |row| {
@@ -728,9 +819,22 @@ impl Render for MainView {
                     .child(
                         div()
                             .flex()
+                            .items_center()
+                            .min_w_0()
                             .gap_4()
                             .child(format!("{} items", entry_count))
-                            .child(format_selection_summary(selected_count, selected_bytes)),
+                            .child(if trash_active {
+                                if selected_count == 0 {
+                                    String::new()
+                                } else {
+                                    format!("{selected_count} selected")
+                                }
+                            } else {
+                                format_selection_summary(selected_count, selected_bytes)
+                            })
+                            .when(!trash_active && !view_metadata.is_empty(), |el| {
+                                el.child(div().ellipsize().child(view_metadata))
+                            }),
                     )
                     .child(
                         div()
@@ -761,6 +865,45 @@ pub fn format_selection_summary(count: usize, total_bytes: u64) -> String {
             "{count} selected ({})",
             format_size(Some(total_bytes), false)
         )
+    }
+}
+
+/// Formats selection/sort metadata shown in the status bar when Size and Modified columns
+/// are hidden (`CompactList` and `Grid`).
+pub fn format_status_selection_metadata(state: &AppState) -> String {
+    if state.view_mode == ViewMode::Details {
+        return String::new();
+    }
+    let selected = state.selected_entries();
+    if selected.len() == 1 {
+        let entry = selected[0];
+        let name = entry.display_name();
+        let size_or_kind = if entry.is_dir() {
+            "Folder".to_string()
+        } else {
+            format_size(entry.size, false)
+        };
+        return match entry.modified {
+            Some(modified) => format!(
+                "{name} · {size_or_kind} · {}",
+                format_modified(Some(modified))
+            ),
+            None => format!("{name} · {size_or_kind}"),
+        };
+    }
+    let col = match state.sort_column {
+        SortColumn::Name => "Name",
+        SortColumn::Size => "Size",
+        SortColumn::Date => "Modified",
+    };
+    let dir = match state.sort_direction {
+        SortDirection::Ascending => "▲",
+        SortDirection::Descending => "▼",
+    };
+    if state.show_hidden {
+        format!("Sort: {col} {dir} · Hidden")
+    } else {
+        format!("Sort: {col} {dir}")
     }
 }
 

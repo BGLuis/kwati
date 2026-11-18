@@ -1,12 +1,11 @@
 //! Shared motion chrome primitives: press-scale/hover buttons, toggle switches, checkboxes, and modal cards.
 
-use gpui::{
-    div, prelude::*, px, AnyElement, Bounds, Div, Hsla, Pixels, SharedString, Stateful, Styled,
-    Window,
-};
+use gpui::{div, prelude::*, px, AnyElement, Div, Hsla, Pixels, Stateful, Styled};
 
 use crate::components::icon::{animated_icon_sized, IconMotion, IconName};
-use crate::motion::{color_lerp, lerp_f32, Curve, DIALOG_RISE_PX, DIALOG_START_SCALE, PRESS_SCALE};
+use crate::motion::{
+    color_lerp, lerp_f32, Curve, DIALOG_RISE_PX, DIALOG_START_SCALE, MENU_START_SCALE, PRESS_SCALE,
+};
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, TextRole};
 
@@ -99,27 +98,35 @@ pub fn animated_toggle_switch(
         )
 }
 
+/// Resolves the checkmark icon motion for a checkbox at normalized progress `check_t`.
+#[inline]
+pub fn checkbox_check_motion(check_t: f32, reduced: bool) -> Option<IconMotion> {
+    let t = check_t.clamp(0.0, 1.0);
+    if t > 0.02 {
+        Some(if reduced {
+            IconMotion::Rest
+        } else {
+            IconMotion::Draw(t)
+        })
+    } else {
+        None
+    }
+}
+
 /// Renders an animated `16 px` checkbox row with smooth fill and checkmark stroke draw-in.
 pub fn animated_checkbox_row(
     id: impl Into<gpui::ElementId>,
     check_t: f32,
     label: &str,
     theme: &Theme,
+    reduced: bool,
 ) -> Stateful<Div> {
     let t = check_t.clamp(0.0, 1.0);
     let border_col = color_lerp(theme.border_strong, theme.accent, t);
     let box_bg = color_lerp(theme.surface_raised, theme.accent, t);
 
-    let check_child: Option<AnyElement> = if t > 0.02 {
-        Some(animated_icon_sized(
-            IconName::Check,
-            IconMotion::Draw(t),
-            size::ICON,
-            theme.on_accent,
-        ))
-    } else {
-        None
-    };
+    let check_child: Option<AnyElement> = checkbox_check_motion(t, reduced)
+        .map(|motion| animated_icon_sized(IconName::Check, motion, size::ICON, theme.on_accent));
 
     div()
         .id(id)
@@ -189,7 +196,7 @@ pub fn wrap_modal_card_entrance(
         )
 }
 
-/// Computes `(visible_scale, opacity)` for menu and tooltip entrance from `0.6`.
+/// Computes `(visible_scale, opacity)` for menu and tooltip entrance from [`MENU_START_SCALE`].
 #[inline]
 pub fn popup_entrance_metrics(t: f32, reduced: bool) -> (f32, f32) {
     let t = t.clamp(0.0, 1.0);
@@ -197,19 +204,7 @@ pub fn popup_entrance_metrics(t: f32, reduced: bool) -> (f32, f32) {
     let scale = if reduced {
         1.0
     } else {
-        lerp_f32(0.6, 1.0, Curve::Spring.sample(t)).max(0.5)
+        lerp_f32(MENU_START_SCALE, 1.0, Curve::Spring.sample(t)).max(0.5)
     };
     (scale, opacity)
 }
-
-/// Helper for stable hover/press IDs passed as static labels or strings.
-pub fn press_border_radius(base: Pixels, press_t: f32, reduced: bool) -> Pixels {
-    if reduced {
-        return base;
-    }
-    let _ = Bounds::<Pixels>::default;
-    base * lerp_f32(1.0, PRESS_SCALE, press_t.clamp(0.0, 1.0))
-}
-
-#[allow(dead_code)]
-fn _unused_shared_string(_s: SharedString, _w: &mut Window) {}

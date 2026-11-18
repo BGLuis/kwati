@@ -139,6 +139,7 @@ icons! {
     Search => "search",
     Settings => "settings",
     Trash => "trash",
+    ViewCompact => "view-compact",
     ViewGrid => "view-grid",
     ViewList => "view-list",
 }

@@ -11,7 +11,7 @@ use gpui::{
     MouseDownEvent, SharedString, Stateful, Window,
 };
 
-use kwati_core::{ConnectionState, Location};
+use kwati_core::{ConnectionState, Location, ViewMode};
 
 use crate::actions::navigation::TogglePreview;
 use crate::actions::{DisconnectRemote, OpenSettings, ReconnectRemote, RefreshListing};
@@ -35,6 +35,9 @@ enum HeaderControl {
     Refresh,
     Reconnect,
     Disconnect,
+    ViewDetails,
+    ViewGrid,
+    ViewCompact,
     Search,
     Preview,
     Settings,
@@ -123,6 +126,7 @@ pub struct HeaderView {
     // The address field is rewritten only when this changes, so a refresh of the same
     // directory does not erase a path being typed.
     shown_location: Location,
+    shown_trash_active: bool,
     hovered: HashSet<HeaderControl>,
     pressed: HashSet<HeaderControl>,
     last_remote_state: Option<RemoteBadgeState>,
@@ -132,22 +136,28 @@ pub struct HeaderView {
 
 impl HeaderView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let initial_path = app_state
-            .read(cx)
-            .current_location
-            .path()
-            .to_string_lossy()
-            .to_string();
+        let (initial_path, shown_location, shown_trash_active) = {
+            let state = app_state.read(cx);
+            let text = if state.trash_active {
+                "Trash".to_string()
+            } else {
+                state.current_location.path().to_string_lossy().to_string()
+            };
+            (text, state.current_location.clone(), state.trash_active)
+        };
         let address_input = cx.new(|cx| {
             let mut input = TextInput::with_placeholder("Type path and press Enter...", cx);
             input.set_text(initial_path, cx);
             input
         });
-        let shown_location = app_state.read(cx).current_location.clone();
         cx.observe(&app_state, |this, app_state, cx| {
-            let location = app_state.read(cx).current_location.clone();
-            if this.shown_location != location {
+            let (location, trash_active) = {
+                let state = app_state.read(cx);
+                (state.current_location.clone(), state.trash_active)
+            };
+            if this.shown_location != location || this.shown_trash_active != trash_active {
                 this.shown_location = location;
+                this.shown_trash_active = trash_active;
                 this.sync_address_input(cx);
             }
         })
@@ -156,6 +166,7 @@ impl HeaderView {
             app_state,
             address_input,
             shown_location,
+            shown_trash_active,
             hovered: HashSet::new(),
             pressed: HashSet::new(),
             last_remote_state: None,
@@ -173,13 +184,14 @@ impl HeaderView {
 
     /// Synchronizes the address input text with the state's current location path.
     pub fn sync_address_input(&mut self, cx: &mut Context<Self>) {
-        let path_str = self
-            .app_state
-            .read(cx)
-            .current_location
-            .path()
-            .to_string_lossy()
-            .to_string();
+        let path_str = {
+            let state = self.app_state.read(cx);
+            if state.trash_active {
+                "Trash".to_string()
+            } else {
+                state.current_location.path().to_string_lossy().to_string()
+            }
+        };
         self.address_input.update(cx, |input, cx| {
             input.set_text(path_str, cx);
         });
@@ -194,9 +206,16 @@ impl HeaderView {
             return;
         }
 
-        let remote_profile_id = match &self.app_state.read(cx).current_location {
-            Location::Remote { profile_id, .. } => Some(profile_id.clone()),
-            Location::Local(_) => None,
+        let remote_profile_id = {
+            let state = self.app_state.read(cx);
+            if state.trash_active {
+                None
+            } else {
+                match &state.current_location {
+                    Location::Remote { profile_id, .. } => Some(profile_id.clone()),
+                    Location::Local(_) => None,
+                }
+            }
         };
 
         if let Some(profile_id) = remote_profile_id {
@@ -334,6 +353,92 @@ impl HeaderView {
         }
     }
 
+    pub fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        self.app_state.update(cx, |state, cx| {
+            state.set_view_mode(mode);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn view_switcher_segment(
+        &self,
+        spec: (
+            &'static str,
+            HeaderControl,
+            ViewMode,
+            IconName,
+            &'static str,
+        ),
+        active: bool,
+        motion: (f32, f32),
+        reduced: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (id, ctrl, mode, icon_name, tooltip_label) = spec;
+        let (hover_t, press_t) = motion;
+        let bg = if active {
+            theme.selection.into()
+        } else {
+            hover_bg(transparent_black(), hover_t, theme)
+        };
+        let color = if active {
+            theme.text
+        } else {
+            color_lerp(theme.text_muted, theme.text, hover_t).into()
+        };
+        let scale = if reduced {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, press_t.clamp(0.0, 1.0))
+        };
+
+        div()
+            .id(id)
+            .debug_selector(move || format!("#{id}"))
+            .w(gpui::px(26.))
+            .h(gpui::px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .rounded(gpui::px(2.))
+            .bg(bg)
+            .cursor(CursorStyle::PointingHand)
+            .tooltip(Tooltip::text(tooltip_label))
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                this.set_hover(ctrl, *hovered, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.set_press(ctrl, true, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.set_press(ctrl, false, cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.set_press(ctrl, false, cx);
+                }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_view_mode(mode, cx);
+            }))
+            .child(animated_icon_sized(
+                icon_name,
+                IconMotion::Rest,
+                size::ICON * scale,
+                color,
+            ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn icon_button(
         &self,
@@ -431,24 +536,31 @@ impl Render for HeaderView {
             can_go_forward,
             preview_open,
             settings_open,
+            view_mode,
             remote_info,
             show_network_badge,
             can_go_up,
             reduced,
         ) = {
             let state = self.app_state.read(cx);
-            let can_go_up = state
-                .current_location
-                .parent()
-                .map(|p| !p.path().as_os_str().is_empty())
-                .unwrap_or(false);
+            let can_go_up = !state.trash_active
+                && state
+                    .current_location
+                    .parent()
+                    .map(|p| !p.path().as_os_str().is_empty())
+                    .unwrap_or(false);
             (
-                state.history.can_go_back(),
-                state.history.can_go_forward(),
+                state.trash_active || state.history.can_go_back(),
+                !state.trash_active && state.history.can_go_forward(),
                 state.panels.preview_open,
                 state.settings_open,
-                remote_header_info(state),
-                is_network_mount_badge_visible(state),
+                state.view_mode,
+                if state.trash_active {
+                    None
+                } else {
+                    remote_header_info(state)
+                },
+                !state.trash_active && is_network_mount_badge_visible(state),
                 can_go_up,
                 is_reduced_motion(state.settings.motion_preference),
             )
@@ -497,6 +609,12 @@ impl Render for HeaderView {
             now,
             reduced,
         );
+        let (view_details_hover, view_details_press) =
+            self.control_factors(HeaderControl::ViewDetails, true, now, reduced);
+        let (view_grid_hover, view_grid_press) =
+            self.control_factors(HeaderControl::ViewGrid, true, now, reduced);
+        let (view_compact_hover, view_compact_press) =
+            self.control_factors(HeaderControl::ViewCompact, true, now, reduced);
         let (search_hover, search_press) =
             self.control_factors(HeaderControl::Search, true, now, reduced);
         let (preview_hover, preview_press) =
@@ -593,6 +711,61 @@ impl Render for HeaderView {
                     }),
                 )
             });
+
+        let view_switcher = div()
+            .id("header-view-switcher")
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_none()
+            .p(space::S2)
+            .gap(space::S2)
+            .rounded(radius::CONTROL)
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border_strong)
+            .child(self.view_switcher_segment(
+                (
+                    "view-mode-details",
+                    HeaderControl::ViewDetails,
+                    ViewMode::Details,
+                    IconName::ViewList,
+                    "Details view (Ctrl+1)",
+                ),
+                view_mode == ViewMode::Details,
+                (view_details_hover, view_details_press),
+                reduced,
+                &theme,
+                cx,
+            ))
+            .child(self.view_switcher_segment(
+                (
+                    "view-mode-grid",
+                    HeaderControl::ViewGrid,
+                    ViewMode::Grid,
+                    IconName::ViewGrid,
+                    "Grid view (Ctrl+2)",
+                ),
+                view_mode == ViewMode::Grid,
+                (view_grid_hover, view_grid_press),
+                reduced,
+                &theme,
+                cx,
+            ))
+            .child(self.view_switcher_segment(
+                (
+                    "view-mode-compact",
+                    HeaderControl::ViewCompact,
+                    ViewMode::CompactList,
+                    IconName::ViewCompact,
+                    "Compact list view (Ctrl+3)",
+                ),
+                view_mode == ViewMode::CompactList,
+                (view_compact_hover, view_compact_press),
+                reduced,
+                &theme,
+                cx,
+            ));
 
         let search_btn = self
             .icon_button(
@@ -887,6 +1060,7 @@ impl Render for HeaderView {
                     }))
                     .child(self.address_input.clone()),
             )
+            .child(view_switcher)
             .child(search_btn)
             .child(preview_btn)
             .child(settings_btn)
