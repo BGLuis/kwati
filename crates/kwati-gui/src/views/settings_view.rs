@@ -1,17 +1,21 @@
 //! Grouped, data-driven Settings modal view (#29, #34, #50, #52).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Subscription,
-    Window,
+    div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, KeyDownEvent, MouseButton,
+    PathPromptOptions, Subscription, Task, Window,
 };
-use kwati_core::{MotionPreference, Settings, SortColumn, SortDirection, ViewMode};
+use kwati_core::{
+    list_installed_themes, IconGroup, IconSource, MotionPreference, Settings, SortColumn,
+    SortDirection, ViewMode, ICON_TYPE_SPECS,
+};
 
 use crate::components::{
-    animated_icon, animated_toggle_switch, icon, modal_scrim_color, wrap_modal_card_entrance,
-    IconMotion, IconName, TextInput,
+    animated_icon, animated_toggle_switch, icon, modal_scrim_color, resolved_icon,
+    wrap_modal_card_entrance, IconMotion, IconName, TextInput,
 };
 use crate::motion::{
     is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker, INSTANT, QUICK,
@@ -25,6 +29,7 @@ use crate::tokens::{radius, size, space, Fonts, TextRole};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSectionId {
     General,
+    Icons,
     NetworkMounts,
     Remote,
 }
@@ -72,6 +77,7 @@ pub struct SettingRowSpec {
 
 pub const SETTINGS_SECTIONS: &[(SettingsSectionId, &str)] = &[
     (SettingsSectionId::General, "Geral"),
+    (SettingsSectionId::Icons, "Ícones"),
     (SettingsSectionId::NetworkMounts, "Montagens de rede"),
     (SettingsSectionId::Remote, "Remoto"),
 ];
@@ -207,12 +213,62 @@ enum SettingsMotionKey {
     Button(usize),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum IconFocusKey {
+    HeaderClose,
+    BaseBuiltIn,
+    BaseTheme(usize),
+    BaseThemeDir,
+    GroupInherit(usize),
+    GroupBuiltIn(usize),
+    GroupTheme(usize),
+    GroupImage(usize),
+    TypeInherit(usize),
+    TypeBuiltIn(usize),
+    TypeTheme(usize),
+    TypeImage(usize),
+    PresetSave,
+    PresetApply(usize),
+    PresetRename(usize),
+    PresetRenameConfirm(usize),
+    PresetRenameCancel(usize),
+    PresetDelete(usize),
+    ResetDefaults,
+    FooterClose,
+}
+
+#[derive(Debug, Clone)]
+enum IconPickerTarget {
+    Group(IconGroup),
+    Type(String),
+    ThemeDir,
+}
+
+const SAMPLE_PREVIEW_ICONS: &[(IconName, &str)] = &[
+    (IconName::Folder, "Pasta"),
+    (IconName::FolderDownloads, "Downloads"),
+    (IconName::FileImage, "Imagem"),
+    (IconName::FilePdf, "PDF"),
+    (IconName::FileCode, "Código"),
+    (IconName::FileArchive, "Arquivo"),
+    (IconName::FileAudio, "Áudio"),
+    (IconName::File, "Outro"),
+];
+
 pub struct SettingsView {
     pub app_state: Entity<AppState>,
     pub focus_handle: FocusHandle,
     inputs: HashMap<SettingKey, Entity<TextInput>>,
     last_input_texts: HashMap<SettingKey, String>,
     errors: HashMap<SettingKey, String>,
+    icon_error: Option<String>,
+    installed_themes: Vec<String>,
+    preset_name_input: Entity<TextInput>,
+    preset_rename_input: Entity<TextInput>,
+    renaming_preset: Option<String>,
+    focus_handles: HashMap<IconFocusKey, FocusHandle>,
+    focus_order: Vec<FocusHandle>,
+    picker_task: Option<Task<()>>,
     motion: MotionTracker<SettingsMotionKey>,
     last_open: bool,
     is_syncing: bool,
@@ -250,11 +306,17 @@ impl SettingsView {
             subscriptions.push(sub);
         }
 
+        let preset_name_input = cx.new(|cx| TextInput::with_placeholder("Nome do preset", cx));
+        let preset_rename_input = cx.new(|cx| TextInput::with_placeholder("Novo nome", cx));
+
         let state_sub = cx.observe(&app_state, |this, app_state, cx| {
             let open = app_state.read(cx).settings_open;
             if open && !this.last_open {
                 let now = Instant::now();
                 this.errors.clear();
+                this.icon_error = None;
+                this.renaming_preset = None;
+                this.installed_themes = list_installed_themes();
                 this.sync_inputs_from_state(cx);
                 this.motion.set_immediate(
                     SettingsMotionKey::ModalOpen,
@@ -279,6 +341,14 @@ impl SettingsView {
             inputs,
             last_input_texts,
             errors: HashMap::new(),
+            icon_error: None,
+            installed_themes: list_installed_themes(),
+            preset_name_input,
+            preset_rename_input,
+            renaming_preset: None,
+            focus_handles: HashMap::new(),
+            focus_order: Vec::new(),
+            picker_task: None,
             motion: MotionTracker::new(),
             last_open,
             is_syncing: false,
@@ -293,6 +363,9 @@ impl SettingsView {
     pub fn open(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         self.errors.clear();
+        self.icon_error = None;
+        self.renaming_preset = None;
+        self.installed_themes = list_installed_themes();
         self.app_state.update(cx, |state, _| state.open_settings());
         self.sync_inputs_from_state(cx);
         self.motion.set_immediate(
@@ -312,6 +385,8 @@ impl SettingsView {
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.errors.clear();
+        self.icon_error = None;
+        self.renaming_preset = None;
         self.sync_inputs_from_state(cx);
         self.app_state.update(cx, |state, _| state.close_settings());
         self.last_open = false;
@@ -324,6 +399,42 @@ impl SettingsView {
 
     pub fn field_error(&self, key: SettingKey) -> Option<&str> {
         self.errors.get(&key).map(String::as_str)
+    }
+
+    pub fn icon_error(&self) -> Option<&str> {
+        self.icon_error.as_deref()
+    }
+
+    pub fn installed_themes(&self) -> &[String] {
+        &self.installed_themes
+    }
+
+    /// Overrides the detected system themes list (for platform-independent view tests).
+    pub fn set_installed_themes_for_test(&mut self, themes: Vec<String>, cx: &mut Context<Self>) {
+        self.installed_themes = themes;
+        cx.notify();
+    }
+
+    pub fn preset_name_input(&self) -> &Entity<TextInput> {
+        &self.preset_name_input
+    }
+
+    pub fn preset_rename_input(&self) -> &Entity<TextInput> {
+        &self.preset_rename_input
+    }
+
+    pub fn renaming_preset(&self) -> Option<&str> {
+        self.renaming_preset.as_deref()
+    }
+
+    pub fn focus_handles_count(&self) -> usize {
+        self.focus_order.len()
+    }
+
+    pub fn is_valid_icon_image_path(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png") || ext.eq_ignore_ascii_case("svg"))
     }
 
     pub fn input_entity(&self, key: SettingKey) -> Option<&Entity<TextInput>> {
@@ -526,8 +637,9 @@ impl SettingsView {
     }
 
     pub fn reset_to_defaults(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
-        let res = self.app_state.update(cx, |state, _| {
+        let res = self.app_state.update(cx, |state, cx| {
             state.reset_settings()?;
+            state.reset_icon_preferences()?;
             let defaults = state.settings.clone();
             state.set_show_hidden(defaults.show_hidden);
             state.set_sort(
@@ -535,20 +647,285 @@ impl SettingsView {
                 defaults.default_sort.direction,
             );
             state.set_view_mode(defaults.view_mode);
+            cx.notify();
             Ok(())
         });
         if res.is_ok() {
             self.errors.clear();
+            self.icon_error = None;
+            self.renaming_preset = None;
             self.sync_inputs_from_state(cx);
         }
         cx.notify();
         res
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.key == "escape" {
-            cx.stop_propagation();
-            self.close(cx);
+    pub fn set_icon_base(
+        &mut self,
+        source: IconSource,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let res = self.app_state.update(cx, |state, cx| {
+            state.set_icon_base(source)?;
+            cx.notify();
+            Ok(())
+        });
+        self.record_icon_result(&res);
+        cx.notify();
+        res
+    }
+
+    pub fn set_icon_group_override(
+        &mut self,
+        group: IconGroup,
+        source: Option<IconSource>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let res = self.app_state.update(cx, |state, cx| {
+            state.set_icon_group_override(group, source)?;
+            cx.notify();
+            Ok(())
+        });
+        self.record_icon_result(&res);
+        cx.notify();
+        res
+    }
+
+    pub fn set_icon_type_override(
+        &mut self,
+        type_key: &str,
+        source: Option<IconSource>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let res = self.app_state.update(cx, |state, cx| {
+            state.set_icon_type_override(type_key, source)?;
+            cx.notify();
+            Ok(())
+        });
+        self.record_icon_result(&res);
+        cx.notify();
+        res
+    }
+
+    pub fn save_icon_preset(&mut self, name: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let res = self.app_state.update(cx, |state, cx| {
+            state.save_icon_preset(name)?;
+            cx.notify();
+            Ok(())
+        });
+        self.record_icon_result(&res);
+        if res.is_ok() {
+            self.preset_name_input
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+        }
+        cx.notify();
+        res
+    }
+
+    pub fn apply_icon_preset(&mut self, name: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let res = self.app_state.update(cx, |state, cx| {
+            state.apply_icon_preset(name)?;
+            cx.notify();
+            Ok(())
+        });
+        self.record_icon_result(&res);
+        cx.notify();
+        res
+    }
+
+    pub fn rename_icon_preset(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let res = self.app_state.update(cx, |state, cx| {
+            state.rename_icon_preset(old_name, new_name)?;
+            cx.notify();
+            Ok(())
+        });
+        self.record_icon_result(&res);
+        if res.is_ok() {
+            self.renaming_preset = None;
+        }
+        cx.notify();
+        res
+    }
+
+    pub fn delete_icon_preset(
+        &mut self,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        let res: Result<bool, String> = self.app_state.update(cx, |state, cx| {
+            let deleted = state.delete_icon_preset(name)?;
+            cx.notify();
+            Ok(deleted)
+        });
+        match &res {
+            Ok(_) => {
+                self.icon_error = None;
+                if self.renaming_preset.as_deref() == Some(name) {
+                    self.renaming_preset = None;
+                }
+            }
+            Err(err) => self.icon_error = Some(err.clone()),
+        }
+        cx.notify();
+        res
+    }
+
+    fn begin_rename_preset(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.renaming_preset = Some(name.to_string());
+        let text = name.to_string();
+        self.preset_rename_input.update(cx, |input, cx| {
+            input.set_text(text, cx);
+        });
+        self.preset_rename_input.read(cx).focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn commit_rename_preset(&mut self, cx: &mut Context<Self>) {
+        let Some(old_name) = self.renaming_preset.clone() else {
+            return;
+        };
+        let new_name = self.preset_rename_input.read(cx).text().to_string();
+        let _ = self.rename_icon_preset(&old_name, &new_name, cx);
+    }
+
+    fn cancel_rename_preset(&mut self, cx: &mut Context<Self>) {
+        self.renaming_preset = None;
+        self.icon_error = None;
+        cx.notify();
+    }
+
+    fn record_icon_result(&mut self, res: &Result<(), String>) {
+        match res {
+            Ok(()) => self.icon_error = None,
+            Err(err) => self.icon_error = Some(err.clone()),
+        }
+    }
+
+    fn next_theme_choice(&self, current: Option<&IconSource>, base: &IconSource) -> Option<String> {
+        if self.installed_themes.is_empty() {
+            return None;
+        }
+        if let Some(IconSource::Theme(cur)) = current {
+            if let Some(idx) = self.installed_themes.iter().position(|t| t == cur) {
+                let next = (idx + 1) % self.installed_themes.len();
+                return Some(self.installed_themes[next].clone());
+            }
+        }
+        if let IconSource::Theme(base_theme) = base {
+            if self.installed_themes.iter().any(|t| t == base_theme) {
+                return Some(base_theme.clone());
+            }
+        }
+        Some(self.installed_themes[0].clone())
+    }
+
+    fn open_icon_picker(&mut self, target: IconPickerTarget, cx: &mut Context<Self>) {
+        let options = match target {
+            IconPickerTarget::ThemeDir => PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some("Selecionar pasta do tema de ícones".into()),
+            },
+            IconPickerTarget::Group(_) | IconPickerTarget::Type(_) => PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Selecionar ícone (PNG ou SVG)".into()),
+            },
+        };
+        let rx = cx.prompt_for_paths(options);
+        self.picker_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(chosen) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| match target {
+                IconPickerTarget::ThemeDir => {
+                    if chosen.join("index.theme").is_file() {
+                        let _ = view.set_icon_base(
+                            IconSource::Theme(chosen.to_string_lossy().into_owned()),
+                            cx,
+                        );
+                    } else {
+                        view.icon_error =
+                            Some("A pasta selecionada não contém index.theme.".into());
+                        cx.notify();
+                    }
+                }
+                IconPickerTarget::Group(group) => {
+                    if Self::is_valid_icon_image_path(&chosen) {
+                        let _ = view.set_icon_group_override(
+                            group,
+                            Some(IconSource::Image(chosen)),
+                            cx,
+                        );
+                    } else {
+                        view.icon_error = Some("Selecione uma imagem PNG ou SVG.".into());
+                        cx.notify();
+                    }
+                }
+                IconPickerTarget::Type(key) => {
+                    if Self::is_valid_icon_image_path(&chosen) {
+                        let _ =
+                            view.set_icon_type_override(&key, Some(IconSource::Image(chosen)), cx);
+                    } else {
+                        view.icon_error = Some("Selecione uma imagem PNG ou SVG.".into());
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    fn ensure_focus_handle(&mut self, key: IconFocusKey, cx: &mut Context<Self>) -> FocusHandle {
+        self.focus_handles
+            .entry(key)
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    fn register_focus(&mut self, handle: &FocusHandle) {
+        self.focus_order.push(handle.clone());
+    }
+
+    fn cycle_focus(&self, reverse: bool, window: &mut Window) {
+        if self.focus_order.is_empty() {
+            return;
+        }
+        let current = self.focus_order.iter().position(|h| h.is_focused(window));
+        let next = match (current, reverse) {
+            (Some(idx), false) => (idx + 1) % self.focus_order.len(),
+            (Some(idx), true) => (idx + self.focus_order.len() - 1) % self.focus_order.len(),
+            (None, false) => 0,
+            (None, true) => self.focus_order.len() - 1,
+        };
+        self.focus_order[next].focus(window);
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "tab" => {
+                cx.stop_propagation();
+                self.cycle_focus(event.keystroke.modifiers.shift, window);
+                cx.notify();
+            }
+            "escape" => {
+                cx.stop_propagation();
+                if self.renaming_preset.is_some() {
+                    self.cancel_rename_preset(cx);
+                } else {
+                    self.close(cx);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -833,6 +1210,714 @@ impl SettingsView {
                 el.child(div().text_label().text_color(theme.danger).child(msg))
             })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_action_pill(
+        &mut self,
+        id: impl Into<gpui::ElementId>,
+        focus_key: IconFocusKey,
+        label: impl Into<gpui::SharedString>,
+        active: bool,
+        primary: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+        on_activate: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let theme = Theme::get(cx);
+        let handle = self.ensure_focus_handle(focus_key, cx);
+        self.register_focus(&handle);
+        let focused = handle.is_focused(window);
+
+        let bg = if primary {
+            theme.accent
+        } else if active {
+            theme.selection
+        } else {
+            theme.surface_raised
+        };
+        let fg = if primary {
+            theme.on_accent
+        } else if active {
+            theme.text
+        } else {
+            theme.text_muted
+        };
+        let border = if focused || active {
+            theme.accent
+        } else {
+            theme.border
+        };
+
+        let handler = std::rc::Rc::new(on_activate);
+        let handler_key = handler.clone();
+
+        div()
+            .id(id)
+            .track_focus(&handle)
+            .px(space::S8)
+            .py(space::S2)
+            .rounded(radius::CONTROL)
+            .border_1()
+            .border_color(border)
+            .bg(bg)
+            .text_label()
+            .text_color(fg)
+            .cursor_pointer()
+            .hover(|s| s.border_color(theme.accent))
+            .child(label.into())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    handler(this, window, cx);
+                }),
+            )
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                if matches!(ev.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    handler_key(this, window, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    fn render_icons_section(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx);
+        let (prefs, presets, resolver) = {
+            let state = self.app_state.read(cx);
+            (
+                state.icon_config.active.clone(),
+                state.icon_config.presets.clone(),
+                state.icon_resolver.clone(),
+            )
+        };
+        let installed_themes = self.installed_themes.clone();
+        let has_themes = !installed_themes.is_empty();
+
+        // 1. Base source row
+        let mut base_buttons = vec![self.render_action_pill(
+            "icon-base-builtin",
+            IconFocusKey::BaseBuiltIn,
+            "Integrado",
+            prefs.base == IconSource::BuiltIn,
+            false,
+            window,
+            cx,
+            |this, _, cx| {
+                let _ = this.set_icon_base(IconSource::BuiltIn, cx);
+            },
+        )];
+        for (ix, theme_name) in installed_themes.iter().enumerate() {
+            let t_name = theme_name.clone();
+            let selected = matches!(&prefs.base, IconSource::Theme(cur) if cur == theme_name);
+            base_buttons.push(self.render_action_pill(
+                ("icon-base-theme", ix),
+                IconFocusKey::BaseTheme(ix),
+                theme_name.clone(),
+                selected,
+                false,
+                window,
+                cx,
+                move |this, _, cx| {
+                    let _ = this.set_icon_base(IconSource::Theme(t_name.clone()), cx);
+                },
+            ));
+        }
+        let custom_theme_active = matches!(
+            &prefs.base,
+            IconSource::Theme(cur) if !installed_themes.iter().any(|t| t == cur)
+        );
+        base_buttons.push(self.render_action_pill(
+            "icon-base-theme-dir",
+            IconFocusKey::BaseThemeDir,
+            "Pasta de tema…",
+            custom_theme_active,
+            false,
+            window,
+            cx,
+            |this, _, cx| {
+                this.open_icon_picker(IconPickerTarget::ThemeDir, cx);
+            },
+        ));
+
+        let base_row = div()
+            .flex()
+            .flex_col()
+            .gap(space::S8)
+            .py(space::S8)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(space::S8)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(space::S2)
+                            .child(div().text_body().text_color(theme.text).child("Origem base"))
+                            .child(
+                                div()
+                                    .text_label()
+                                    .text_color(theme.text_muted)
+                                    .child(if has_themes {
+                                        format!("Atual: {}", source_summary(Some(&prefs.base)))
+                                    } else {
+                                        "Nenhum tema do sistema encontrado; use Integrado, Pasta de tema… ou imagens.".to_string()
+                                    }),
+                            ),
+                    ),
+            )
+            .child(div().flex().flex_wrap().gap(space::S4).children(base_buttons));
+
+        // 2. Live preview row
+        let preview_items = SAMPLE_PREVIEW_ICONS.iter().map(|&(builtin, label)| {
+            let color = if builtin.is_folder() {
+                theme.accent
+            } else {
+                theme.text
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(space::S4)
+                .px(space::S8)
+                .py(space::S4)
+                .rounded(radius::CONTROL)
+                .bg(theme.surface)
+                .border_1()
+                .border_color(theme.border)
+                .child(resolved_icon(
+                    builtin,
+                    IconMotion::Rest,
+                    size::ICON,
+                    color,
+                    &prefs,
+                    &resolver,
+                ))
+                .child(div().text_label().text_color(theme.text_muted).child(label))
+        });
+
+        let preview_row = div()
+            .flex()
+            .flex_col()
+            .gap(space::S4)
+            .py(space::S8)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_label()
+                    .text_color(theme.text_muted)
+                    .child("Pré-visualização"),
+            )
+            .child(
+                div()
+                    .p(space::S8)
+                    .rounded(radius::CONTROL)
+                    .bg(theme.surface_raised)
+                    .flex()
+                    .flex_wrap()
+                    .gap(space::S8)
+                    .children(preview_items),
+            );
+
+        // 3. Group overrides list
+        let mut group_rows = Vec::with_capacity(IconGroup::ALL.len());
+        for (ix, &group) in IconGroup::ALL.iter().enumerate() {
+            let override_src = prefs.groups.get(&group);
+            let rep = representative_icon_for_group(group);
+            let color = if rep.is_folder() {
+                theme.accent
+            } else {
+                theme.text
+            };
+            let mut controls = vec![
+                self.render_action_pill(
+                    ("icon-grp-inherit", ix),
+                    IconFocusKey::GroupInherit(ix),
+                    "Herdar",
+                    override_src.is_none(),
+                    false,
+                    window,
+                    cx,
+                    move |this, _, cx| {
+                        let _ = this.set_icon_group_override(group, None, cx);
+                    },
+                ),
+                self.render_action_pill(
+                    ("icon-grp-builtin", ix),
+                    IconFocusKey::GroupBuiltIn(ix),
+                    "Integrado",
+                    matches!(override_src, Some(IconSource::BuiltIn)),
+                    false,
+                    window,
+                    cx,
+                    move |this, _, cx| {
+                        let _ = this.set_icon_group_override(group, Some(IconSource::BuiltIn), cx);
+                    },
+                ),
+            ];
+            if has_themes {
+                let next_theme = self.next_theme_choice(override_src, &prefs.base);
+                controls.push(self.render_action_pill(
+                    ("icon-grp-theme", ix),
+                    IconFocusKey::GroupTheme(ix),
+                    "Tema",
+                    matches!(override_src, Some(IconSource::Theme(_))),
+                    false,
+                    window,
+                    cx,
+                    move |this, _, cx| {
+                        if let Some(name) = next_theme.clone() {
+                            let _ = this.set_icon_group_override(
+                                group,
+                                Some(IconSource::Theme(name)),
+                                cx,
+                            );
+                        }
+                    },
+                ));
+            }
+            controls.push(self.render_action_pill(
+                ("icon-grp-image", ix),
+                IconFocusKey::GroupImage(ix),
+                "Imagem…",
+                matches!(override_src, Some(IconSource::Image(_))),
+                false,
+                window,
+                cx,
+                move |this, _, cx| {
+                    this.open_icon_picker(IconPickerTarget::Group(group), cx);
+                },
+            ));
+
+            group_rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(space::S8)
+                    .py(space::S4)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(space::S8)
+                            .flex_1()
+                            .min_w_0()
+                            .child(resolved_icon(
+                                rep,
+                                IconMotion::Rest,
+                                size::ICON,
+                                color,
+                                &prefs,
+                                &resolver,
+                            ))
+                            .child(
+                                div()
+                                    .text_body()
+                                    .text_color(theme.text)
+                                    .child(group.label()),
+                            )
+                            .child(
+                                div()
+                                    .text_label()
+                                    .text_color(theme.text_muted)
+                                    .child(source_summary(override_src)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(space::S4)
+                            .children(controls),
+                    ),
+            );
+        }
+
+        let groups_block = div()
+            .flex()
+            .flex_col()
+            .gap(space::S4)
+            .py(space::S8)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_label()
+                    .text_color(theme.text_muted)
+                    .child("Substituições por grupo"),
+            )
+            .children(group_rows);
+
+        // 4. Per-type overrides list
+        let mut type_rows = Vec::with_capacity(ICON_TYPE_SPECS.len());
+        for (ix, spec) in ICON_TYPE_SPECS.iter().enumerate() {
+            let builtin = IconName::from_key_name(spec.key).unwrap_or(IconName::File);
+            let color = if builtin.is_folder() {
+                theme.accent
+            } else {
+                theme.text
+            };
+            let override_src = prefs.types.get(spec.key);
+            let type_key = spec.key;
+
+            let mut controls = vec![
+                self.render_action_pill(
+                    ("icon-type-inherit", ix),
+                    IconFocusKey::TypeInherit(ix),
+                    "Herdar",
+                    override_src.is_none(),
+                    false,
+                    window,
+                    cx,
+                    move |this, _, cx| {
+                        let _ = this.set_icon_type_override(type_key, None, cx);
+                    },
+                ),
+                self.render_action_pill(
+                    ("icon-type-builtin", ix),
+                    IconFocusKey::TypeBuiltIn(ix),
+                    "Integrado",
+                    matches!(override_src, Some(IconSource::BuiltIn)),
+                    false,
+                    window,
+                    cx,
+                    move |this, _, cx| {
+                        let _ =
+                            this.set_icon_type_override(type_key, Some(IconSource::BuiltIn), cx);
+                    },
+                ),
+            ];
+            if has_themes {
+                let next_theme = self.next_theme_choice(override_src, &prefs.base);
+                controls.push(self.render_action_pill(
+                    ("icon-type-theme", ix),
+                    IconFocusKey::TypeTheme(ix),
+                    "Tema",
+                    matches!(override_src, Some(IconSource::Theme(_))),
+                    false,
+                    window,
+                    cx,
+                    move |this, _, cx| {
+                        if let Some(name) = next_theme.clone() {
+                            let _ = this.set_icon_type_override(
+                                type_key,
+                                Some(IconSource::Theme(name)),
+                                cx,
+                            );
+                        }
+                    },
+                ));
+            }
+            controls.push(self.render_action_pill(
+                ("icon-type-image", ix),
+                IconFocusKey::TypeImage(ix),
+                "Imagem…",
+                matches!(override_src, Some(IconSource::Image(_))),
+                false,
+                window,
+                cx,
+                move |this, _, cx| {
+                    this.open_icon_picker(IconPickerTarget::Type(type_key.to_string()), cx);
+                },
+            ));
+
+            type_rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(space::S8)
+                    .py(space::S2)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(space::S8)
+                            .flex_1()
+                            .min_w_0()
+                            .child(resolved_icon(
+                                builtin,
+                                IconMotion::Rest,
+                                size::ICON,
+                                color,
+                                &prefs,
+                                &resolver,
+                            ))
+                            .child(div().text_body().text_color(theme.text).child(spec.label))
+                            .child(
+                                div()
+                                    .px(space::S4)
+                                    .py(px(1.))
+                                    .rounded(radius::CONTROL)
+                                    .bg(theme.surface_raised)
+                                    .text_label()
+                                    .text_color(theme.text_muted)
+                                    .child(spec.group.label()),
+                            )
+                            .child(
+                                div()
+                                    .text_label()
+                                    .text_color(theme.text_muted)
+                                    .child(source_summary(override_src)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(space::S4)
+                            .children(controls),
+                    ),
+            );
+        }
+
+        let types_block = div()
+            .flex()
+            .flex_col()
+            .gap(space::S4)
+            .py(space::S8)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_label()
+                    .text_color(theme.text_muted)
+                    .child("Substituições por tipo"),
+            )
+            .children(type_rows);
+
+        // 5. Presets block
+        let preset_input_handle = self.preset_name_input.read(cx).focus_handle.clone();
+        self.register_focus(&preset_input_handle);
+        let save_btn = self.render_action_pill(
+            "icon-preset-save",
+            IconFocusKey::PresetSave,
+            "Salvar preset",
+            false,
+            true,
+            window,
+            cx,
+            |this, _, cx| {
+                let name = this.preset_name_input.read(cx).text().to_string();
+                let _ = this.save_icon_preset(&name, cx);
+            },
+        );
+
+        let mut preset_rows = Vec::new();
+        let renaming = self.renaming_preset.clone();
+        for (ix, name) in presets.keys().enumerate() {
+            let preset_name = name.clone();
+            if renaming.as_deref() == Some(name.as_str()) {
+                let rename_handle = self.preset_rename_input.read(cx).focus_handle.clone();
+                self.register_focus(&rename_handle);
+                let confirm_btn = self.render_action_pill(
+                    ("icon-preset-rename-confirm", ix),
+                    IconFocusKey::PresetRenameConfirm(ix),
+                    "Confirmar",
+                    false,
+                    true,
+                    window,
+                    cx,
+                    |this, _, cx| {
+                        this.commit_rename_preset(cx);
+                    },
+                );
+                let cancel_btn = self.render_action_pill(
+                    ("icon-preset-rename-cancel", ix),
+                    IconFocusKey::PresetRenameCancel(ix),
+                    "Cancelar",
+                    false,
+                    false,
+                    window,
+                    cx,
+                    |this, _, cx| {
+                        this.cancel_rename_preset(cx);
+                    },
+                );
+                preset_rows.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(space::S8)
+                        .py(space::S4)
+                        .child(
+                            div()
+                                .flex_1()
+                                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                                    if ev.keystroke.key == "enter" {
+                                        cx.stop_propagation();
+                                        this.commit_rename_preset(cx);
+                                    } else if ev.keystroke.key == "escape" {
+                                        cx.stop_propagation();
+                                        this.cancel_rename_preset(cx);
+                                    }
+                                }))
+                                .child(self.preset_rename_input.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(space::S4)
+                                .child(confirm_btn)
+                                .child(cancel_btn),
+                        )
+                        .into_any_element(),
+                );
+            } else {
+                let apply_name = preset_name.clone();
+                let rename_name = preset_name.clone();
+                let delete_name = preset_name.clone();
+                let apply_btn = self.render_action_pill(
+                    ("icon-preset-apply", ix),
+                    IconFocusKey::PresetApply(ix),
+                    "Aplicar",
+                    false,
+                    false,
+                    window,
+                    cx,
+                    move |this, _, cx| {
+                        let _ = this.apply_icon_preset(&apply_name, cx);
+                    },
+                );
+                let rename_btn = self.render_action_pill(
+                    ("icon-preset-rename", ix),
+                    IconFocusKey::PresetRename(ix),
+                    "Renomear",
+                    false,
+                    false,
+                    window,
+                    cx,
+                    move |this, window, cx| {
+                        this.begin_rename_preset(&rename_name, window, cx);
+                    },
+                );
+                let delete_btn = self.render_action_pill(
+                    ("icon-preset-delete", ix),
+                    IconFocusKey::PresetDelete(ix),
+                    "Excluir",
+                    false,
+                    false,
+                    window,
+                    cx,
+                    move |this, _, cx| {
+                        let _ = this.delete_icon_preset(&delete_name, cx);
+                    },
+                );
+                preset_rows.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(space::S8)
+                        .py(space::S4)
+                        .child(div().text_body().text_color(theme.text).child(preset_name))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(space::S4)
+                                .child(apply_btn)
+                                .child(rename_btn)
+                                .child(delete_btn),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let presets_block = div()
+            .flex()
+            .flex_col()
+            .gap(space::S8)
+            .py(space::S8)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_label()
+                    .text_color(theme.text_muted)
+                    .child("Presets salvos"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(space::S8)
+                    .child(
+                        div()
+                            .flex_1()
+                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                                if ev.keystroke.key == "enter" {
+                                    cx.stop_propagation();
+                                    let name = this.preset_name_input.read(cx).text().to_string();
+                                    let _ = this.save_icon_preset(&name, cx);
+                                }
+                            }))
+                            .child(self.preset_name_input.clone()),
+                    )
+                    .child(save_btn),
+            )
+            .when(preset_rows.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_label()
+                        .text_color(theme.text_muted)
+                        .child("Nenhum preset salvo."),
+                )
+            })
+            .children(preset_rows);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(space::S4)
+            .child(base_row)
+            .child(preview_row)
+            .child(groups_block)
+            .child(types_block)
+            .child(presets_block)
+            .when_some(self.icon_error.clone(), |el, msg| {
+                el.child(div().text_label().text_color(theme.danger).child(msg))
+            })
+            .into_any_element()
+    }
+}
+
+fn representative_icon_for_group(group: IconGroup) -> IconName {
+    match group {
+        IconGroup::Folders => IconName::Folder,
+        IconGroup::SpecialFolders => IconName::FolderDownloads,
+        IconGroup::Images => IconName::FileImage,
+        IconGroup::Documents => IconName::FilePdf,
+        IconGroup::Code => IconName::FileCode,
+        IconGroup::Archives => IconName::FileArchive,
+        IconGroup::AudioVideo => IconName::FileAudio,
+        IconGroup::Other => IconName::File,
+    }
+}
+
+fn source_summary(source: Option<&IconSource>) -> String {
+    match source {
+        None => "Herdando".to_string(),
+        Some(IconSource::BuiltIn) => "Integrado".to_string(),
+        Some(IconSource::Theme(name)) => format!("Tema: {name}"),
+        Some(IconSource::Image(path)) => {
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            format!("Imagem: {file_name}")
+        }
+    }
 }
 
 impl Render for SettingsView {
@@ -860,13 +1945,32 @@ impl Render for SettingsView {
             .pulse_progress(&SettingsMotionKey::HeaderSettingsIcon, now, reduced)
             .map_or(IconMotion::Rest, IconMotion::Pulse);
 
+        self.focus_order.clear();
+        let header_close_handle = self.ensure_focus_handle(IconFocusKey::HeaderClose, cx);
+        self.register_focus(&header_close_handle);
+        let header_close_focused = header_close_handle.is_focused(window);
+
         let sections = SETTINGS_SECTIONS
             .iter()
             .map(|&(section_id, title)| {
+                if section_id == SettingsSectionId::Icons {
+                    let icons_body = self.render_icons_section(window, cx);
+                    return div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::S4)
+                        .child(div().text_label().text_color(theme.accent).child(title))
+                        .child(icons_body);
+                }
                 let rows: Vec<&SettingRowSpec> = SETTINGS_ROWS
                     .iter()
                     .filter(|r| r.section == section_id)
                     .collect();
+                for spec in &rows {
+                    if let Some(input) = self.inputs.get(&spec.key) {
+                        self.register_focus(&input.read(cx).focus_handle);
+                    }
+                }
                 let rendered_rows: Vec<_> = rows
                     .into_iter()
                     .map(|spec| self.render_row(spec, now, reduced, cx))
@@ -880,10 +1984,18 @@ impl Render for SettingsView {
             })
             .collect::<Vec<_>>();
 
+        let reset_handle = self.ensure_focus_handle(IconFocusKey::ResetDefaults, cx);
+        self.register_focus(&reset_handle);
+        let reset_focused = reset_handle.is_focused(window);
+
+        let footer_close_handle = self.ensure_focus_handle(IconFocusKey::FooterClose, cx);
+        self.register_focus(&footer_close_handle);
+        let footer_close_focused = footer_close_handle.is_focused(window);
+
         let card = div()
             .id("settings-modal-card")
-            .w(px(580.))
-            .max_h(px(640.))
+            .w(px(660.))
+            .max_h(px(660.))
             .rounded(radius::DIALOG)
             .bg(theme.surface)
             .border_1()
@@ -917,15 +2029,28 @@ impl Render for SettingsView {
                     .child(
                         div()
                             .id("settings-header-close")
+                            .track_focus(&header_close_handle)
                             .p(space::S4)
                             .rounded(radius::CONTROL)
+                            .border_1()
+                            .border_color(if header_close_focused {
+                                theme.accent
+                            } else {
+                                gpui::transparent_black().into()
+                            })
                             .cursor_pointer()
                             .hover(|s| s.bg(theme.surface_raised))
                             .child(icon(IconName::Close).text_color(theme.text_muted))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.close(cx)),
-                            ),
+                            )
+                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                                if matches!(ev.keystroke.key.as_str(), "enter" | "space") {
+                                    cx.stop_propagation();
+                                    this.close(cx);
+                                }
+                            })),
                     ),
             )
             // Grouped sections
@@ -954,11 +2079,16 @@ impl Render for SettingsView {
                     .child(
                         div()
                             .id("settings-reset")
+                            .track_focus(&reset_handle)
                             .h(size::CONTROL)
                             .px(space::S12)
                             .rounded(radius::CONTROL)
                             .border_1()
-                            .border_color(theme.border)
+                            .border_color(if reset_focused {
+                                theme.accent
+                            } else {
+                                theme.border
+                            })
                             .bg(theme.surface_raised)
                             .flex()
                             .items_center()
@@ -972,14 +2102,27 @@ impl Render for SettingsView {
                                 cx.listener(|this, _, _, cx| {
                                     let _ = this.reset_to_defaults(cx);
                                 }),
-                            ),
+                            )
+                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                                if matches!(ev.keystroke.key.as_str(), "enter" | "space") {
+                                    cx.stop_propagation();
+                                    let _ = this.reset_to_defaults(cx);
+                                }
+                            })),
                     )
                     .child(
                         div()
                             .id("settings-close")
+                            .track_focus(&footer_close_handle)
                             .h(size::CONTROL)
                             .px(space::S12)
                             .rounded(radius::CONTROL)
+                            .border_1()
+                            .border_color(if footer_close_focused {
+                                theme.text
+                            } else {
+                                theme.accent
+                            })
                             .bg(theme.accent)
                             .flex()
                             .items_center()
@@ -990,7 +2133,13 @@ impl Render for SettingsView {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.close(cx)),
-                            ),
+                            )
+                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                                if matches!(ev.keystroke.key.as_str(), "enter" | "space") {
+                                    cx.stop_propagation();
+                                    this.close(cx);
+                                }
+                            })),
                     ),
             )
             .into_any_element();
@@ -1008,7 +2157,7 @@ impl Render for SettingsView {
             .occlude()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(wrap_modal_card_entrance(card, px(580.), open_t, reduced))
+            .child(wrap_modal_card_entrance(card, px(660.), open_t, reduced))
             .into_any_element()
     }
 }

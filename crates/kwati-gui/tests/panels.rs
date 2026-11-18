@@ -233,3 +233,72 @@ fn alt_p_hides_and_shows_the_preview(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("alt-p");
     assert!(panels(&main, cx).preview_open);
 }
+
+#[test]
+fn standard_places_give_special_folders_their_own_icons() {
+    use kwati_gui::components::{icon_for_with, IconName, SpecialFolders};
+    use kwati_gui::views::sidebar_view::standard_places;
+
+    let expected = [
+        ("Home", IconName::FolderHome),
+        ("Desktop", IconName::FolderDesktop),
+        ("Documents", IconName::FolderDocuments),
+        ("Downloads", IconName::FolderDownloads),
+        ("Pictures", IconName::FolderPictures),
+        ("Music", IconName::FolderMusic),
+        ("Videos", IconName::FolderVideos),
+    ];
+
+    let places = standard_places();
+    for (name, expected_icon) in expected {
+        if let Some(place) = places.iter().find(|p| p.name == name) {
+            assert_eq!(
+                place.icon, expected_icon,
+                "standard place {name} should use {expected_icon:?}"
+            );
+        }
+    }
+
+    // Also verify the special-folder icon resolution directly for all standard user dirs
+    // regardless of which XDG user dirs exist on the test host.
+    let base = PathBuf::from("/home/kwati-test-user");
+    let specials = SpecialFolders {
+        home: Some(base.clone()),
+        desktop: Some(base.join("Desktop")),
+        documents: Some(base.join("Documents")),
+        downloads: Some(base.join("Downloads")),
+        pictures: Some(base.join("Pictures")),
+        music: Some(base.join("Music")),
+        videos: Some(base.join("Videos")),
+        public: Some(base.join("Public")),
+    };
+    assert_eq!(icon_for_with(&base, true, &specials), IconName::FolderHome);
+    assert_eq!(
+        icon_for_with(&base.join("Desktop"), true, &specials),
+        IconName::FolderDesktop
+    );
+    assert_eq!(
+        icon_for_with(&base.join("Documents"), true, &specials),
+        IconName::FolderDocuments
+    );
+    assert_eq!(
+        icon_for_with(&base.join("Downloads"), true, &specials),
+        IconName::FolderDownloads
+    );
+    assert_eq!(
+        icon_for_with(&base.join("Pictures"), true, &specials),
+        IconName::FolderPictures
+    );
+    assert_eq!(
+        icon_for_with(&base.join("Music"), true, &specials),
+        IconName::FolderMusic
+    );
+    assert_eq!(
+        icon_for_with(&base.join("Videos"), true, &specials),
+        IconName::FolderVideos
+    );
+    assert_eq!(
+        icon_for_with(&base.join("Public"), true, &specials),
+        IconName::FolderPublic
+    );
+}

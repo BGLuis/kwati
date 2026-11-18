@@ -9,10 +9,11 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{AsyncApp, Context, Task, WeakEntity};
 use kwati_core::{
-    list_trash, settings_path, sort_entries_by, volume_kind, Backend, BackendError, Bookmark,
-    ConnectionProfile, ConnectionState, DirWatcher, Entry, History, HostKeyUnknown, ListOptions,
-    LocalBackend, Location, ReconnectingBackend, Selection, Settings, SettingsWarning, SortColumn,
-    SortDirection, SortOrder, TrashItem, ViewMode, VolumeKind,
+    default_icons_path, list_trash, settings_path, sort_entries_by, volume_kind, Backend,
+    BackendError, Bookmark, ConnectionProfile, ConnectionState, DirWatcher, Entry, History,
+    HostKeyUnknown, IconConfig, IconGroup, IconResolver, IconSource, ListOptions, LocalBackend,
+    Location, ReconnectingBackend, Selection, Settings, SettingsWarning, SortColumn, SortDirection,
+    SortOrder, TrashItem, ViewMode, VolumeKind,
 };
 
 use crate::layout::PanelLayout;
@@ -259,6 +260,8 @@ pub struct AppState {
     pub settings: Settings,
     pub settings_open: bool,
     pub settings_warnings: Vec<SettingsWarning>,
+    pub icon_config: IconConfig,
+    pub icon_resolver: Arc<IconResolver>,
     pub active_jobs: Vec<JobStatus>, // Owned by guiops-worker
     pub completed_jobs: Vec<CompletedJob>,
     pub undo_stack: UndoStack,              // Owned by guiops-worker
@@ -287,6 +290,7 @@ pub struct AppState {
     pub panels: PanelLayout,
     pub dir_watcher: Option<DirWatcher>,
     settings_path: Option<PathBuf>,
+    icons_path: Option<PathBuf>,
     foreground: Option<Foreground>,
     pending_navigation: Option<(Location, Arrival)>,
     reconnect_target: Option<Location>,
@@ -322,6 +326,8 @@ impl AppState {
             settings,
             settings_open: false,
             settings_warnings: Vec::new(),
+            icon_config: IconConfig::default(),
+            icon_resolver: Arc::new(IconResolver::new()),
             active_jobs: Vec::new(),
             completed_jobs: Vec::new(),
             undo_stack: UndoStack::new(),
@@ -348,6 +354,7 @@ impl AppState {
             panels: PanelLayout::default(),
             dir_watcher: None,
             settings_path: None,
+            icons_path: None,
             foreground: None,
             pending_navigation: None,
             reconnect_target: None,
@@ -371,6 +378,18 @@ impl AppState {
                 Err(err) => {
                     state.status_message = Some(format!("Cannot load settings: {err}"));
                 }
+            }
+        }
+        if let Some(path) = default_icons_path() {
+            state.icons_path = Some(path.clone());
+            match IconConfig::load_from(&path) {
+                Ok(icon_config) => {
+                    state.icon_config = icon_config;
+                }
+                Err(err) if state.status_message.is_none() => {
+                    state.status_message = Some(format!("Cannot load icon preferences: {err}"));
+                }
+                Err(_) => {}
             }
         }
         let (remote, problem) = RemoteSessions::load_native();
@@ -451,6 +470,115 @@ impl AppState {
         self.view_mode = self.settings.view_mode;
         self.settings_warnings.clear();
         Ok(())
+    }
+
+    /// Associates an `icons.toml` file path without touching disk (for tests).
+    pub fn with_icons_path(mut self, path: Option<PathBuf>) -> Self {
+        self.icons_path = path;
+        self
+    }
+
+    /// Associates a custom [`IconResolver`] (for tests with temporary icon theme directories).
+    pub fn with_icon_resolver(mut self, resolver: Arc<IconResolver>) -> Self {
+        self.icon_resolver = resolver;
+        self
+    }
+
+    /// Returns the configured `icons.toml` persistence path, if any.
+    pub fn icons_path(&self) -> Option<&Path> {
+        self.icons_path.as_deref()
+    }
+
+    /// Updates `icons_path` (`None` disables writing `icons.toml` to disk).
+    pub fn set_icons_path(&mut self, path: Option<PathBuf>) {
+        self.icons_path = path;
+    }
+
+    /// Loads icon preferences and presets from `path` and sets it as the persistence target.
+    pub fn load_icons_from(&mut self, path: &Path) -> Result<(), String> {
+        let config = IconConfig::load_from(path)
+            .map_err(|err| format!("Cannot load icon preferences: {err}"))?;
+        self.icon_config = config;
+        self.icons_path = Some(path.to_path_buf());
+        self.icon_resolver.clear_cache();
+        Ok(())
+    }
+
+    /// Applies `f` to a copy of `icon_config`, persists if `icons_path` is set, and commits.
+    pub fn update_icon_config(
+        &mut self,
+        f: impl FnOnce(&mut IconConfig) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut next = self.icon_config.clone();
+        f(&mut next)?;
+        if let Some(path) = &self.icons_path {
+            next.save_to(path)
+                .map_err(|err| format!("Cannot save icon preferences: {err}"))?;
+        }
+        self.icon_config = next;
+        self.icon_resolver.clear_cache();
+        Ok(())
+    }
+
+    pub fn set_icon_base(&mut self, source: IconSource) -> Result<(), String> {
+        self.update_icon_config(|cfg| {
+            cfg.active.base = source;
+            Ok(())
+        })
+    }
+
+    pub fn set_icon_group_override(
+        &mut self,
+        group: IconGroup,
+        source: Option<IconSource>,
+    ) -> Result<(), String> {
+        self.update_icon_config(|cfg| {
+            cfg.active.set_group_override(group, source);
+            Ok(())
+        })
+    }
+
+    pub fn set_icon_type_override(
+        &mut self,
+        type_key: &str,
+        source: Option<IconSource>,
+    ) -> Result<(), String> {
+        self.update_icon_config(|cfg| {
+            cfg.active.set_type_override(type_key, source);
+            Ok(())
+        })
+    }
+
+    pub fn save_icon_preset(&mut self, name: impl Into<String>) -> Result<(), String> {
+        self.update_icon_config(|cfg| cfg.save_preset(name))
+    }
+
+    pub fn apply_icon_preset(&mut self, name: &str) -> Result<(), String> {
+        self.update_icon_config(|cfg| cfg.apply_preset(name))
+    }
+
+    pub fn rename_icon_preset(
+        &mut self,
+        old_name: &str,
+        new_name: impl Into<String>,
+    ) -> Result<(), String> {
+        self.update_icon_config(|cfg| cfg.rename_preset(old_name, new_name))
+    }
+
+    pub fn delete_icon_preset(&mut self, name: &str) -> Result<bool, String> {
+        let mut deleted = false;
+        self.update_icon_config(|cfg| {
+            deleted = cfg.delete_preset(name);
+            Ok(())
+        })?;
+        Ok(deleted)
+    }
+
+    pub fn reset_icon_preferences(&mut self) -> Result<(), String> {
+        self.update_icon_config(|cfg| {
+            cfg.reset_active();
+            Ok(())
+        })
     }
 
     /// Returns the configured listing timeout for local/mounted directories.

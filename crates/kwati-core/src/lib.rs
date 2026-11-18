@@ -3,6 +3,7 @@ mod connection;
 mod copy;
 mod delete;
 mod ftp;
+pub mod icons;
 mod move_entry;
 pub mod places;
 mod profiles;
@@ -28,6 +29,11 @@ pub use copy::{
 };
 pub use delete::{delete_permanently, Confirmed};
 pub use ftp::{CertificateInvalid, FtpBackend, TlsUnavailable};
+pub use icons::{
+    default_icons_path, freedesktop_candidates, group_for_type_key, is_symbolic_icon_path,
+    list_installed_themes, normalize_type_key, IconConfig, IconGroup, IconPreferences,
+    IconResolver, IconSource, IconTypeSpec, ResolvedIcon, ICON_TYPE_SPECS,
+};
 pub use move_entry::{move_entry, move_entry_with};
 pub use places::{
     list_places, resolve_bookmarks, standard_places, standard_places_from, Bookmark, Place,

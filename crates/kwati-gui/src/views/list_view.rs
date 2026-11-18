@@ -12,7 +12,9 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, Stateful,
     UniformListScrollHandle, Window,
 };
-use kwati_core::{Entry, Location, SortColumn, SortDirection, ViewMode};
+use kwati_core::{
+    Entry, IconPreferences, IconResolver, Location, SortColumn, SortDirection, ViewMode,
+};
 
 use crate::actions::navigation::{
     ClearSelection, GoBack, GoForward, GoUp, OpenContextMenu, OpenSelected, PageDown, PageUp,
@@ -20,7 +22,9 @@ use crate::actions::navigation::{
 };
 use crate::actions::operations::get_location_clipboard;
 use crate::components::interactive::focus_ring_color;
-use crate::components::{animated_icon_sized, Ellipsize, IconMotion, IconName, ScrollbarState};
+use crate::components::{
+    icon_for_entry, resolved_icon, Ellipsize, IconMotion, IconName, ScrollbarState, SpecialFolders,
+};
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
     MotionTracker, DELETE_THROW, DELETE_THROW_PX, INSTANT, LIST_CASCADE_CAP, LIST_CASCADE_STEP,
@@ -123,6 +127,7 @@ enum ListMotionKey {
 #[derive(Clone, Debug)]
 struct ExitingRow {
     name: String,
+    icon: IconName,
     is_dir: bool,
     is_hidden: bool,
     size_str: String,
@@ -182,6 +187,7 @@ impl Focusable for ListView {
 
 impl ListView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
         let (initial_rev, initial_loc, initial_entries, initial_mode) = {
             let state = app_state.read(cx);
             let cur = state.current_location.clone();
@@ -1010,6 +1016,8 @@ impl ListView {
         is_selected: bool,
         is_focused_row: bool,
         is_cut: bool,
+        is_remote: bool,
+        specials: &SpecialFolders,
         scroll_top_entry: usize,
         now: Instant,
         reduced: bool,
@@ -1166,11 +1174,7 @@ impl ListView {
         } else {
             IconMotion::Rest
         };
-        let glyph = if is_dir {
-            IconName::Folder
-        } else {
-            IconName::File
-        };
+        let glyph = icon_for_entry(&entry.path, is_dir, is_remote, specials);
         let glyph_col: Hsla = if is_dir {
             theme.accent.into()
         } else if is_hidden && !is_selected {
@@ -1263,6 +1267,8 @@ impl ListView {
         vis: ItemVisuals,
         theme: &Theme,
         fonts: &Fonts,
+        icon_prefs: &IconPreferences,
+        icon_resolver: &IconResolver,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let is_dir = entry.is_dir();
@@ -1307,11 +1313,13 @@ impl ListView {
                     .flex()
                     .items_center()
                     .gap(space::S8)
-                    .child(animated_icon_sized(
+                    .child(resolved_icon(
                         vis.glyph,
                         vis.icon_motion,
                         size::ICON * vis.icon_scale,
                         vis.glyph_col,
+                        icon_prefs,
+                        icon_resolver,
                     ))
                     .child(div().ellipsize().child(name)),
             )
@@ -1342,6 +1350,8 @@ impl ListView {
         entry: &Entry,
         loc: &Location,
         vis: ItemVisuals,
+        icon_prefs: &IconPreferences,
+        icon_resolver: &IconResolver,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let name = entry.display_name();
@@ -1367,11 +1377,13 @@ impl ListView {
             .text_color(vis.text_col);
 
         Self::attach_entry_interactions(base, ix, loc.clone(), entry.clone(), cx)
-            .child(animated_icon_sized(
+            .child(resolved_icon(
                 vis.glyph,
                 vis.icon_motion,
                 size::ICON * vis.icon_scale,
                 vis.glyph_col,
+                icon_prefs,
+                icon_resolver,
             ))
             .child(div().flex_1().ellipsize().child(name))
             .into_any_element()
@@ -1384,6 +1396,8 @@ impl ListView {
         entry: &Entry,
         loc: &Location,
         vis: ItemVisuals,
+        icon_prefs: &IconPreferences,
+        icon_resolver: &IconResolver,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let name = entry.display_name();
@@ -1419,11 +1433,13 @@ impl ListView {
                     .items_center()
                     .justify_center()
                     .flex_none()
-                    .child(animated_icon_sized(
+                    .child(resolved_icon(
                         vis.glyph,
                         vis.icon_motion,
                         GRID_ICON_SIZE * vis.icon_scale,
                         vis.glyph_col,
+                        icon_prefs,
+                        icon_resolver,
                     )),
             )
             .child(
@@ -1531,6 +1547,8 @@ impl ListView {
             }
 
             if !del_set.is_empty() && view_mode != ViewMode::Grid {
+                let is_remote = matches!(state.current_location, Location::Remote { .. });
+                let specials = SpecialFolders::from_system();
                 self.exiting_scroll_top = scroll_top;
                 for (old_ix, (loc, entry)) in self.prev_entries.iter().enumerate() {
                     if del_set.contains(loc)
@@ -1540,6 +1558,7 @@ impl ListView {
                     {
                         self.exiting_rows.push(ExitingRow {
                             name: entry.display_name(),
+                            icon: icon_for_entry(&entry.path, entry.is_dir(), is_remote, &specials),
                             is_dir: entry.is_dir(),
                             is_hidden: entry.is_hidden,
                             size_str: format_size(entry.size, entry.is_dir()),
@@ -1659,6 +1678,8 @@ impl Render for ListView {
             show_hidden,
             reduced,
             focused_location,
+            icon_prefs,
+            icon_resolver,
         ) = {
             let state: &AppState = self.app_state.read(cx);
             let r = is_reduced_motion(state.settings.motion_preference);
@@ -1677,6 +1698,8 @@ impl Render for ListView {
                         .and_then(|ix| state.entries.get(ix))
                         .map(|e| entry_location(&state.current_location, e))
                 }),
+                state.icon_config.active.clone(),
+                state.icon_resolver.clone(),
             )
         };
         let entry_count = entries.len();
@@ -1754,7 +1777,9 @@ impl Render for ListView {
             ),
         ];
 
+        let is_remote = matches!(current, Location::Remote { .. });
         let entries_clone = entries;
+        let special_folders = SpecialFolders::from_system();
         let (row_text, row_muted, row_accent) = (theme.text, theme.text_muted, theme.accent);
         let row_fonts = fonts.clone();
 
@@ -1784,11 +1809,7 @@ impl Render for ListView {
                     let scroll_shift_px =
                         (self.exiting_scroll_top as isize - current_top as isize) as f32 * row_h_px;
                     let top_px = ex.top_px + scroll_shift_px;
-                    let glyph = if ex.is_dir {
-                        IconName::Folder
-                    } else {
-                        IconName::File
-                    };
+                    let glyph = ex.icon;
                     let glyph_col = if ex.is_dir {
                         row_accent
                     } else if ex.is_hidden {
@@ -1819,11 +1840,13 @@ impl Render for ListView {
                                 .flex()
                                 .items_center()
                                 .gap(space::S8)
-                                .child(animated_icon_sized(
+                                .child(resolved_icon(
                                     glyph,
                                     IconMotion::Rest,
                                     size::ICON,
                                     glyph_col,
+                                    &icon_prefs,
+                                    &icon_resolver,
                                 ))
                                 .child(div().ellipsize().child(ex.name.clone())),
                         )
@@ -2107,6 +2130,8 @@ impl Render for ListView {
                                                                 is_selected,
                                                                 is_focused_row,
                                                                 is_cut,
+                                                                is_remote,
+                                                                &special_folders,
                                                                 scroll_top_entry,
                                                                 now,
                                                                 reduced,
@@ -2122,13 +2147,21 @@ impl Render for ListView {
                                                                         vis,
                                                                         &theme_for_rows,
                                                                         &row_fonts,
+                                                                        &icon_prefs,
+                                                                        &icon_resolver,
                                                                         cx,
                                                                     ),
                                                                 );
                                                             } else {
                                                                 items.push(
                                                                     this.render_compact_row(
-                                                                        ix, entry, &loc, vis, cx,
+                                                                        ix,
+                                                                        entry,
+                                                                        &loc,
+                                                                        vis,
+                                                                        &icon_prefs,
+                                                                        &icon_resolver,
+                                                                        cx,
                                                                     ),
                                                                 );
                                                             }
@@ -2163,6 +2196,8 @@ impl Render for ListView {
                                                                         is_selected,
                                                                         is_focused_row,
                                                                         is_cut,
+                                                                        is_remote,
+                                                                        &special_folders,
                                                                         scroll_top_entry,
                                                                         now,
                                                                         reduced,
@@ -2170,7 +2205,13 @@ impl Render for ListView {
                                                                     );
                                                                 row_tiles.push(
                                                                     this.render_grid_tile(
-                                                                        ix, entry, &loc, vis, cx,
+                                                                        ix,
+                                                                        entry,
+                                                                        &loc,
+                                                                        vis,
+                                                                        &icon_prefs,
+                                                                        &icon_resolver,
+                                                                        cx,
                                                                     ),
                                                                 );
                                                             }

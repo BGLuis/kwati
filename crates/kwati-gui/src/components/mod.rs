@@ -1,4 +1,5 @@
 pub mod ellipsize;
+pub mod file_icons;
 pub mod icon;
 pub mod interactive;
 pub mod scrollbar;
@@ -6,7 +7,10 @@ pub mod text_input;
 pub mod tooltip;
 
 pub use ellipsize::Ellipsize;
-pub use icon::{animated_icon, animated_icon_sized, icon, Assets, IconMotion, IconName, IconPart};
+pub use file_icons::{icon_for, icon_for_entry, icon_for_with, SpecialFolders};
+pub use icon::{
+    animated_icon, animated_icon_sized, icon, resolved_icon, Assets, IconMotion, IconName, IconPart,
+};
 pub use interactive::{
     animated_checkbox_row, animated_toggle_switch, focus_ring_color, hover_bg, modal_scrim_color,
     popup_entrance_metrics, press_scaled_slot, wrap_modal_card_entrance,
