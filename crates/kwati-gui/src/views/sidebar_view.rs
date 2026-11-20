@@ -303,6 +303,7 @@ enum SidebarKey {
     Server(usize),
     Drive(usize),
     DriveEject(usize),
+    RefreshDrives,
     NetworkShare(usize),
 }
 
@@ -312,6 +313,7 @@ enum SidebarMotionKey {
     Press(SidebarKey),
     ServerDraw(usize),
     EjectHop(usize),
+    RefreshSpin,
 }
 
 pub struct SidebarView {
@@ -320,7 +322,8 @@ pub struct SidebarView {
     pub bookmarks: Vec<UserBookmark>,
     pub volumes: Vec<SidebarVolume>,
     pub network: Vec<NetworkMount>,
-    /// Drives show as plain rows unless the user asks for capacity cards with a right click.
+    /// Drives show as rows with their free space unless the user asks for capacity cards with
+    /// a right click.
     pub drive_details: bool,
     editing_bookmark: Option<usize>,
     rename_input: Entity<TextInput>,
@@ -330,6 +333,7 @@ pub struct SidebarView {
     motion: MotionTracker<SidebarMotionKey>,
     _state_sub: Subscription,
     _device_poll: Task<()>,
+    device_refresh: Option<Task<()>>,
 }
 
 impl SidebarView {
@@ -372,6 +376,7 @@ impl SidebarView {
             motion: MotionTracker::new(),
             _state_sub: state_sub,
             _device_poll: device_poll,
+            device_refresh: None,
         }
     }
 
@@ -391,6 +396,22 @@ impl SidebarView {
                 }
             }
         }
+    }
+
+    /// Lists drives and shares now instead of waiting for the next poll.
+    pub fn refresh_devices(&mut self, cx: &mut Context<Self>) {
+        self.refresh_devices_with(|| (device_volumes(), network_mounts()), cx);
+    }
+
+    pub fn refresh_devices_with(
+        &mut self,
+        list: impl FnOnce() -> (Vec<Volume>, Vec<NetworkMount>) + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.device_refresh = Some(cx.spawn(async move |this, cx| {
+            let (volumes, network) = cx.background_executor().spawn(async move { list() }).await;
+            let _ = this.update(cx, |this, cx| this.set_devices(volumes, network, cx));
+        }));
     }
 
     fn set_devices(
@@ -734,7 +755,7 @@ impl SidebarView {
         cx.notify();
     }
 
-    /// A drive as one row, like a place; its capacity waits in the tooltip.
+    /// A drive as a row like a place, with its free space on a second line.
     #[allow(clippy::too_many_arguments)]
     fn drive_row(
         &mut self,
@@ -790,9 +811,12 @@ impl SidebarView {
         };
         let eject_id = vol.id.clone();
 
+        let free_space = (vol.is_mounted && vol.total_bytes > 0).then(|| vol.capacity_summary());
+
         div()
             .id(("drive-row", ix))
-            .h(size::SIDEBAR_ROW)
+            .min_h(size::SIDEBAR_ROW)
+            .py(space::S2)
             .px(space::S8)
             .rounded(radius::CONTROL)
             .cursor_pointer()
@@ -828,7 +852,23 @@ impl SidebarView {
                             theme.text
                         },
                     ))
-                    .child(div().flex_1().ellipsize().child(vol.name)),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().ellipsize().child(vol.name))
+                            .when_some(free_space, |col, free| {
+                                col.child(
+                                    div()
+                                        .ellipsize()
+                                        .text_label()
+                                        .text_color(theme.text_muted)
+                                        .child(free),
+                                )
+                            }),
+                    ),
             )
             .when(vol.is_removable && vol.is_mounted, |el| {
                 el.child(
@@ -2011,6 +2051,18 @@ impl Render for SidebarView {
             })
             .collect();
 
+        let (refresh_drives_hover, refresh_drives_press) =
+            self.step_row_factors(SidebarKey::RefreshDrives, now, reduced);
+        let refresh_drives_scale = if reduced {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, refresh_drives_press)
+        };
+        let refresh_drives_motion = self
+            .motion
+            .pulse_progress(&SidebarMotionKey::RefreshSpin, now, reduced)
+            .map_or(IconMotion::Rest, IconMotion::Pulse);
+
         let network_rows: Vec<_> = network
             .iter()
             .enumerate()
@@ -2375,12 +2427,74 @@ impl Render for SidebarView {
                             div()
                                 .px(space::S8)
                                 .py(space::S4)
-                                .text_label()
-                                .text_color(theme.text_muted)
-                                .child("Drives")
+                                .flex()
+                                .items_center()
+                                .justify_between()
                                 .on_mouse_down(
                                     MouseButton::Right,
                                     cx.listener(Self::toggle_drive_details),
+                                )
+                                .child(
+                                    div()
+                                        .text_label()
+                                        .text_color(theme.text_muted)
+                                        .child("Drives"),
+                                )
+                                .child(
+                                    div()
+                                        .id("sidebar-refresh-drives")
+                                        .p(space::S2)
+                                        .rounded(radius::CONTROL)
+                                        .cursor_pointer()
+                                        .bg(color_lerp(
+                                            transparent_black(),
+                                            theme.border,
+                                            refresh_drives_hover,
+                                        ))
+                                        .tooltip(Tooltip::text("Refresh drives"))
+                                        .on_hover(cx.listener(|this, hovered, _, cx| {
+                                            this.set_hover(SidebarKey::RefreshDrives, *hovered, cx);
+                                        }))
+                                        .child(animated_icon_sized(
+                                            IconName::Refresh,
+                                            refresh_drives_motion,
+                                            size::ICON * refresh_drives_scale,
+                                            theme.text_muted,
+                                        ))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.set_press(SidebarKey::RefreshDrives, true, cx);
+                                                this.motion.trigger_pulse(
+                                                    SidebarMotionKey::RefreshSpin,
+                                                    QUICK,
+                                                    MotionKind::MovementOrScale,
+                                                    Instant::now(),
+                                                );
+                                                this.refresh_devices(cx);
+                                            }),
+                                        )
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_press(
+                                                    SidebarKey::RefreshDrives,
+                                                    false,
+                                                    cx,
+                                                );
+                                            }),
+                                        )
+                                        .on_mouse_up_out(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_press(
+                                                    SidebarKey::RefreshDrives,
+                                                    false,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
                                 ),
                         )
                         .children(drive_elements),
