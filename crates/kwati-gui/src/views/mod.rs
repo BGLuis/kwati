@@ -40,6 +40,7 @@ use crate::actions::operations::{
 use crate::actions::remote_sync::RemotePollerHost;
 use crate::actions::{
     DisconnectRemote, ManageServers, OpenSettings, ReconnectRemote, RefreshListing, TogglePreview,
+    ToggleSidebar,
 };
 use crate::components::Ellipsize;
 use crate::layout::{PanelLayout, PREVIEW_DEFAULT, SIDEBAR_DEFAULT};
@@ -472,6 +473,18 @@ impl MainView {
                 self.list.read(cx).focus_handle.focus(window);
             }
             ContextMenuAction::Rename => self.open_rename_for_selection(window, cx),
+            ContextMenuAction::Bookmark => {
+                if let [Location::Local(path)] = self.selected_locations(cx).as_slice() {
+                    let path = path.clone();
+                    let res = self
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.bookmark_folder(path, cx));
+                    if let Err(err) = res {
+                        self.set_status(err, cx);
+                    }
+                }
+                self.list.read(cx).focus_handle.focus(window);
+            }
             ContextMenuAction::Copy => {
                 self.copy_selection_to_clipboard(false, cx);
                 self.list.read(cx).focus_handle.focus(window);
@@ -592,6 +605,7 @@ impl Render for MainView {
             status_is_completion,
             reduced,
             panel_preview_setting,
+            shown_sidebar_width,
         ) = {
             let state = self.app_state.read(cx);
             let (count, sel_count, sel_bytes) = if state.trash_active {
@@ -619,6 +633,7 @@ impl Render for MainView {
                 state.status_is_completion,
                 is_reduced_motion(state.settings.motion_preference),
                 state.panels.preview,
+                state.panels.shown_sidebar(window_width).sidebar,
             )
         };
 
@@ -725,6 +740,12 @@ impl Render for MainView {
             .on_action(cx.listener(|this, _: &TogglePreview, _, cx| {
                 this.resize_panels(cx, PanelLayout::toggle_preview)
             }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.app_state.update(cx, |state, cx| {
+                    state.toggle_sidebar();
+                    cx.notify();
+                })
+            }))
             .on_action(cx.listener(|this, _: &SetViewDetails, _, cx| {
                 this.set_view_mode(ViewMode::Details, cx)
             }))
@@ -757,13 +778,20 @@ impl Render for MainView {
                             .w(px(display_sidebar.max(0.0)))
                             .h_full()
                             .overflow_hidden()
-                            .child(self.sidebar.clone())
-                            .child(resize_handle(
-                                "sidebar-edge",
-                                SidebarEdge,
-                                Edge::Right,
-                                &theme,
-                            )),
+                            .child(
+                                div()
+                                    .w(shown_sidebar_width)
+                                    .h_full()
+                                    .child(self.sidebar.clone()),
+                            )
+                            .when(panels.sidebar > px(0.), |pane| {
+                                pane.child(resize_handle(
+                                    "sidebar-edge",
+                                    SidebarEdge,
+                                    Edge::Right,
+                                    &theme,
+                                ))
+                            }),
                     )
                     .child(
                         div()

@@ -78,6 +78,7 @@ fn the_list_never_gets_less_than_its_minimum_while_both_panes_show() {
         sidebar: SidebarWidth::Expanded(px(360.)),
         preview: px(600.),
         preview_open: true,
+        sidebar_open: true,
     };
     for width in (540..=1600).step_by(7) {
         let width = px(width as f32);
@@ -218,6 +219,61 @@ fn dragging_the_preview_edge_to_the_window_edge_closes_it(cx: &mut TestAppContex
     let layout = panels(&main, cx);
     assert!(!layout.preview_open);
     assert_eq!(layout.preview, PREVIEW_DEFAULT);
+}
+
+#[test]
+fn a_hidden_sidebar_leaves_its_room_to_the_other_panes_and_returns_at_its_width() {
+    let mut layout = PanelLayout {
+        sidebar: SidebarWidth::Expanded(px(240.)),
+        ..PanelLayout::default()
+    };
+    layout.sidebar_open = false;
+    let hidden = layout.resolve(px(1400.));
+    assert_eq!(hidden.sidebar, px(0.));
+    assert_eq!(hidden.preview, Some(PREVIEW_DEFAULT));
+
+    // Without the sidebar, a window too narrow for both panes still fits the preview.
+    let narrow = LIST_MIN + PREVIEW_MIN;
+    assert_eq!(layout.resolve(narrow).preview, Some(PREVIEW_MIN));
+
+    layout.sidebar_open = true;
+    assert_eq!(layout.resolve(px(1400.)).sidebar, px(240.));
+}
+
+#[gpui::test]
+fn f9_hides_the_sidebar_and_the_choice_survives_a_restart(cx: &mut TestAppContext) {
+    cx.update(kwati_gui::actions::register_keybindings);
+    let dir = std::env::temp_dir().join(format!("kwati_test_sidebar_f9_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let settings_file = dir.join("settings.toml");
+    let path = settings_file.clone();
+    let location = Location::Local(dir.clone());
+    let (main, cx) = cx.add_window_view(|window, cx| {
+        let state =
+            cx.new(|_| AppState::new(location).with_settings_path(Some(settings_file.clone())));
+        MainView::new(state, window, cx)
+    });
+    cx.simulate_resize(size(px(1024.), px(720.)));
+    cx.run_until_parked();
+    main.update_in(cx, |main, window, cx| {
+        main.list.read(cx).focus_handle.focus(window)
+    });
+
+    cx.simulate_keystrokes("f9");
+    assert!(!panels(&main, cx).sidebar_open);
+
+    let mut restarted = AppState::new(Location::Local(dir.clone()));
+    restarted.load_settings_from(&path).unwrap();
+    assert!(!restarted.panels.sidebar_open);
+
+    cx.simulate_keystrokes("f9");
+    assert!(panels(&main, cx).sidebar_open);
+    let mut restarted = AppState::new(Location::Local(dir.clone()));
+    restarted.load_settings_from(&path).unwrap();
+    assert!(restarted.panels.sidebar_open);
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[gpui::test]

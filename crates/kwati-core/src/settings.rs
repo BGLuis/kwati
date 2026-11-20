@@ -9,6 +9,7 @@ use crate::{SortColumn, SortDirection, SortOrder};
 
 pub const CURRENT_VERSION: u32 = 1;
 pub const DEFAULT_SHOW_HIDDEN: bool = false;
+pub const DEFAULT_SHOW_SIDEBAR: bool = true;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 5;
 pub const MIN_REFRESH_INTERVAL_SECS: u32 = 1;
 pub const MAX_REFRESH_INTERVAL_SECS: u32 = 3600;
@@ -55,6 +56,7 @@ pub enum ViewMode {
 pub struct Settings {
     pub version: u32,
     pub show_hidden: bool,
+    pub show_sidebar: bool,
     pub default_sort: SortOrder,
     pub view_mode: ViewMode,
     pub refresh_interval_secs: u32,
@@ -77,6 +79,7 @@ impl Default for Settings {
         Self {
             version: CURRENT_VERSION,
             show_hidden: DEFAULT_SHOW_HIDDEN,
+            show_sidebar: DEFAULT_SHOW_SIDEBAR,
             default_sort: SortOrder::default(),
             view_mode: ViewMode::default(),
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
@@ -484,6 +487,12 @@ impl Settings {
             defaults.show_hidden,
             &mut warnings,
         );
+        let show_sidebar = take_bool_or_default(
+            &mut table,
+            "show_sidebar",
+            defaults.show_sidebar,
+            &mut warnings,
+        );
         let default_sort =
             take_default_sort_or_default(&mut table, defaults.default_sort, &mut warnings);
         let view_mode = take_view_mode_or_default(&mut table, defaults.view_mode, &mut warnings);
@@ -585,6 +594,7 @@ impl Settings {
         let settings = Self {
             version,
             show_hidden,
+            show_sidebar,
             default_sort,
             view_mode,
             refresh_interval_secs,
@@ -667,6 +677,7 @@ impl Settings {
         let mut table = self.unknown.clone();
         table.insert("version".into(), Value::Integer(self.version.into()));
         table.insert("show_hidden".into(), Value::Boolean(self.show_hidden));
+        table.insert("show_sidebar".into(), Value::Boolean(self.show_sidebar));
         let mut sort_table = Table::new();
         sort_table.insert(
             "column".into(),
@@ -915,6 +926,28 @@ mod tests {
             loaded.default_sort,
             SortOrder::new(SortColumn::Date, SortDirection::Descending)
         );
+    }
+
+    #[test]
+    fn hidden_sidebar_survives_a_restart_and_older_files_show_it() {
+        let dir = TestDir::new("settings_show_sidebar");
+        let path = dir.path.join("settings.toml");
+
+        fs::write(&path, "version = 1\n").unwrap();
+        let (mut settings, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert!(settings.show_sidebar);
+
+        settings.show_sidebar = false;
+        settings.save_to(&path).unwrap();
+        let (loaded, _) = Settings::load_from(&path).unwrap();
+        assert!(!loaded.show_sidebar);
+
+        fs::write(&path, "show_sidebar = \"no\"\n").unwrap();
+        let (loaded, warnings) = Settings::load_from(&path).unwrap();
+        assert!(loaded.show_sidebar);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].key, "show_sidebar");
     }
 
     #[test]

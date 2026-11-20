@@ -156,6 +156,8 @@ fn settings_view_reset_to_defaults_restores_all_and_persists(cx: &mut TestAppCon
     view.update(cx, |view, cx| {
         view.toggle_bool_setting(SettingKey::ShowHidden, cx)
             .unwrap();
+        view.toggle_bool_setting(SettingKey::ShowSidebar, cx)
+            .unwrap();
         view.set_sort_column(SortColumn::Date, cx).unwrap();
         view.set_numeric_input(SettingKey::ListTimeoutSecs, "30", cx)
             .unwrap();
@@ -175,6 +177,7 @@ fn settings_view_reset_to_defaults_restores_all_and_persists(cx: &mut TestAppCon
 
     state.read_with(cx, |state, _| {
         assert!(!state.show_hidden);
+        assert!(state.panels.sidebar_open);
         assert_eq!(state.sort_column, SortColumn::Name);
         assert_eq!(state.sort_direction, SortDirection::Ascending);
         assert_eq!(state.settings, Settings::default());
@@ -182,6 +185,27 @@ fn settings_view_reset_to_defaults_restores_all_and_persists(cx: &mut TestAppCon
 
     let (disk, _) = Settings::load_from(&settings_file).unwrap();
     assert_eq!(disk, Settings::default());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui::test]
+fn settings_show_sidebar_toggle_hides_it_and_persists(cx: &mut TestAppContext) {
+    let dir = temp_dir("settings_show_sidebar");
+    let settings_file = dir.join("settings.toml");
+    let state = cx.new(|_| {
+        AppState::new(Location::Local(dir.clone())).with_settings_path(Some(settings_file.clone()))
+    });
+    let view = cx.new(|cx| SettingsView::new(state.clone(), cx));
+
+    view.update(cx, |view, cx| {
+        view.toggle_bool_setting(SettingKey::ShowSidebar, cx)
+            .unwrap();
+    });
+
+    state.read_with(cx, |state, _| assert!(!state.panels.sidebar_open));
+    let (disk, _) = Settings::load_from(&settings_file).unwrap();
+    assert!(!disk.show_sidebar);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

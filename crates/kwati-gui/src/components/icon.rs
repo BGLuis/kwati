@@ -134,6 +134,7 @@ icons! {
     Home => "home",
     Image => "image",
     Network => "network",
+    PanelLeft => "panel-left",
     PanelRight => "panel-right",
     Plus => "plus",
     Refresh => "refresh",

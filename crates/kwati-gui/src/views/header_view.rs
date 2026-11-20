@@ -13,7 +13,7 @@ use gpui::{
 
 use kwati_core::{ConnectionState, Location, ViewMode};
 
-use crate::actions::navigation::TogglePreview;
+use crate::actions::navigation::{TogglePreview, ToggleSidebar};
 use crate::actions::{DisconnectRemote, OpenSettings, ReconnectRemote, RefreshListing};
 use crate::components::interactive::hover_bg;
 use crate::components::{animated_icon_sized, IconMotion, IconName, TextInput, Tooltip};
@@ -39,6 +39,7 @@ enum HeaderControl {
     ViewGrid,
     ViewCompact,
     Search,
+    Sidebar,
     Preview,
     Settings,
 }
@@ -534,6 +535,7 @@ impl Render for HeaderView {
         let (
             can_go_back,
             can_go_forward,
+            sidebar_open,
             preview_open,
             settings_open,
             view_mode,
@@ -552,6 +554,7 @@ impl Render for HeaderView {
             (
                 state.trash_active || state.history.can_go_back(),
                 !state.trash_active && state.history.can_go_forward(),
+                state.panels.sidebar_open,
                 state.panels.preview_open,
                 state.settings_open,
                 state.view_mode,
@@ -617,6 +620,8 @@ impl Render for HeaderView {
             self.control_factors(HeaderControl::ViewCompact, true, now, reduced);
         let (search_hover, search_press) =
             self.control_factors(HeaderControl::Search, true, now, reduced);
+        let (sidebar_hover, sidebar_press) =
+            self.control_factors(HeaderControl::Sidebar, true, now, reduced);
         let (preview_hover, preview_press) =
             self.control_factors(HeaderControl::Preview, true, now, reduced);
         let (settings_hover, settings_press) =
@@ -782,6 +787,26 @@ impl Render for HeaderView {
             )
             .tooltip(Tooltip::text("Buscar (Ctrl+F)"))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSearch), cx));
+
+        let sidebar_btn = self
+            .icon_button(
+                "toggle-sidebar",
+                HeaderControl::Sidebar,
+                IconName::PanelLeft,
+                true,
+                sidebar_open,
+                sidebar_hover,
+                sidebar_press,
+                reduced,
+                &theme,
+                cx,
+            )
+            .tooltip(Tooltip::text(if sidebar_open {
+                "Hide sidebar (F9)"
+            } else {
+                "Show sidebar (F9)"
+            }))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
 
         let preview_btn = self
             .icon_button(
@@ -1062,6 +1087,7 @@ impl Render for HeaderView {
             )
             .child(view_switcher)
             .child(search_btn)
+            .child(sidebar_btn)
             .child(preview_btn)
             .child(settings_btn)
     }
