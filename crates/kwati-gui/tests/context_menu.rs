@@ -210,6 +210,83 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     let _ = fs::remove_dir_all(&root);
 }
 
+fn row_of(main: &Entity<MainView>, cx: &mut VisualTestContext, name: &str) -> usize {
+    main.read_with(cx, |main, cx| {
+        main.app_state
+            .read(cx)
+            .entries
+            .iter()
+            .position(|e| e.name().to_string_lossy() == name)
+            .unwrap()
+    })
+}
+
+fn bookmark_item_enabled(main: &Entity<MainView>, cx: &mut VisualTestContext) -> Option<bool> {
+    main.read_with(cx, |main, cx| {
+        main.context_menu
+            .read(cx)
+            .entries()
+            .iter()
+            .find_map(|e| match e {
+                ContextMenuEntry::Item {
+                    action: ContextMenuAction::Bookmark,
+                    enabled,
+                    ..
+                } => Some(*enabled),
+                _ => None,
+            })
+    })
+}
+
+#[gpui::test]
+fn bookmark_folder_adds_it_to_the_sidebar_and_it_survives_a_restart(cx: &mut TestAppContext) {
+    let root = fixture("bookmark");
+    let _clipboard = clipboard();
+    let settings_file = root.join("settings.toml");
+    let (main, cx) = open_window(cx, &root);
+    main.update(cx, |main, cx| {
+        main.app_state.update(cx, |state, _| {
+            state.set_settings_path(Some(settings_file.clone()))
+        })
+    });
+
+    // Files cannot be bookmarked.
+    let ix = row_of(&main, cx, "alpha.txt");
+    let file = row_center(&main, cx, ix);
+    right_click(cx, file);
+    assert_eq!(bookmark_item_enabled(&main, cx), None);
+    cx.simulate_keystrokes("escape");
+
+    let ix = row_of(&main, cx, "sub");
+    let folder = row_center(&main, cx, ix);
+    right_click(cx, folder);
+    assert_eq!(bookmark_item_enabled(&main, cx), Some(true));
+    // Open, Rename, Bookmark Folder.
+    cx.simulate_keystrokes("down down enter");
+    cx.run_until_parked();
+
+    let sub = root.join("sub");
+    let sidebar_paths = main.read_with(cx, |main, cx| {
+        main.sidebar
+            .read(cx)
+            .bookmarks
+            .iter()
+            .map(|b| (b.name.clone(), b.path.clone()))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(sidebar_paths, [("sub".to_string(), sub.clone())]);
+
+    let (disk, _) = kwati_core::Settings::load_from(&settings_file).unwrap();
+    assert_eq!(disk.bookmarks.len(), 1);
+    assert_eq!(disk.bookmarks[0].path, sub);
+
+    // The same folder is offered again only as a disabled item.
+    right_click(cx, folder);
+    assert_eq!(bookmark_item_enabled(&main, cx), Some(false));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[gpui::test]
 fn shift_f10_and_escape_toggle_context_menu_and_keyboard_runs_action(cx: &mut TestAppContext) {
     let root = fixture("keyboard");

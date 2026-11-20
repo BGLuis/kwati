@@ -473,6 +473,18 @@ impl MainView {
                 self.list.read(cx).focus_handle.focus(window);
             }
             ContextMenuAction::Rename => self.open_rename_for_selection(window, cx),
+            ContextMenuAction::Bookmark => {
+                if let [Location::Local(path)] = self.selected_locations(cx).as_slice() {
+                    let path = path.clone();
+                    let res = self
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.bookmark_folder(path, cx));
+                    if let Err(err) = res {
+                        self.set_status(err, cx);
+                    }
+                }
+                self.list.read(cx).focus_handle.focus(window);
+            }
             ContextMenuAction::Copy => {
                 self.copy_selection_to_clipboard(false, cx);
                 self.list.read(cx).focus_handle.focus(window);

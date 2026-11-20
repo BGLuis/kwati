@@ -493,6 +493,11 @@ impl SidebarView {
         let Location::Local(path) = current else {
             return Err("Apenas pastas locais podem ser fixadas nos favoritos.".into());
         };
+        self.bookmark_folder(path, cx)
+    }
+
+    /// Adds `path` to the bookmarks under its folder name, unless it is already there.
+    pub fn bookmark_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) -> Result<(), String> {
         if self.bookmarks.iter().any(|b| b.path == path) {
             return Ok(());
         }

@@ -23,6 +23,7 @@ use crate::tokens::{radius, size, space, Fonts, TextRole};
 pub enum ContextMenuAction {
     Open,
     Rename,
+    Bookmark,
     Copy,
     Cut,
     Paste,
@@ -52,9 +53,12 @@ pub enum ContextMenuEvent {
 }
 
 /// Builds the context menu entries applicable to the current selection and clipboard state.
+/// `folder_bookmarked` is `Some` when the selection is a single local folder, telling whether
+/// the sidebar already lists it.
 pub fn build_context_menu_entries(
     selected: &[Location],
     has_clipboard: bool,
+    folder_bookmarked: Option<bool>,
 ) -> Vec<ContextMenuEntry> {
     if selected.is_empty() {
         return vec![
@@ -93,7 +97,7 @@ pub fn build_context_menu_entries(
     };
 
     if selected.len() == 1 {
-        vec![
+        let mut entries = vec![
             ContextMenuEntry::Item {
                 action: ContextMenuAction::Open,
                 label: "Open",
@@ -108,6 +112,17 @@ pub fn build_context_menu_entries(
                 enabled: true,
                 destructive: false,
             },
+        ];
+        if let Some(bookmarked) = folder_bookmarked {
+            entries.push(ContextMenuEntry::Item {
+                action: ContextMenuAction::Bookmark,
+                label: "Bookmark Folder",
+                shortcut: None,
+                enabled: !bookmarked,
+                destructive: false,
+            });
+        }
+        entries.extend([
             ContextMenuEntry::Separator,
             ContextMenuEntry::Item {
                 action: ContextMenuAction::Copy,
@@ -138,7 +153,8 @@ pub fn build_context_menu_entries(
                 enabled: true,
                 destructive: true,
             },
-        ]
+        ]);
+        entries
     } else {
         vec![
             ContextMenuEntry::Item {
@@ -222,9 +238,16 @@ impl ContextMenuView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let selected = self.app_state.read(cx).selected_locations();
+        let state = self.app_state.read(cx);
+        let selected = state.selected_locations();
+        let folder_bookmarked = match (state.selected_entries().as_slice(), selected.as_slice()) {
+            ([entry], [Location::Local(path)]) if entry.is_dir() => {
+                Some(state.settings.bookmarks.iter().any(|b| &b.path == path))
+            }
+            _ => None,
+        };
         let has_clipboard = get_location_clipboard().is_some();
-        self.entries = build_context_menu_entries(&selected, has_clipboard);
+        self.entries = build_context_menu_entries(&selected, has_clipboard, folder_bookmarked);
         self.position = position;
         self.focused_index = self.first_enabled_index();
         self.hovered_index = None;
@@ -329,7 +352,10 @@ fn menu_action_icon(action: ContextMenuAction) -> Option<IconName> {
         ContextMenuAction::Remove => Some(IconName::Trash),
         ContextMenuAction::NewFolder => Some(IconName::Folder),
         ContextMenuAction::Refresh => Some(IconName::Refresh),
-        ContextMenuAction::Rename | ContextMenuAction::Cut | ContextMenuAction::Paste => None,
+        ContextMenuAction::Rename
+        | ContextMenuAction::Bookmark
+        | ContextMenuAction::Cut
+        | ContextMenuAction::Paste => None,
     }
 }
 
