@@ -36,12 +36,17 @@ pub struct PanelLayout {
     pub preview: Pixels,
     /// Closing the preview keeps its width for when it opens again.
     pub preview_open: bool,
+    /// Hiding the sidebar keeps its width for when it shows again.
+    pub sidebar_open: bool,
 }
 
 /// Pane widths that fit a given window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedLayout {
+    /// Zero while the sidebar is hidden.
     pub sidebar: Pixels,
+    /// While the sidebar is hidden, whether it would show as icons, so it keeps that look
+    /// while it slides shut.
     pub sidebar_compact: bool,
     /// `None` when the preview is closed or the window is too narrow to show it beside the
     /// list.
@@ -54,6 +59,7 @@ impl Default for PanelLayout {
             sidebar: SidebarWidth::Expanded(SIDEBAR_DEFAULT),
             preview: PREVIEW_DEFAULT,
             preview_open: true,
+            sidebar_open: true,
         }
     }
 }
@@ -64,6 +70,14 @@ impl PanelLayout {
     pub fn resolve(&self, window_width: Pixels) -> ResolvedLayout {
         let room = window_width - LIST_MIN;
         let preview = self.preview;
+
+        if !self.sidebar_open {
+            return ResolvedLayout {
+                sidebar: px(0.),
+                sidebar_compact: self.shown_sidebar(window_width).sidebar_compact,
+                preview: (self.preview_open && PREVIEW_MIN <= room).then(|| preview.min(room)),
+            };
+        }
 
         if !self.preview_open {
             return match self.sidebar {
@@ -131,6 +145,15 @@ impl PanelLayout {
 
     pub fn toggle_preview(&mut self) {
         self.preview_open = !self.preview_open;
+    }
+
+    /// The layout the window would have with the sidebar showing.
+    pub fn shown_sidebar(&self, window_width: Pixels) -> ResolvedLayout {
+        PanelLayout {
+            sidebar_open: true,
+            ..*self
+        }
+        .resolve(window_width)
     }
 
     /// Sets the preview from the pointer's distance to the right edge of the window, closing

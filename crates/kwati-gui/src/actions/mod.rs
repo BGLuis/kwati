@@ -41,6 +41,7 @@ pub fn register_keybindings(cx: &mut App) {
         KeyBinding::new("menu", navigation::OpenContextMenu, Some("ListView")),
         KeyBinding::new("f5", navigation::Refresh, None),
         KeyBinding::new("alt-p", navigation::TogglePreview, None),
+        KeyBinding::new("f9", navigation::ToggleSidebar, None),
         // View modes
         KeyBinding::new("ctrl-1", navigation::SetViewDetails, None),
         KeyBinding::new("cmd-1", navigation::SetViewDetails, None),
