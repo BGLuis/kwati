@@ -171,3 +171,94 @@ pub fn list_places(settings: &Settings) -> SidebarPlaces {
         bookmarks: resolve_bookmarks(settings),
     }
 }
+
+/// An entry in the unified sidebar Places list (folders, bookmarks, and Trash).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceEntry {
+    Folder { name: String, path: PathBuf },
+    Trash,
+}
+
+impl PlaceEntry {
+    pub fn folder(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self::Folder {
+            name: name.into(),
+            path: path.into(),
+        }
+    }
+
+    pub fn is_trash(&self) -> bool {
+        matches!(self, Self::Trash)
+    }
+
+    pub fn is_removable(&self) -> bool {
+        !self.is_trash()
+    }
+
+    pub fn is_missing(&self) -> bool {
+        match self {
+            Self::Folder { path, .. } => !path.exists(),
+            Self::Trash => false,
+        }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Folder { path, .. } => Some(path.as_path()),
+            Self::Trash => None,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Folder { name, .. } => name.as_str(),
+            Self::Trash => "Trash",
+        }
+    }
+}
+
+/// Ensures exactly one [`PlaceEntry::Trash`] exists in `entries` (appending one if absent and
+/// dropping duplicates after the first).
+pub fn ensure_trash_present(entries: &mut Vec<PlaceEntry>) {
+    let mut seen_trash = false;
+    entries.retain(|e| {
+        if e.is_trash() {
+            if seen_trash {
+                false
+            } else {
+                seen_trash = true;
+                true
+            }
+        } else {
+            true
+        }
+    });
+    if !seen_trash {
+        entries.push(PlaceEntry::Trash);
+    }
+}
+
+/// Builds the default unified Places list from OS standard places, any legacy bookmarks not
+/// already present, and [`PlaceEntry::Trash`].
+pub fn default_place_entries(legacy_bookmarks: &[Bookmark]) -> Vec<PlaceEntry> {
+    let mut entries: Vec<PlaceEntry> = standard_places()
+        .into_iter()
+        .map(|p| PlaceEntry::Folder {
+            name: p.name,
+            path: p.path,
+        })
+        .collect();
+    if entries.is_empty() {
+        entries.push(PlaceEntry::folder("Root", PathBuf::from("/")));
+    }
+    for bm in legacy_bookmarks {
+        if !entries
+            .iter()
+            .any(|e| e.path().is_some_and(|p| p == bm.path))
+        {
+            entries.push(PlaceEntry::folder(&bm.name, &bm.path));
+        }
+    }
+    entries.push(PlaceEntry::Trash);
+    entries
+}

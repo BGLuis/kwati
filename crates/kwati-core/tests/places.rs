@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kwati_core::{
-    list_places, resolve_bookmarks, standard_places, standard_places_from, Bookmark, PlaceKind,
-    Settings,
+    list_places, resolve_bookmarks, standard_places, standard_places_from, Bookmark, PlaceEntry,
+    PlaceKind, Settings,
 };
 
 struct TestDir {
@@ -174,4 +174,58 @@ fn bookmarks_missing_target() {
     let (persisted, _) = Settings::load_from(&settings_path).unwrap();
     assert_eq!(persisted.bookmarks.len(), 1);
     assert!(persisted.bookmarks[0].is_missing());
+}
+
+#[test]
+fn unified_places_round_trip_migration_and_trash_invariant() {
+    let dir = TestDir::new("unified_places");
+    let settings_path = dir.path.join("settings.toml");
+    let custom_dir = dir.path.join("projects");
+    fs::create_dir_all(&custom_dir).unwrap();
+
+    // Legacy bookmarks are migrated into resolved_places() alongside standard places and Trash.
+    let mut settings = Settings::default();
+    settings.add_bookmark(Bookmark::new("Projects", &custom_dir));
+    let initial = settings.resolved_places();
+    assert!(initial.iter().any(PlaceEntry::is_trash));
+    assert!(initial
+        .iter()
+        .any(|e| e.path() == Some(custom_dir.as_path())));
+
+    // Removing all folder entries works, except Trash which refuses removal.
+    while settings.resolved_places().len() > 1 {
+        let idx = settings
+            .resolved_places()
+            .iter()
+            .position(|e| !e.is_trash())
+            .expect("folder place");
+        settings.remove_place(idx).unwrap();
+    }
+    assert_eq!(settings.resolved_places(), vec![PlaceEntry::Trash]);
+    assert!(settings.remove_place(0).is_err());
+
+    // Add two folders, move Trash between them, rename one, and reload from disk.
+    let path_a = dir.path.join("alpha");
+    let path_b = dir.path.join("beta");
+    fs::create_dir_all(&path_a).unwrap();
+    fs::create_dir_all(&path_b).unwrap();
+    assert!(settings.add_place("Alpha", path_a.clone()));
+    assert!(!settings.add_place("Duplicate Alpha", path_a.clone()));
+    assert!(settings.add_place("Beta", path_b.clone()));
+    // Currently: [Trash, Alpha, Beta] -> move Trash (0) to index 1 -> [Alpha, Trash, Beta]
+    assert!(settings.reorder_places(0, 1));
+    assert!(settings.rename_place(0, "Alpha Renamed"));
+    assert!(!settings.rename_place(1, "Cannot Rename Trash"));
+
+    settings.save_to(&settings_path).unwrap();
+    let (reloaded, warnings) = Settings::load_from(&settings_path).unwrap();
+    assert!(warnings.is_empty());
+    assert_eq!(
+        reloaded.resolved_places(),
+        vec![
+            PlaceEntry::folder("Alpha Renamed", path_a),
+            PlaceEntry::Trash,
+            PlaceEntry::folder("Beta", path_b),
+        ]
+    );
 }

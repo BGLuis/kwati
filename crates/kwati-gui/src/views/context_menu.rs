@@ -18,7 +18,7 @@ use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole};
 
-/// Actions offered by the file list context menu.
+/// Actions offered by the file list or sidebar Places context menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextMenuAction {
     Open,
@@ -30,6 +30,9 @@ pub enum ContextMenuAction {
     Remove,
     NewFolder,
     Refresh,
+    SidebarOpen(usize),
+    SidebarRename(usize),
+    SidebarRemove(usize),
 }
 
 /// An item or separator inside the context menu.
@@ -116,7 +119,7 @@ pub fn build_context_menu_entries(
         if let Some(bookmarked) = folder_bookmarked {
             entries.push(ContextMenuEntry::Item {
                 action: ContextMenuAction::Bookmark,
-                label: "Bookmark Folder",
+                label: "Add to Places",
                 shortcut: None,
                 enabled: !bookmarked,
                 destructive: false,
@@ -183,6 +186,44 @@ pub fn build_context_menu_entries(
     }
 }
 
+/// Builds the context menu entries for a sidebar Places item at `index`.
+/// Trash can be opened, while folders can be opened, renamed, or removed from Places.
+pub fn build_sidebar_place_menu_entries(index: usize, is_trash: bool) -> Vec<ContextMenuEntry> {
+    if is_trash {
+        return vec![ContextMenuEntry::Item {
+            action: ContextMenuAction::SidebarOpen(index),
+            label: "Open",
+            shortcut: None,
+            enabled: true,
+            destructive: false,
+        }];
+    }
+    vec![
+        ContextMenuEntry::Item {
+            action: ContextMenuAction::SidebarOpen(index),
+            label: "Open",
+            shortcut: None,
+            enabled: true,
+            destructive: false,
+        },
+        ContextMenuEntry::Item {
+            action: ContextMenuAction::SidebarRename(index),
+            label: "Rename",
+            shortcut: None,
+            enabled: true,
+            destructive: false,
+        },
+        ContextMenuEntry::Separator,
+        ContextMenuEntry::Item {
+            action: ContextMenuAction::SidebarRemove(index),
+            label: "Remove from Places",
+            shortcut: None,
+            enabled: true,
+            destructive: false,
+        },
+    ]
+}
+
 /// Floating context menu anchored at the pointer or focused list row.
 pub struct ContextMenuView {
     app_state: Entity<AppState>,
@@ -242,12 +283,32 @@ impl ContextMenuView {
         let selected = state.selected_locations();
         let folder_bookmarked = match (state.selected_entries().as_slice(), selected.as_slice()) {
             ([entry], [Location::Local(path)]) if entry.is_dir() => {
-                Some(state.settings.bookmarks.iter().any(|b| &b.path == path))
+                Some(state.is_place_pinned(path))
             }
             _ => None,
         };
         let has_clipboard = get_location_clipboard().is_some();
         self.entries = build_context_menu_entries(&selected, has_clipboard, folder_bookmarked);
+        self.position = position;
+        self.focused_index = self.first_enabled_index();
+        self.hovered_index = None;
+        self.opened_at = Some(Instant::now());
+        self.motion.clear();
+        self.is_open = true;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    /// Opens the menu at `position` for a sidebar Places item.
+    pub fn open_for_sidebar_place_at(
+        &mut self,
+        index: usize,
+        is_trash: bool,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.entries = build_sidebar_place_menu_entries(index, is_trash);
         self.position = position;
         self.focused_index = self.first_enabled_index();
         self.hovered_index = None;
@@ -352,10 +413,13 @@ fn menu_action_icon(action: ContextMenuAction) -> Option<IconName> {
         ContextMenuAction::Remove => Some(IconName::Trash),
         ContextMenuAction::NewFolder => Some(IconName::Folder),
         ContextMenuAction::Refresh => Some(IconName::Refresh),
+        ContextMenuAction::SidebarRemove(_) => Some(IconName::Close),
         ContextMenuAction::Rename
         | ContextMenuAction::Bookmark
         | ContextMenuAction::Cut
-        | ContextMenuAction::Paste => None,
+        | ContextMenuAction::Paste
+        | ContextMenuAction::SidebarOpen(_)
+        | ContextMenuAction::SidebarRename(_) => None,
     }
 }
 
@@ -479,6 +543,7 @@ impl Render for ContextMenuView {
 
                     let row = div()
                         .id(("context-menu-item", ix))
+                        .debug_selector(move || format!("context-menu-item-{ix}"))
                         .relative()
                         .left(px(item_dx))
                         .opacity(item_opacity)

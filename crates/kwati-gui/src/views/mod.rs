@@ -21,7 +21,7 @@ pub use preview_view::PreviewView;
 pub use remote_dialogs::{RemoteDialogKind, RemoteDialogsView};
 pub use search_view::SearchView;
 pub use settings_view::SettingsView;
-pub use sidebar_view::SidebarView;
+pub use sidebar_view::{SidebarView, SidebarViewEvent};
 pub use trash_view::{TrashView, TrashViewEvent};
 
 use std::time::Instant;
@@ -182,6 +182,46 @@ impl MainView {
                     .update(cx, |menu, cx| menu.open_at(position, window, cx));
                 cx.notify();
             }
+        })
+        .detach();
+
+        cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            match event {
+                SidebarViewEvent::MoveEntries { sources, dest_dir } => {
+                    let sources = sources.clone();
+                    let dest_dir = dest_dir.clone();
+                    let in_place = sources
+                        .iter()
+                        .all(|src| src.parent().as_ref() == Some(&dest_dir));
+                    if in_place {
+                        this.set_status("The items are already in this folder", cx);
+                    } else {
+                        this.dialogs.update(cx, |dialogs, cx| {
+                            dialogs.begin_paste(sources, dest_dir, true, cx);
+                        });
+                    }
+                }
+                SidebarViewEvent::TrashEntries(locations) => {
+                    let locations = locations.clone();
+                    this.open_dialog(window, cx, |dialogs, cx| {
+                        dialogs.open_remove_confirmation(locations, cx)
+                    });
+                }
+                SidebarViewEvent::OpenPlaceContextMenu {
+                    index,
+                    is_trash,
+                    position,
+                } => {
+                    if !this.any_blocking_modal_open(cx) {
+                        this.context_menu.update(cx, |menu, cx| {
+                            menu.open_for_sidebar_place_at(
+                                *index, *is_trash, *position, window, cx,
+                            );
+                        });
+                    }
+                }
+            }
+            cx.notify();
         })
         .detach();
 
@@ -478,7 +518,7 @@ impl MainView {
                     let path = path.clone();
                     let res = self
                         .sidebar
-                        .update(cx, |sidebar, cx| sidebar.bookmark_folder(path, cx));
+                        .update(cx, |sidebar, cx| sidebar.pin_folder(path, cx));
                     if let Err(err) = res {
                         self.set_status(err, cx);
                     }
@@ -507,6 +547,25 @@ impl MainView {
                     cx.notify();
                 });
                 self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::SidebarOpen(index) => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.open_place_at(index, cx));
+                self.focus_active_content(window, cx);
+            }
+            ContextMenuAction::SidebarRename(index) => {
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.begin_rename_place(index, window, cx)
+                });
+            }
+            ContextMenuAction::SidebarRemove(index) => {
+                let res = self
+                    .sidebar
+                    .update(cx, |sidebar, cx| sidebar.remove_place_in_state(index, cx));
+                if let Err(err) = res {
+                    self.set_status(err, cx);
+                }
+                self.focus_active_content(window, cx);
             }
         }
     }

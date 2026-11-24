@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use toml::{Table, Value};
 
-use crate::places::Bookmark;
+use crate::places::{default_place_entries, ensure_trash_present, Bookmark, PlaceEntry};
 use crate::{SortColumn, SortDirection, SortOrder};
 
 pub const CURRENT_VERSION: u32 = 1;
@@ -70,6 +70,7 @@ pub struct Settings {
     pub remote_search_parallel: u32,
     pub motion_preference: MotionPreference,
     pub bookmarks: Vec<Bookmark>,
+    pub places: Option<Vec<PlaceEntry>>,
     /// Keys this version does not know, kept so a newer version's file survives a save.
     unknown: Table,
 }
@@ -90,6 +91,7 @@ impl Default for Settings {
             remote_search_parallel: DEFAULT_REMOTE_SEARCH_PARALLEL,
             motion_preference: MotionPreference::default(),
             bookmarks: Vec::new(),
+            places: None,
             unknown: Table::new(),
         }
     }
@@ -591,6 +593,72 @@ impl Settings {
             }
         }
 
+        let mut places = None;
+        if let Some(val) = table.remove("places") {
+            match val {
+                Value::Array(items) => {
+                    let mut parsed = Vec::with_capacity(items.len());
+                    for (idx, item) in items.into_iter().enumerate() {
+                        if let Value::Table(mut t) = item {
+                            let kind = t.remove("kind").and_then(|v| match v {
+                                Value::String(s) => Some(s),
+                                _ => None,
+                            });
+                            match kind.as_deref() {
+                                Some("trash") => parsed.push(PlaceEntry::Trash),
+                                Some("folder") | None => {
+                                    let name = t.remove("name").and_then(|v| match v {
+                                        Value::String(s) => Some(s),
+                                        _ => None,
+                                    });
+                                    let path = t.remove("path").and_then(|v| match v {
+                                        Value::String(s) => Some(PathBuf::from(s)),
+                                        _ => None,
+                                    });
+                                    match (name, path) {
+                                        (Some(name), Some(path)) => {
+                                            parsed.push(PlaceEntry::folder(name, path));
+                                        }
+                                        _ => {
+                                            warnings.push(SettingsWarning {
+                                                key: "places",
+                                                message: format!(
+                                                    "invalid place entry at index {}",
+                                                    idx
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                                Some(other) => {
+                                    warnings.push(SettingsWarning {
+                                        key: "places",
+                                        message: format!(
+                                            "unknown place kind '{}' at index {}",
+                                            other, idx
+                                        ),
+                                    });
+                                }
+                            }
+                        } else {
+                            warnings.push(SettingsWarning {
+                                key: "places",
+                                message: format!("place entry at index {} is not a table", idx),
+                            });
+                        }
+                    }
+                    ensure_trash_present(&mut parsed);
+                    places = Some(parsed);
+                }
+                _ => {
+                    warnings.push(SettingsWarning {
+                        key: "places",
+                        message: "places must be an array of tables".into(),
+                    });
+                }
+            }
+        }
+
         let settings = Self {
             version,
             show_hidden,
@@ -605,6 +673,7 @@ impl Settings {
             remote_search_parallel,
             motion_preference,
             bookmarks,
+            places,
             unknown: table,
         };
         Ok((settings, warnings))
@@ -664,6 +733,73 @@ impl Settings {
         }
         let item = self.bookmarks.remove(from);
         self.bookmarks.insert(to, item);
+        true
+    }
+
+    /// Returns the unified sidebar Places list, migrating from standard places + legacy
+    /// bookmarks when `places` has not yet been customized, and guaranteeing Trash is present.
+    pub fn resolved_places(&self) -> Vec<PlaceEntry> {
+        match &self.places {
+            Some(entries) => {
+                let mut list = entries.clone();
+                ensure_trash_present(&mut list);
+                list
+            }
+            None => default_place_entries(&self.bookmarks),
+        }
+    }
+
+    fn ensure_places_mut(&mut self) -> &mut Vec<PlaceEntry> {
+        if self.places.is_none() {
+            self.places = Some(default_place_entries(&self.bookmarks));
+        }
+        let list = self.places.as_mut().expect("initialized above");
+        ensure_trash_present(list);
+        list
+    }
+
+    /// Adds a folder to the unified Places list unless `path` is already pinned.
+    pub fn add_place(&mut self, name: impl Into<String>, path: PathBuf) -> bool {
+        let list = self.ensure_places_mut();
+        if list.iter().any(|e| e.path().is_some_and(|p| p == path)) {
+            return false;
+        }
+        list.push(PlaceEntry::folder(name, path));
+        true
+    }
+
+    /// Renames the folder place at `index`. Returns `false` if `index` is out of range or Trash.
+    pub fn rename_place(&mut self, index: usize, new_name: impl Into<String>) -> bool {
+        let list = self.ensure_places_mut();
+        match list.get_mut(index) {
+            Some(PlaceEntry::Folder { name, .. }) => {
+                *name = new_name.into();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Removes the folder place at `index`. Trash cannot be removed.
+    pub fn remove_place(&mut self, index: usize) -> Result<PlaceEntry, &'static str> {
+        let list = self.ensure_places_mut();
+        let Some(entry) = list.get(index) else {
+            return Err("Place index out of range.");
+        };
+        if entry.is_trash() {
+            return Err("Trash cannot be removed.");
+        }
+        Ok(list.remove(index))
+    }
+
+    /// Moves any place (including Trash) from `from` to `to`.
+    pub fn reorder_places(&mut self, from: usize, to: usize) -> bool {
+        let list = self.ensure_places_mut();
+        if from >= list.len() || to >= list.len() {
+            return false;
+        }
+        let item = list.remove(from);
+        list.insert(to, item);
         true
     }
 
@@ -734,6 +870,29 @@ impl Settings {
             })
             .collect();
         table.insert("bookmarks".into(), Value::Array(bookmark_tables));
+        if let Some(places) = &self.places {
+            let place_tables: Vec<Value> = places
+                .iter()
+                .map(|entry| {
+                    let mut t = Table::new();
+                    match entry {
+                        PlaceEntry::Trash => {
+                            t.insert("kind".into(), Value::String("trash".into()));
+                        }
+                        PlaceEntry::Folder { name, path } => {
+                            t.insert("kind".into(), Value::String("folder".into()));
+                            t.insert("name".into(), Value::String(name.clone()));
+                            t.insert(
+                                "path".into(),
+                                Value::String(path.to_string_lossy().to_string()),
+                            );
+                        }
+                    }
+                    Value::Table(t)
+                })
+                .collect();
+            table.insert("places".into(), Value::Array(place_tables));
+        }
         let text = toml::to_string(&table)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 

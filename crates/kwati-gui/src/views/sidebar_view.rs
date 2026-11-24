@@ -1,19 +1,21 @@
 //! Sidebar view (owned by guinet-worker for #61).
 //!
-//! Renders quick-access places, bookmarks, the device's mounted drives with capacity
-//! indicators, and mounted network shares.
+//! Renders the unified quick-access Places list (standard folders, pinned folders, and Trash),
+//! the device's mounted drives with capacity indicators, and mounted network shares.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, transparent_black, AnyElement, Context, Div, Entity, FontWeight,
-    KeyDownEvent, MouseButton, MouseDownEvent, Stateful, Subscription, Task, Window,
+    div, prelude::*, px, transparent_black, AnyElement, Context, Div, Entity, EventEmitter,
+    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Stateful,
+    StyleRefinement, Subscription, Task, Window,
 };
 use kwati_core::{
-    device_volumes, is_trash_browsing_supported, network_mounts, ConnectionState, Location,
-    NetworkMount, PlaceKind, Volume,
+    device_volumes, is_trash_browsing_supported, network_mounts, ConnectionState, IconPreferences,
+    IconResolver, Location, NetworkMount, PlaceEntry, PlaceKind, Volume,
 };
 
 use crate::actions::{open_system_trash, ManageServers};
@@ -29,6 +31,7 @@ use crate::remote::protocol_label;
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, TextRole};
+use crate::views::list_view::DragEntries;
 
 /// Formats byte quantities into human-readable strings (B, KB, MB, GB, TB).
 pub fn format_bytes(bytes: u64) -> String {
@@ -50,11 +53,18 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// A standard quick-access place (Home, Documents, Downloads, etc.).
+/// Distinguishes folder entries from the built-in Trash entry in the unified Places list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarPlaceKind {
+    Folder(PathBuf),
+    Trash,
+}
+
+/// An item in the unified sidebar Places list (standard folders, user-pinned folders, and Trash).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarPlace {
     pub name: String,
-    pub path: PathBuf,
+    pub kind: SidebarPlaceKind,
     pub icon: IconName,
 }
 
@@ -62,8 +72,55 @@ impl SidebarPlace {
     pub fn new(name: impl Into<String>, path: PathBuf, icon: IconName) -> Self {
         Self {
             name: name.into(),
-            path,
+            kind: SidebarPlaceKind::Folder(path),
             icon,
+        }
+    }
+
+    pub fn trash() -> Self {
+        Self {
+            name: "Trash".into(),
+            kind: SidebarPlaceKind::Trash,
+            icon: IconName::Trash,
+        }
+    }
+
+    pub fn from_entry(entry: &PlaceEntry, specials: &SpecialFolders) -> Self {
+        match entry {
+            PlaceEntry::Trash => Self::trash(),
+            PlaceEntry::Folder { name, path } => {
+                let resolved = if path == Path::new("/") {
+                    match icon_for_with(path, true, specials) {
+                        IconName::Folder => IconName::Drive,
+                        other => other,
+                    }
+                } else {
+                    icon_for_with(path, true, specials)
+                };
+                Self::new(name.clone(), path.clone(), resolved)
+            }
+        }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        match &self.kind {
+            SidebarPlaceKind::Folder(path) => Some(path.as_path()),
+            SidebarPlaceKind::Trash => None,
+        }
+    }
+
+    pub fn is_trash(&self) -> bool {
+        matches!(self.kind, SidebarPlaceKind::Trash)
+    }
+
+    pub fn is_removable(&self) -> bool {
+        !self.is_trash()
+    }
+
+    pub fn is_missing(&self) -> bool {
+        match &self.kind {
+            SidebarPlaceKind::Folder(path) => !path.exists(),
+            SidebarPlaceKind::Trash => false,
         }
     }
 }
@@ -111,27 +168,6 @@ pub fn standard_places() -> Vec<SidebarPlace> {
     }
 
     places
-}
-
-/// A user-defined pinned bookmark.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserBookmark {
-    pub name: String,
-    pub path: PathBuf,
-}
-
-impl UserBookmark {
-    pub fn new(name: impl Into<String>, path: PathBuf) -> Self {
-        Self {
-            name: name.into(),
-            path,
-        }
-    }
-
-    /// Returns true if the bookmarked target directory/file no longer exists.
-    pub fn is_missing(&self) -> bool {
-        !self.path.exists()
-    }
 }
 
 /// A storage volume or drive listed in the sidebar.
@@ -295,9 +331,7 @@ const DEVICE_POLL: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SidebarKey {
     Place(usize),
-    Trash,
-    Bookmark(usize),
-    AddBookmark,
+    AddPlace,
     ManageServers,
     AddServer,
     Server(usize),
@@ -305,6 +339,152 @@ enum SidebarKey {
     DriveEject(usize),
     RefreshDrives,
     NetworkShare(usize),
+}
+
+#[derive(Clone)]
+struct DragSidebarPlace {
+    index: usize,
+    name: String,
+    icon: IconName,
+    is_trash: bool,
+    is_missing: bool,
+}
+
+struct DragPlacePreview {
+    name: String,
+    icon: IconName,
+    is_trash: bool,
+    is_missing: bool,
+    icon_prefs: IconPreferences,
+    icon_resolver: Arc<IconResolver>,
+}
+
+impl Render for DragPlacePreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
+        let glyph = if self.is_trash {
+            animated_icon_sized(IconName::Trash, IconMotion::Rest, size::ICON, theme.text)
+        } else if self.is_missing {
+            animated_icon_sized(IconName::Alert, IconMotion::Rest, size::ICON, theme.danger)
+        } else if self.icon.is_folder() {
+            resolved_icon(
+                self.icon,
+                IconMotion::Rest,
+                size::ICON,
+                resolve_icon_color(self.icon.key_name(), &self.icon_prefs, &theme),
+                &self.icon_prefs,
+                &self.icon_resolver,
+            )
+        } else {
+            animated_icon_sized(self.icon, IconMotion::Rest, size::ICON, theme.text)
+        };
+
+        div()
+            .h(size::SIDEBAR_ROW)
+            .px(space::S8)
+            .rounded(radius::CONTROL)
+            .bg(theme.surface_raised)
+            .border_1()
+            .border_color(theme.accent)
+            .shadow_sm()
+            .opacity(0.92)
+            .flex()
+            .items_center()
+            .gap(space::S8)
+            .text_body()
+            .text_color(if self.is_missing {
+                theme.danger
+            } else {
+                theme.text
+            })
+            .child(glyph)
+            .child(self.name.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarViewEvent {
+    MoveEntries {
+        sources: Vec<Location>,
+        dest_dir: Location,
+    },
+    TrashEntries(Vec<Location>),
+    OpenPlaceContextMenu {
+        index: usize,
+        is_trash: bool,
+        position: Point<Pixels>,
+    },
+}
+
+impl EventEmitter<SidebarViewEvent> for SidebarView {}
+
+fn can_move_entries_to(dragged: &DragEntries, dest_path: &Path) -> bool {
+    if dragged.items.is_empty() {
+        return false;
+    }
+    let dest_loc = Location::Local(dest_path.to_path_buf());
+    for item in &dragged.items {
+        if let Location::Local(src) = &item.location {
+            if src == dest_path || (item.is_dir && dest_path.starts_with(src)) {
+                return false;
+            }
+        }
+    }
+    !dragged
+        .items
+        .iter()
+        .all(|item| item.location.parent().as_ref() == Some(&dest_loc))
+}
+
+fn style_drag_over_place_entry(
+    style: StyleRefinement,
+    dragged: &DragEntries,
+    is_trash: bool,
+    is_missing: bool,
+    dest_path: Option<&Path>,
+    theme: &Theme,
+) -> StyleRefinement {
+    if is_trash {
+        return style
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.danger);
+    }
+    if is_missing {
+        return style;
+    }
+    if let Some(dest) = dest_path {
+        if can_move_entries_to(dragged, dest) {
+            return style
+                .bg(theme.surface)
+                .border_1()
+                .border_color(theme.accent);
+        }
+    }
+    style
+}
+
+fn style_drag_over_pin(
+    style: StyleRefinement,
+    dragged: &DragEntries,
+    pinned_paths: &[PathBuf],
+    theme: &Theme,
+    expand_height: bool,
+) -> StyleRefinement {
+    if let Some((path, _)) = dragged.single_local_folder() {
+        if !pinned_paths.iter().any(|p| p.as_path() == path) {
+            let styled = style
+                .bg(theme.surface)
+                .border_1()
+                .border_color(theme.accent);
+            return if expand_height {
+                styled.h(size::SIDEBAR_ROW)
+            } else {
+                styled
+            };
+        }
+    }
+    style
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -319,13 +499,12 @@ enum SidebarMotionKey {
 pub struct SidebarView {
     pub app_state: Entity<AppState>,
     pub places: Vec<SidebarPlace>,
-    pub bookmarks: Vec<UserBookmark>,
     pub volumes: Vec<SidebarVolume>,
     pub network: Vec<NetworkMount>,
     /// Drives show as rows with their free space unless the user asks for capacity cards with
     /// a right click.
     pub drive_details: bool,
-    editing_bookmark: Option<usize>,
+    editing_place: Option<usize>,
     rename_input: Entity<TextInput>,
     hovered: HashSet<SidebarKey>,
     pressed: HashSet<SidebarKey>,
@@ -338,16 +517,16 @@ pub struct SidebarView {
 
 impl SidebarView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let initial_bookmarks = app_state
+        let specials = SpecialFolders::from_system();
+        let initial_places = app_state
             .read(cx)
-            .settings
-            .bookmarks
+            .places()
             .iter()
-            .map(|b| UserBookmark::new(&b.name, b.path.clone()))
+            .map(|entry| SidebarPlace::from_entry(entry, &specials))
             .collect();
-        let rename_input = cx.new(|cx| TextInput::with_placeholder("Nome do favorito", cx));
+        let rename_input = cx.new(|cx| TextInput::with_placeholder("Nome do local", cx));
         let state_sub = cx.observe(&app_state, |this, app_state, cx| {
-            this.sync_bookmarks_from_state(app_state.read(cx));
+            this.sync_places_from_state(app_state.read(cx));
             cx.notify();
         });
         let device_poll = cx.spawn(async move |this, cx| loop {
@@ -363,12 +542,11 @@ impl SidebarView {
         });
         Self {
             app_state,
-            places: standard_places(),
-            bookmarks: initial_bookmarks,
+            places: initial_places,
             volumes: Vec::new(),
             network: Vec::new(),
             drive_details: false,
-            editing_bookmark: None,
+            editing_place: None,
             rename_input,
             hovered: HashSet::new(),
             pressed: HashSet::new(),
@@ -380,19 +558,19 @@ impl SidebarView {
         }
     }
 
-    /// Synchronizes `self.bookmarks` with `state.settings.bookmarks`.
-    pub fn sync_bookmarks_from_state(&mut self, state: &AppState) {
-        let synced: Vec<UserBookmark> = state
-            .settings
-            .bookmarks
+    /// Synchronizes `self.places` with `state.places()`.
+    pub fn sync_places_from_state(&mut self, state: &AppState) {
+        let specials = SpecialFolders::from_system();
+        let synced: Vec<SidebarPlace> = state
+            .places()
             .iter()
-            .map(|b| UserBookmark::new(&b.name, b.path.clone()))
+            .map(|entry| SidebarPlace::from_entry(entry, &specials))
             .collect();
-        if self.bookmarks != synced {
-            self.bookmarks = synced;
-            if let Some(idx) = self.editing_bookmark {
-                if idx >= self.bookmarks.len() {
-                    self.editing_bookmark = None;
+        if self.places != synced {
+            self.places = synced;
+            if let Some(idx) = self.editing_place {
+                if self.places.get(idx).is_none_or(|p| p.is_trash()) {
+                    self.editing_place = None;
                 }
             }
         }
@@ -428,31 +606,10 @@ impl SidebarView {
         }
     }
 
-    // --- Bookmarks management ---
+    // --- Unified Places management ---
 
-    pub fn add_bookmark(&mut self, name: impl Into<String>, path: PathBuf) {
-        self.bookmarks.push(UserBookmark::new(name, path));
-    }
-
-    pub fn remove_bookmark(&mut self, index: usize) -> Option<UserBookmark> {
-        if index < self.bookmarks.len() {
-            Some(self.bookmarks.remove(index))
-        } else {
-            None
-        }
-    }
-
-    pub fn reorder_bookmark(&mut self, from: usize, to: usize) -> bool {
-        if from >= self.bookmarks.len() || to >= self.bookmarks.len() {
-            return false;
-        }
-        let item = self.bookmarks.remove(from);
-        self.bookmarks.insert(to, item);
-        true
-    }
-
-    /// Adds a bookmark via `AppState::add_bookmark` and persists/syncs it.
-    pub fn add_bookmark_in_state(
+    /// Adds a place via `AppState::add_place` and persists/syncs it.
+    pub fn add_place_in_state(
         &mut self,
         name: impl Into<String>,
         path: PathBuf,
@@ -460,37 +617,37 @@ impl SidebarView {
     ) -> Result<(), String> {
         let res = self
             .app_state
-            .update(cx, |state, _| state.add_bookmark(name, path));
+            .update(cx, |state, _| state.add_place(name, path));
         if res.is_ok() {
             let state = self.app_state.read(cx);
-            self.sync_bookmarks_from_state(state);
+            self.sync_places_from_state(state);
         }
         cx.notify();
         res
     }
 
-    /// Removes a bookmark via `AppState::remove_bookmark` and persists/syncs it.
-    pub fn remove_bookmark_in_state(
+    /// Removes a place via `AppState::remove_place` and persists/syncs it. Trash cannot be removed.
+    pub fn remove_place_in_state(
         &mut self,
         index: usize,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let res = self
             .app_state
-            .update(cx, |state, _| state.remove_bookmark(index).map(|_| ()));
+            .update(cx, |state, _| state.remove_place(index).map(|_| ()));
         if res.is_ok() {
-            if self.editing_bookmark == Some(index) {
-                self.editing_bookmark = None;
+            if self.editing_place == Some(index) {
+                self.editing_place = None;
             }
             let state = self.app_state.read(cx);
-            self.sync_bookmarks_from_state(state);
+            self.sync_places_from_state(state);
         }
         cx.notify();
         res
     }
 
-    /// Renames a bookmark via `AppState::rename_bookmark` and persists/syncs it.
-    pub fn rename_bookmark_in_state(
+    /// Renames a folder place via `AppState::rename_place` and persists/syncs it.
+    pub fn rename_place_in_state(
         &mut self,
         index: usize,
         name: impl Into<String>,
@@ -498,28 +655,47 @@ impl SidebarView {
     ) -> Result<(), String> {
         let res = self
             .app_state
-            .update(cx, |state, _| state.rename_bookmark(index, name));
+            .update(cx, |state, _| state.rename_place(index, name));
         if res.is_ok() {
-            self.editing_bookmark = None;
+            self.editing_place = None;
             let state = self.app_state.read(cx);
-            self.sync_bookmarks_from_state(state);
+            self.sync_places_from_state(state);
         }
         cx.notify();
         res
     }
 
-    /// Pins the current local folder into `AppState::settings.bookmarks`.
+    /// Moves any place (including Trash) from `from` to `to` and persists/syncs it.
+    pub fn reorder_place_in_state(
+        &mut self,
+        from: usize,
+        to: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let res = self
+            .app_state
+            .update(cx, |state, _| state.reorder_places(from, to));
+        if res.is_ok() {
+            self.editing_place = None;
+            let state = self.app_state.read(cx);
+            self.sync_places_from_state(state);
+        }
+        cx.notify();
+        res
+    }
+
+    /// Pins the current local folder into the unified Places list.
     pub fn pin_current_location(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         let current = self.app_state.read(cx).current_location.clone();
         let Location::Local(path) = current else {
-            return Err("Apenas pastas locais podem ser fixadas nos favoritos.".into());
+            return Err("Apenas pastas locais podem ser fixadas nos locais.".into());
         };
-        self.bookmark_folder(path, cx)
+        self.pin_folder(path, cx)
     }
 
-    /// Adds `path` to the bookmarks under its folder name, unless it is already there.
-    pub fn bookmark_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) -> Result<(), String> {
-        if self.bookmarks.iter().any(|b| b.path == path) {
+    /// Adds `path` to Places under its folder name, unless it is already there.
+    pub fn pin_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) -> Result<(), String> {
+        if self.places.iter().any(|p| p.path() == Some(path.as_path())) {
             return Ok(());
         }
         let name = path
@@ -527,20 +703,23 @@ impl SidebarView {
             .map(|n| n.to_string_lossy().to_string())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
-        self.add_bookmark_in_state(name, path, cx)
+        self.add_place_in_state(name, path, cx)
     }
 
-    pub fn begin_rename_bookmark(
+    pub fn begin_rename_place(
         &mut self,
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(bm) = self.bookmarks.get(index) else {
+        let Some(place) = self.places.get(index) else {
             return;
         };
-        let current_name = bm.name.clone();
-        self.editing_bookmark = Some(index);
+        if place.is_trash() {
+            return;
+        }
+        let current_name = place.name.clone();
+        self.editing_place = Some(index);
         self.rename_input.update(cx, |input, cx| {
             input.set_text(current_name, cx);
         });
@@ -548,22 +727,79 @@ impl SidebarView {
         cx.notify();
     }
 
-    pub fn commit_rename_bookmark(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.editing_bookmark else {
+    pub fn commit_rename_place(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.editing_place else {
             return;
         };
         let new_name = self.rename_input.read(cx).text().trim().to_string();
         if new_name.is_empty() {
-            self.editing_bookmark = None;
+            self.editing_place = None;
             cx.notify();
             return;
         }
-        let _ = self.rename_bookmark_in_state(index, new_name, cx);
+        let _ = self.rename_place_in_state(index, new_name, cx);
     }
 
-    pub fn cancel_rename_bookmark(&mut self, cx: &mut Context<Self>) {
-        self.editing_bookmark = None;
+    pub fn cancel_rename_place(&mut self, cx: &mut Context<Self>) {
+        self.editing_place = None;
         cx.notify();
+    }
+
+    pub fn open_place_at(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(place) = self.places.get(index).cloned() else {
+            return;
+        };
+        if place.is_trash() {
+            self.open_trash(cx);
+        } else if let Some(path) = place.path() {
+            self.navigate_to_path(path, cx);
+        }
+    }
+
+    fn handle_place_entries_drop(
+        &mut self,
+        dragged: &DragEntries,
+        is_trash: bool,
+        is_missing: bool,
+        dest_path: Option<&Path>,
+        cx: &mut Context<Self>,
+    ) {
+        if is_trash {
+            let locations = dragged.locations();
+            if !locations.is_empty() {
+                cx.emit(SidebarViewEvent::TrashEntries(locations));
+            }
+            return;
+        }
+        if is_missing {
+            return;
+        }
+        if let Some(dest) = dest_path {
+            if can_move_entries_to(dragged, dest) {
+                cx.emit(SidebarViewEvent::MoveEntries {
+                    sources: dragged.locations(),
+                    dest_dir: Location::Local(dest.to_path_buf()),
+                });
+            } else {
+                self.app_state.update(cx, |state, _| {
+                    state.set_status("Os itens já estão nesta pasta.");
+                });
+            }
+        }
+    }
+
+    fn handle_pin_drop(&mut self, dragged: &DragEntries, cx: &mut Context<Self>) {
+        if let Some((path, _)) = dragged.single_local_folder() {
+            if let Err(err) = self.pin_folder(path.to_path_buf(), cx) {
+                self.app_state.update(cx, |state, _| {
+                    state.set_status(err);
+                });
+            }
+        } else if !dragged.items.is_empty() {
+            self.app_state.update(cx, |state, _| {
+                state.set_status("Apenas pastas locais podem ser fixadas em Places.");
+            });
+        }
     }
 
     /// Initiates a connection to the saved server profile `profile_id`.
@@ -993,10 +1229,12 @@ impl SidebarView {
         self.sync_server_draws(&servers, now);
 
         let places = self.places.clone();
-        let bookmarks = self.bookmarks.clone();
         let volumes = self.volumes.clone();
         let network = self.network.clone();
-        let specials = SpecialFolders::from_system();
+        let pinned_paths: Vec<PathBuf> = places
+            .iter()
+            .filter_map(|p| p.path().map(Path::to_path_buf))
+            .collect();
 
         let place_rows: Vec<_> = places
             .iter()
@@ -1004,9 +1242,17 @@ impl SidebarView {
             .map(|(ix, place)| {
                 let key = SidebarKey::Place(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
-                let path = place.path.clone();
-                let is_active =
-                    !trash_active && matches!(&current_loc, Location::Local(p) if p == &place.path);
+                let is_trash = place.is_trash();
+                let is_missing = place.is_missing();
+                let path_opt = place.path().map(Path::to_path_buf);
+                let path_for_drag_over = path_opt.clone();
+                let path_for_drop = path_opt.clone();
+                let is_active = if is_trash {
+                    trash_active
+                } else {
+                    !trash_active
+                        && matches!((&current_loc, &path_opt), (Location::Local(cur), Some(p)) if cur == p)
+                };
                 let row_bg = if is_active {
                     theme.selection.into()
                 } else {
@@ -1017,17 +1263,41 @@ impl SidebarView {
                 } else {
                     lerp_f32(1.0, PRESS_SCALE, press_t)
                 };
-                let color = if place.icon.is_folder() {
-                    resolve_icon_color(place.icon.key_name(), &icon_prefs, &theme)
+                let (glyph_name, glyph_color, tooltip_label) = if is_trash {
+                    (IconName::Trash, theme.text.into(), place.name.clone())
+                } else if is_missing {
+                    (
+                        IconName::Alert,
+                        theme.danger.into(),
+                        format!("{} (missing)", place.name),
+                    )
+                } else if place.icon.is_folder() {
+                    (
+                        place.icon,
+                        resolve_icon_color(place.icon.key_name(), &icon_prefs, &theme),
+                        place.name.clone(),
+                    )
                 } else {
-                    theme.text.into()
+                    (place.icon, theme.text.into(), place.name.clone())
                 };
-                let glyph_motion =
-                    if !reduced && place.icon.is_folder() && (is_active || hover_t > 0.01) {
-                        IconMotion::State(if is_active { 1.0 } else { hover_t })
-                    } else {
-                        IconMotion::Rest
-                    };
+                let glyph_motion = if !reduced
+                    && (is_trash || (glyph_name.is_folder() && !is_missing))
+                    && (is_active || hover_t > 0.01)
+                {
+                    IconMotion::State(if is_active { 1.0 } else { hover_t })
+                } else {
+                    IconMotion::Rest
+                };
+                let drag_payload = DragSidebarPlace {
+                    index: ix,
+                    name: place.name.clone(),
+                    icon: place.icon,
+                    is_trash,
+                    is_missing,
+                };
+                let drag_prefs = icon_prefs.clone();
+                let drag_resolver = icon_resolver.clone();
+
                 div()
                     .id(("place", ix))
                     .h(size::SIDEBAR_ROW)
@@ -1038,95 +1308,72 @@ impl SidebarView {
                     .rounded(radius::CONTROL)
                     .cursor_pointer()
                     .bg(row_bg)
-                    .tooltip(Tooltip::text(place.name.clone()))
+                    .tooltip(Tooltip::text(tooltip_label))
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
                         this.set_hover(key, *hovered, cx);
                     }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.set_press(key, true, cx);
-                            this.navigate_to_path(&path, cx);
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
-                    )
-                    .child(if place.icon.is_folder() {
-                        resolved_icon(
-                            place.icon,
-                            glyph_motion,
-                            size::ICON * scale,
-                            color,
-                            &icon_prefs,
-                            &icon_resolver,
-                        )
-                    } else {
-                        animated_icon_sized(place.icon, glyph_motion, size::ICON * scale, color)
+                    .on_drag(drag_payload, move |dragged, _, _, cx| {
+                        cx.new(|_| DragPlacePreview {
+                            name: dragged.name.clone(),
+                            icon: dragged.icon,
+                            is_trash: dragged.is_trash,
+                            is_missing: dragged.is_missing,
+                            icon_prefs: drag_prefs.clone(),
+                            icon_resolver: drag_resolver.clone(),
+                        })
                     })
-            })
-            .collect();
-
-        let bookmark_rows: Vec<_> = bookmarks
-            .iter()
-            .enumerate()
-            .map(|(ix, bm)| {
-                let key = SidebarKey::Bookmark(ix);
-                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
-                let path = bm.path.clone();
-                let is_active =
-                    !trash_active && matches!(&current_loc, Location::Local(p) if p == &bm.path);
-                let row_bg = if is_active {
-                    theme.selection.into()
-                } else {
-                    color_lerp(transparent_black(), theme.border, hover_t)
-                };
-                let scale = if reduced {
-                    1.0
-                } else {
-                    lerp_f32(1.0, PRESS_SCALE, press_t)
-                };
-                let (glyph_name, glyph_color, label) = if bm.is_missing() {
-                    (
-                        IconName::Alert,
-                        theme.danger.into(),
-                        format!("{} (missing)", bm.name),
-                    )
-                } else {
-                    let glyph = icon_for_with(&bm.path, true, &specials);
-                    let col = resolve_icon_color(glyph.key_name(), &icon_prefs, &theme);
-                    (glyph, col, bm.name.clone())
-                };
-                let glyph_motion =
-                    if !reduced && glyph_name.is_folder() && (is_active || hover_t > 0.01) {
-                        IconMotion::State(if is_active { 1.0 } else { hover_t })
-                    } else {
-                        IconMotion::Rest
-                    };
-                div()
-                    .id(("bookmark", ix))
-                    .h(size::SIDEBAR_ROW)
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(radius::CONTROL)
-                    .cursor_pointer()
-                    .bg(row_bg)
-                    .tooltip(Tooltip::text(label))
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        this.set_hover(key, *hovered, cx);
+                    .drag_over::<DragSidebarPlace>(move |style, dragged, _, cx| {
+                        if dragged.index == ix {
+                            return style;
+                        }
+                        let theme = Theme::get(cx);
+                        let style = style.bg(theme.surface).border_color(theme.accent);
+                        if dragged.index < ix {
+                            style.border_b_2()
+                        } else {
+                            style.border_t_2()
+                        }
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DragSidebarPlace, _, cx| {
+                        if dragged.index != ix {
+                            let _ = this.reorder_place_in_state(dragged.index, ix, cx);
+                        }
+                    }))
+                    .drag_over::<DragEntries>(move |style, dragged, _, cx| {
+                        let theme = Theme::get(cx);
+                        style_drag_over_place_entry(
+                            style,
+                            dragged,
+                            is_trash,
+                            is_missing,
+                            path_for_drag_over.as_deref(),
+                            &theme,
+                        )
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DragEntries, _, cx| {
+                        this.handle_place_entries_drop(
+                            dragged,
+                            is_trash,
+                            is_missing,
+                            path_for_drop.as_deref(),
+                            cx,
+                        );
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
                             this.set_press(key, true, cx);
-                            this.navigate_to_path(&path, cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |_, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(SidebarViewEvent::OpenPlaceContextMenu {
+                                index: ix,
+                                is_trash,
+                                position: event.position,
+                            });
                         }),
                     )
                     .on_mouse_up(
@@ -1137,14 +1384,14 @@ impl SidebarView {
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
                     )
-                    .child(if bm.is_missing() {
-                        animated_icon_sized(
-                            glyph_name,
-                            glyph_motion,
-                            size::ICON * scale,
-                            glyph_color,
-                        )
-                    } else {
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if is_trash {
+                            this.open_trash(cx);
+                        } else if let Some(path) = &path_opt {
+                            this.navigate_to_path(path, cx);
+                        }
+                    }))
+                    .child(if !is_trash && !is_missing && glyph_name.is_folder() {
                         resolved_icon(
                             glyph_name,
                             glyph_motion,
@@ -1153,6 +1400,8 @@ impl SidebarView {
                             &icon_prefs,
                             &icon_resolver,
                         )
+                    } else {
+                        animated_icon_sized(glyph_name, glyph_motion, size::ICON * scale, glyph_color)
                     })
             })
             .collect();
@@ -1367,60 +1616,6 @@ impl SidebarView {
             })
             .collect();
 
-        let (trash_hover, trash_press) = self.step_row_factors(SidebarKey::Trash, now, reduced);
-        let compact_trash_row = {
-            let row_bg = if trash_active {
-                theme.selection.into()
-            } else {
-                color_lerp(transparent_black(), theme.border, trash_hover)
-            };
-            let scale = if reduced {
-                1.0
-            } else {
-                lerp_f32(1.0, PRESS_SCALE, trash_press)
-            };
-            let trash_motion = if !reduced && (trash_active || trash_hover > 0.01) {
-                IconMotion::State(if trash_active { 1.0 } else { trash_hover })
-            } else {
-                IconMotion::Rest
-            };
-            div()
-                .id("compact-trash")
-                .h(size::SIDEBAR_ROW)
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(radius::CONTROL)
-                .cursor_pointer()
-                .bg(row_bg)
-                .tooltip(Tooltip::text("Trash"))
-                .on_hover(cx.listener(|this, hovered, _, cx| {
-                    this.set_hover(SidebarKey::Trash, *hovered, cx);
-                }))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.set_press(SidebarKey::Trash, true, cx);
-                        this.open_trash(cx);
-                    }),
-                )
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.set_press(SidebarKey::Trash, false, cx)),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.set_press(SidebarKey::Trash, false, cx)),
-                )
-                .child(animated_icon_sized(
-                    IconName::Trash,
-                    trash_motion,
-                    size::ICON * scale,
-                    theme.text,
-                ))
-        };
-
         let (manage_hover, manage_press) =
             self.step_row_factors(SidebarKey::ManageServers, now, reduced);
         let manage_scale = if reduced {
@@ -1433,8 +1628,10 @@ impl SidebarView {
         request_frame_if_active(animating, window);
 
         let divider = || div().h(px(1.)).mx(space::S4).bg(theme.border);
+        let compact_pin_paths = pinned_paths.clone();
 
         div()
+            .id("compact-sidebar")
             .size_full()
             .p(space::S8)
             .bg(theme.surface_raised)
@@ -1445,9 +1642,20 @@ impl SidebarView {
             .gap_1()
             .overflow_hidden()
             .children(place_rows)
-            .child(compact_trash_row)
-            .when(!bookmarks.is_empty(), |s| s.child(divider()))
-            .children(bookmark_rows)
+            .child(
+                div()
+                    .id("compact-places-pin-drop")
+                    .w_full()
+                    .h(px(6.))
+                    .rounded(radius::CONTROL)
+                    .drag_over::<DragEntries>(move |style, dragged, _, cx| {
+                        let theme = Theme::get(cx);
+                        style_drag_over_pin(style, dragged, &compact_pin_paths, &theme, true)
+                    })
+                    .on_drop(cx.listener(|this, dragged: &DragEntries, _, cx| {
+                        this.handle_pin_drop(dragged, cx);
+                    })),
+            )
             .when(!volumes.is_empty(), |s| s.child(divider()))
             .children(drive_rows)
             .when(!network.is_empty(), |s| s.child(divider()))
@@ -1514,12 +1722,10 @@ impl Render for SidebarView {
         let theme = Theme::get(cx);
         let now = Instant::now();
         let places = self.places.clone();
-        let bookmarks = self.bookmarks.clone();
         let volumes = self.volumes.clone();
         let network = self.network.clone();
-        let specials = SpecialFolders::from_system();
         let drive_details = self.drive_details;
-        let editing_bookmark = self.editing_bookmark;
+        let editing_place = self.editing_place;
         let (current_loc, trash_active, servers, reduced, icon_prefs, icon_resolver) = {
             let state = self.app_state.read(cx);
             (
@@ -1533,105 +1739,34 @@ impl Render for SidebarView {
         };
         self.sync_server_draws(&servers, now);
         let can_pin_current = !trash_active
-            && matches!(&current_loc, Location::Local(p) if !bookmarks.iter().any(|b| &b.path == p));
+            && matches!(&current_loc, Location::Local(p) if !places.iter().any(|place| place.path() == Some(p.as_path())));
 
-        let place_rows: Vec<_> = places
+        let (add_place_hover, add_place_press) =
+            self.step_row_factors(SidebarKey::AddPlace, now, reduced);
+        let add_place_scale = if reduced {
+            1.0
+        } else {
+            lerp_f32(1.0, PRESS_SCALE, add_place_press)
+        };
+
+        let pinned_paths: Vec<PathBuf> = places
+            .iter()
+            .filter_map(|p| p.path().map(Path::to_path_buf))
+            .collect();
+
+        let place_rows: Vec<AnyElement> = places
             .into_iter()
             .enumerate()
             .map(|(ix, place)| {
-                let key = SidebarKey::Place(ix);
-                let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
-                let is_active =
-                    !trash_active && matches!(&current_loc, Location::Local(p) if p == &place.path);
-                let row_bg = if is_active {
-                    theme.selection.into()
-                } else {
-                    color_lerp(transparent_black(), theme.border, hover_t)
-                };
-                let scale = if reduced {
-                    1.0
-                } else {
-                    lerp_f32(1.0, PRESS_SCALE, press_t)
-                };
-                let icon_motion =
-                    if !reduced && place.icon.is_folder() && (is_active || hover_t > 0.01) {
-                        IconMotion::State(if is_active { 1.0 } else { hover_t })
-                    } else {
-                        IconMotion::Rest
-                    };
-                let color = if place.icon.is_folder() {
-                    resolve_icon_color(place.icon.key_name(), &icon_prefs, &theme)
-                } else {
-                    theme.text.into()
-                };
-                let p_clone = place.path.clone();
+                let is_trash = place.is_trash();
+                let is_missing = place.is_missing();
+                let path_opt = place.path().map(Path::to_path_buf);
+                let path_for_drag_over = path_opt.clone();
+                let path_for_drop = path_opt.clone();
 
-                div()
-                    .id(("place-row", ix))
-                    .h(size::SIDEBAR_ROW)
-                    .px(space::S8)
-                    .rounded(radius::CONTROL)
-                    .cursor_pointer()
-                    .bg(row_bg)
-                    .text_body()
-                    .text_color(theme.text)
-                    .flex()
-                    .items_center()
-                    .gap(space::S8)
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        this.set_hover(key, *hovered, cx);
-                    }))
-                    .child(if place.icon.is_folder() {
-                        resolved_icon(
-                            place.icon,
-                            icon_motion,
-                            size::ICON * scale,
-                            color,
-                            &icon_prefs,
-                            &icon_resolver,
-                        )
-                    } else {
-                        animated_icon_sized(place.icon, icon_motion, size::ICON * scale, color)
-                    })
-                    .child(div().flex_1().ellipsize().child(place.name))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.set_press(key, true, cx);
-                            this.navigate_to_path(&p_clone, cx);
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
-                    )
-            })
-            .collect();
-
-        let (add_bm_hover, add_bm_press) =
-            self.step_row_factors(SidebarKey::AddBookmark, now, reduced);
-        let add_bm_scale = if reduced {
-            1.0
-        } else {
-            lerp_f32(1.0, PRESS_SCALE, add_bm_press)
-        };
-
-        let bookmark_rows: Vec<_> = bookmarks
-            .iter()
-            .enumerate()
-            .map(|(idx, bm)| {
-                let is_missing = bm.is_missing();
-                let is_active =
-                    !trash_active && matches!(&current_loc, Location::Local(p) if p == &bm.path);
-                let p_clone = bm.path.clone();
-
-                if editing_bookmark == Some(idx) {
+                if !is_trash && editing_place == Some(ix) {
                     return div()
-                        .id(("bookmark-edit", idx))
+                        .id(("place-edit", ix))
                         .h(size::SIDEBAR_ROW)
                         .px(space::S4)
                         .rounded(radius::CONTROL)
@@ -1646,18 +1781,24 @@ impl Render for SidebarView {
                         .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                             if ev.keystroke.key == "enter" {
                                 cx.stop_propagation();
-                                this.commit_rename_bookmark(cx);
+                                this.commit_rename_place(cx);
                             } else if ev.keystroke.key == "escape" {
                                 cx.stop_propagation();
-                                this.cancel_rename_bookmark(cx);
+                                this.cancel_rename_place(cx);
                             }
                         }))
                         .child(self.rename_input.clone())
                         .into_any_element();
                 }
 
-                let key = SidebarKey::Bookmark(idx);
+                let key = SidebarKey::Place(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
+                let is_active = if is_trash {
+                    trash_active
+                } else {
+                    !trash_active
+                        && matches!((&current_loc, &path_opt), (Location::Local(cur), Some(p)) if cur == p)
+                };
                 let row_bg = if is_active {
                     theme.selection.into()
                 } else {
@@ -1668,14 +1809,36 @@ impl Render for SidebarView {
                 } else {
                     lerp_f32(1.0, PRESS_SCALE, press_t)
                 };
-                let folder_motion = if !reduced && !is_missing && (is_active || hover_t > 0.01) {
+                let icon_motion = if !reduced
+                    && (is_trash || (place.icon.is_folder() && !is_missing))
+                    && (is_active || hover_t > 0.01)
+                {
                     IconMotion::State(if is_active { 1.0 } else { hover_t })
                 } else {
                     IconMotion::Rest
                 };
+                let color = if is_trash {
+                    theme.text.into()
+                } else if is_missing {
+                    theme.danger.into()
+                } else if place.icon.is_folder() {
+                    resolve_icon_color(place.icon.key_name(), &icon_prefs, &theme)
+                } else {
+                    theme.text.into()
+                };
+                let drag_payload = DragSidebarPlace {
+                    index: ix,
+                    name: place.name.clone(),
+                    icon: place.icon,
+                    is_trash,
+                    is_missing,
+                };
+                let drag_prefs = icon_prefs.clone();
+                let drag_resolver = icon_resolver.clone();
 
                 div()
-                    .id(("bookmark-row", idx))
+                    .id(("place-row", ix))
+                    .debug_selector(move || format!("place-row-{ix}"))
                     .h(size::SIDEBAR_ROW)
                     .px(space::S8)
                     .rounded(radius::CONTROL)
@@ -1689,6 +1852,53 @@ impl Render for SidebarView {
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
                         this.set_hover(key, *hovered, cx);
                     }))
+                    .on_drag(drag_payload, move |dragged, _, _, cx| {
+                        cx.new(|_| DragPlacePreview {
+                            name: dragged.name.clone(),
+                            icon: dragged.icon,
+                            is_trash: dragged.is_trash,
+                            is_missing: dragged.is_missing,
+                            icon_prefs: drag_prefs.clone(),
+                            icon_resolver: drag_resolver.clone(),
+                        })
+                    })
+                    .drag_over::<DragSidebarPlace>(move |style, dragged, _, cx| {
+                        if dragged.index == ix {
+                            return style;
+                        }
+                        let theme = Theme::get(cx);
+                        let style = style.bg(theme.surface).border_color(theme.accent);
+                        if dragged.index < ix {
+                            style.border_b_2()
+                        } else {
+                            style.border_t_2()
+                        }
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DragSidebarPlace, _, cx| {
+                        if dragged.index != ix {
+                            let _ = this.reorder_place_in_state(dragged.index, ix, cx);
+                        }
+                    }))
+                    .drag_over::<DragEntries>(move |style, dragged, _, cx| {
+                        let theme = Theme::get(cx);
+                        style_drag_over_place_entry(
+                            style,
+                            dragged,
+                            is_trash,
+                            is_missing,
+                            path_for_drag_over.as_deref(),
+                            &theme,
+                        )
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DragEntries, _, cx| {
+                        this.handle_place_entries_drop(
+                            dragged,
+                            is_trash,
+                            is_missing,
+                            path_for_drop.as_deref(),
+                            cx,
+                        );
+                    }))
                     .child(
                         div()
                             .flex()
@@ -1696,76 +1906,64 @@ impl Render for SidebarView {
                             .min_w_0()
                             .items_center()
                             .gap(space::S8)
-                            .child(if is_missing {
+                            .child(if is_trash {
+                                animated_icon_sized(
+                                    IconName::Trash,
+                                    icon_motion,
+                                    size::ICON * scale,
+                                    color,
+                                )
+                            } else if is_missing {
                                 animated_icon_sized(
                                     IconName::Alert,
                                     IconMotion::Rest,
                                     size::ICON * scale,
-                                    theme.danger,
+                                    color,
                                 )
-                            } else {
-                                let glyph = icon_for_with(&bm.path, true, &specials);
+                            } else if place.icon.is_folder() {
                                 resolved_icon(
-                                    glyph,
-                                    folder_motion,
+                                    place.icon,
+                                    icon_motion,
                                     size::ICON * scale,
-                                    resolve_icon_color(glyph.key_name(), &icon_prefs, &theme),
+                                    color,
                                     &icon_prefs,
                                     &icon_resolver,
+                                )
+                            } else {
+                                animated_icon_sized(
+                                    place.icon,
+                                    icon_motion,
+                                    size::ICON * scale,
+                                    color,
                                 )
                             })
                             .child(
                                 div()
                                     .flex_1()
                                     .ellipsize()
-                                    .text_color(if is_missing { theme.danger } else { theme.text })
-                                    .child(bm.name.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(space::S2)
-                            .child(
-                                div()
-                                    .id(("bookmark-rename", idx))
-                                    .px(space::S4)
-                                    .rounded(radius::CONTROL)
-                                    .hover(|s| s.bg(theme.surface_raised))
-                                    .text_label()
-                                    .text_color(theme.text_muted)
-                                    .tooltip(Tooltip::text("Renomear favorito"))
-                                    .child("Aa")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.begin_rename_bookmark(idx, window, cx);
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id(("bookmark-remove", idx))
-                                    .rounded(radius::CONTROL)
-                                    .hover(|s| s.bg(theme.surface_raised))
-                                    .tooltip(Tooltip::text("Remover favorito"))
-                                    .child(icon(IconName::Close).text_color(theme.text_muted))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            let _ = this.remove_bookmark_in_state(idx, cx);
-                                        }),
-                                    ),
+                                    .text_color(if is_missing {
+                                        theme.danger
+                                    } else {
+                                        theme.text
+                                    })
+                                    .child(place.name),
                             ),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
                             this.set_press(key, true, cx);
-                            this.navigate_to_path(&p_clone, cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |_, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(SidebarViewEvent::OpenPlaceContextMenu {
+                                index: ix,
+                                is_trash,
+                                position: event.position,
+                            });
                         }),
                     )
                     .on_mouse_up(
@@ -1776,6 +1974,13 @@ impl Render for SidebarView {
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
                     )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if is_trash {
+                            this.open_trash(cx);
+                        } else if let Some(path) = &path_opt {
+                            this.navigate_to_path(path, cx);
+                        }
+                    }))
                     .into_any_element()
             })
             .collect();
@@ -2128,65 +2333,11 @@ impl Render for SidebarView {
             })
             .collect();
 
-        let (trash_hover, trash_press) = self.step_row_factors(SidebarKey::Trash, now, reduced);
-        let trash_row = {
-            let row_bg = if trash_active {
-                theme.selection.into()
-            } else {
-                color_lerp(transparent_black(), theme.border, trash_hover)
-            };
-            let scale = if reduced {
-                1.0
-            } else {
-                lerp_f32(1.0, PRESS_SCALE, trash_press)
-            };
-            let trash_motion = if !reduced && (trash_active || trash_hover > 0.01) {
-                IconMotion::State(if trash_active { 1.0 } else { trash_hover })
-            } else {
-                IconMotion::Rest
-            };
-            div()
-                .id("sidebar-trash")
-                .h(size::SIDEBAR_ROW)
-                .px(space::S8)
-                .rounded(radius::CONTROL)
-                .cursor_pointer()
-                .bg(row_bg)
-                .text_body()
-                .text_color(theme.text)
-                .flex()
-                .items_center()
-                .gap(space::S8)
-                .on_hover(cx.listener(|this, hovered, _, cx| {
-                    this.set_hover(SidebarKey::Trash, *hovered, cx);
-                }))
-                .child(animated_icon_sized(
-                    IconName::Trash,
-                    trash_motion,
-                    size::ICON * scale,
-                    theme.text,
-                ))
-                .child(div().flex_1().ellipsize().child("Trash"))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.set_press(SidebarKey::Trash, true, cx);
-                        this.open_trash(cx);
-                    }),
-                )
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.set_press(SidebarKey::Trash, false, cx)),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.set_press(SidebarKey::Trash, false, cx)),
-                )
-        };
-
         let animating = self.motion.has_active(now, reduced);
         self.motion.prune_settled(now, reduced);
         request_frame_if_active(animating, window);
+        let header_pin_paths = pinned_paths.clone();
+        let footer_pin_paths = pinned_paths;
 
         div()
             .size_full()
@@ -2201,106 +2352,105 @@ impl Render for SidebarView {
             // --- PLACES SECTION ---
             .child(
                 div()
+                    .id("sidebar-places-section")
                     .flex()
                     .flex_col()
                     .gap_1()
+                    .on_drop(cx.listener(|this, dragged: &DragEntries, _, cx| {
+                        this.handle_pin_drop(dragged, cx);
+                    }))
                     .child(
                         div()
+                            .id("sidebar-places-header")
+                            .debug_selector(|| "sidebar-places-header".into())
                             .px(space::S8)
                             .py(space::S4)
-                            .text_label()
-                            .text_color(theme.text_muted)
-                            .child("Places"),
+                            .rounded(radius::CONTROL)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .drag_over::<DragEntries>(move |style, dragged, _, cx| {
+                                let theme = Theme::get(cx);
+                                style_drag_over_pin(
+                                    style,
+                                    dragged,
+                                    &header_pin_paths,
+                                    &theme,
+                                    false,
+                                )
+                            })
+                            .on_drop(cx.listener(|this, dragged: &DragEntries, _, cx| {
+                                this.handle_pin_drop(dragged, cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_label()
+                                    .text_color(theme.text_muted)
+                                    .child("Places"),
+                            )
+                            .when(can_pin_current, |hdr| {
+                                hdr.child(
+                                    div()
+                                        .id("sidebar-add-place")
+                                        .debug_selector(|| "sidebar-add-place".into())
+                                        .p(space::S2)
+                                        .rounded(radius::CONTROL)
+                                        .cursor_pointer()
+                                        .bg(color_lerp(
+                                            transparent_black(),
+                                            theme.border,
+                                            add_place_hover,
+                                        ))
+                                        .tooltip(Tooltip::text("Adicionar pasta atual aos locais"))
+                                        .on_hover(cx.listener(|this, hovered, _, cx| {
+                                            this.set_hover(SidebarKey::AddPlace, *hovered, cx);
+                                        }))
+                                        .child(animated_icon_sized(
+                                            IconName::Plus,
+                                            IconMotion::Rest,
+                                            size::ICON * add_place_scale,
+                                            theme.text_muted,
+                                        ))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.set_press(SidebarKey::AddPlace, true, cx);
+                                                let _ = this.pin_current_location(cx);
+                                            }),
+                                        )
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_press(SidebarKey::AddPlace, false, cx);
+                                            }),
+                                        )
+                                        .on_mouse_up_out(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_press(SidebarKey::AddPlace, false, cx);
+                                            }),
+                                        ),
+                                )
+                            }),
                     )
                     .children(place_rows)
-                    .child(trash_row),
+                    .child(
+                        div()
+                            .id("sidebar-places-pin-drop")
+                            .debug_selector(|| "sidebar-places-pin-drop".into())
+                            .w_full()
+                            .h(px(6.))
+                            .rounded(radius::CONTROL)
+                            .drag_over::<DragEntries>(move |style, dragged, _, cx| {
+                                let theme = Theme::get(cx);
+                                style_drag_over_pin(style, dragged, &footer_pin_paths, &theme, true)
+                            })
+                            .on_drop(cx.listener(|this, dragged: &DragEntries, _, cx| {
+                                this.handle_pin_drop(dragged, cx);
+                            })),
+                    ),
             )
-            // --- BOOKMARKS SECTION ---
-            .when(!bookmarks.is_empty() || can_pin_current, |parent| {
-                parent.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .px(space::S8)
-                                .py(space::S4)
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_label()
-                                        .text_color(theme.text_muted)
-                                        .child("Bookmarks"),
-                                )
-                                .when(can_pin_current, |hdr| {
-                                    hdr.child(
-                                        div()
-                                            .id("sidebar-add-bookmark")
-                                            .p(space::S2)
-                                            .rounded(radius::CONTROL)
-                                            .cursor_pointer()
-                                            .bg(color_lerp(
-                                                transparent_black(),
-                                                theme.border,
-                                                add_bm_hover,
-                                            ))
-                                            .tooltip(Tooltip::text(
-                                                "Adicionar pasta atual aos favoritos",
-                                            ))
-                                            .on_hover(cx.listener(|this, hovered, _, cx| {
-                                                this.set_hover(
-                                                    SidebarKey::AddBookmark,
-                                                    *hovered,
-                                                    cx,
-                                                );
-                                            }))
-                                            .child(animated_icon_sized(
-                                                IconName::Plus,
-                                                IconMotion::Rest,
-                                                size::ICON * add_bm_scale,
-                                                theme.text_muted,
-                                            ))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.set_press(
-                                                        SidebarKey::AddBookmark,
-                                                        true,
-                                                        cx,
-                                                    );
-                                                    let _ = this.pin_current_location(cx);
-                                                }),
-                                            )
-                                            .on_mouse_up(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.set_press(
-                                                        SidebarKey::AddBookmark,
-                                                        false,
-                                                        cx,
-                                                    );
-                                                }),
-                                            )
-                                            .on_mouse_up_out(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.set_press(
-                                                        SidebarKey::AddBookmark,
-                                                        false,
-                                                        cx,
-                                                    );
-                                                }),
-                                            ),
-                                    )
-                                }),
-                        )
-                        .children(bookmark_rows),
-                )
-            })
             // --- SERVERS SECTION ---
             .child(
                 div()

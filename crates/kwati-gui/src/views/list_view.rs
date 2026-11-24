@@ -5,15 +5,16 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    div, font, point, prelude::*, px, transparent_black, uniform_list, Context, CursorStyle, Div,
-    Entity, EventEmitter, FocusHandle, Focusable, Font, Hsla, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString,
-    Stateful, TextRun, UniformListScrollHandle, Window,
+    div, font, point, prelude::*, px, transparent_black, uniform_list, ClickEvent, Context,
+    CursorStyle, Div, Entity, EventEmitter, FocusHandle, Focusable, Font, Hsla, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy,
+    SharedString, Stateful, TextRun, UniformListScrollHandle, Window,
 };
 use kwati_core::{
     Entry, IconPreferences, IconResolver, Location, ResolvedIcon, SortColumn, SortDirection,
@@ -425,6 +426,9 @@ impl ListView {
             } else if event.modifiers.secondary() {
                 state.toggle_select_location(location);
                 cx.notify();
+            } else if state.selection.len() > 1 && state.selection.contains(&location) {
+                // Keep multi-selection intact on press so dragging moves all selected items;
+                // a plain click without drag collapses it on mouse release.
             } else if state.selection.len() != 1 || !state.selection.contains(&location) {
                 state.selection.select_only(location);
                 cx.notify();
@@ -1100,6 +1104,87 @@ struct ItemVisuals {
     text_col: Hsla,
 }
 
+/// A single entry carried inside a file-list drag operation.
+#[derive(Clone, Debug)]
+pub struct DraggedEntry {
+    pub location: Location,
+    pub is_dir: bool,
+    pub name: String,
+    pub icon: IconName,
+}
+
+/// Drag payload produced when dragging one or more entries from [`ListView`].
+#[derive(Clone, Debug)]
+pub struct DragEntries {
+    pub items: Vec<DraggedEntry>,
+}
+
+impl DragEntries {
+    /// Returns the path and name if this drag carries a single local directory.
+    pub fn single_local_folder(&self) -> Option<(&Path, &str)> {
+        let [item] = self.items.as_slice() else {
+            return None;
+        };
+        if !item.is_dir {
+            return None;
+        }
+        match &item.location {
+            Location::Local(path) => Some((path.as_path(), item.name.as_str())),
+            Location::Remote { .. } => None,
+        }
+    }
+
+    pub fn locations(&self) -> Vec<Location> {
+        self.items.iter().map(|i| i.location.clone()).collect()
+    }
+}
+
+struct DragEntriesPreview {
+    label: String,
+    icon: IconName,
+    icon_prefs: IconPreferences,
+    icon_resolver: Arc<IconResolver>,
+}
+
+impl Render for DragEntriesPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
+        let color = if self.icon.is_folder() {
+            resolve_icon_color(self.icon.key_name(), &self.icon_prefs, &theme)
+        } else {
+            theme.text.into()
+        };
+        let resolved = self.icon_resolver.resolve(
+            &self.icon_prefs,
+            self.icon.key_name(),
+            (size::ICON / px(1.0)).round().max(1.0) as u16,
+        );
+
+        div()
+            .h(size::ROW)
+            .px(space::S8)
+            .rounded(radius::CONTROL)
+            .bg(theme.surface_raised)
+            .border_1()
+            .border_color(theme.accent)
+            .shadow_sm()
+            .opacity(0.92)
+            .flex()
+            .items_center()
+            .gap(space::S8)
+            .text_body()
+            .text_color(theme.text)
+            .child(render_resolved_icon(
+                &resolved,
+                self.icon,
+                IconMotion::Rest,
+                size::ICON,
+                color,
+            ))
+            .child(self.label.clone())
+    }
+}
+
 impl ListView {
     fn cached_entry_icon(&mut self, ix: usize, entry: &Entry, is_remote: bool) -> IconName {
         if self.entry_icon_cache.len() <= ix {
@@ -1446,14 +1531,61 @@ impl ListView {
         }
     }
 
+    fn drag_entries_for(
+        &self,
+        entry: &Entry,
+        loc: &Location,
+        glyph: IconName,
+        cx: &Context<Self>,
+    ) -> DragEntries {
+        let state = self.app_state.read(cx);
+        if state.selection.len() > 1 && state.selection.contains(loc) {
+            let items = state
+                .selection
+                .selected_in_order(&state.entries)
+                .into_iter()
+                .map(|e| DraggedEntry {
+                    location: state.location_of(e),
+                    is_dir: e.is_dir(),
+                    name: e.display_name().to_string(),
+                    icon: if e.is_dir() {
+                        IconName::Folder
+                    } else {
+                        IconName::File
+                    },
+                })
+                .collect();
+            DragEntries { items }
+        } else {
+            DragEntries {
+                items: vec![DraggedEntry {
+                    location: loc.clone(),
+                    is_dir: entry.is_dir(),
+                    name: entry.display_name().to_string(),
+                    icon: glyph,
+                }],
+            }
+        }
+    }
+
     fn attach_entry_interactions(
+        &self,
         el: Stateful<Div>,
         ix: usize,
         loc: Location,
+        drag_entries: DragEntries,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let loc_hover = loc.clone();
-        let loc_press = loc;
+        let loc_press = loc.clone();
+        let loc_click = loc;
+        let (icon_prefs, icon_resolver) = {
+            let state = self.app_state.read(cx);
+            (
+                state.icon_config.active.clone(),
+                state.icon_resolver.clone(),
+            )
+        };
 
         el.on_hover(cx.listener(move |this, hovered, _, cx| {
             if *hovered {
@@ -1465,6 +1597,24 @@ impl ListView {
                 cx.notify();
             }
         }))
+        .on_drag(drag_entries, move |dragged, _, _, cx| {
+            let label = match dragged.items.as_slice() {
+                [only] => only.name.clone(),
+                [first, ..] => format!("{} (+{})", first.name, dragged.items.len() - 1),
+                [] => String::new(),
+            };
+            let icon = dragged
+                .items
+                .first()
+                .map(|i| i.icon)
+                .unwrap_or(IconName::File);
+            cx.new(|_| DragEntriesPreview {
+                label,
+                icon,
+                icon_prefs: icon_prefs.clone(),
+                icon_resolver: icon_resolver.clone(),
+            })
+        })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -1472,6 +1622,18 @@ impl ListView {
                 this.on_entry_click_at(ix, event, window, cx);
             }),
         )
+        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            if let ClickEvent::Mouse(mouse) = event {
+                if !mouse.down.modifiers.shift && !mouse.down.modifiers.secondary() {
+                    this.app_state.update(cx, |state, cx| {
+                        if state.selection.len() > 1 && state.selection.contains(&loc_click) {
+                            state.selection.select_only(loc_click.clone());
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+        }))
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
@@ -1510,6 +1672,7 @@ impl ListView {
         fonts: &Fonts,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let drag_entries = self.drag_entries_for(entry, &loc, vis.glyph, cx);
         let (name, size_str, date_str) = self.cached_row_text(ix, entry);
         let secondary_col: Hsla = if is_selected {
             theme.text.into()
@@ -1538,7 +1701,7 @@ impl ListView {
             .text_body()
             .text_color(vis.text_col);
 
-        Self::attach_entry_interactions(base, ix, loc, cx)
+        self.attach_entry_interactions(base, ix, loc, drag_entries, cx)
             .child(
                 div()
                     .flex_1()
@@ -1583,6 +1746,7 @@ impl ListView {
         vis: ItemVisuals,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let drag_entries = self.drag_entries_for(entry, &loc, vis.glyph, cx);
         let (name, _, _) = self.cached_row_text(ix, entry);
         let base = div()
             .id(ix)
@@ -1605,7 +1769,7 @@ impl ListView {
             .text_body()
             .text_color(vis.text_col);
 
-        Self::attach_entry_interactions(base, ix, loc, cx)
+        self.attach_entry_interactions(base, ix, loc, drag_entries, cx)
             .child(render_resolved_icon(
                 &vis.resolved_icon,
                 vis.glyph,
@@ -1628,6 +1792,7 @@ impl ListView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let drag_entries = self.drag_entries_for(entry, &loc, vis.glyph, cx);
         let (name, _, _) = self.cached_row_text(ix, entry);
         let (line1, line2) = self.cached_grid_label(ix, &name, font(fonts.sans.clone()), window);
         let base = div()
@@ -1654,7 +1819,7 @@ impl ListView {
             .text_body()
             .text_color(vis.text_col);
 
-        Self::attach_entry_interactions(base, ix, loc, cx)
+        self.attach_entry_interactions(base, ix, loc, drag_entries, cx)
             .child(
                 div()
                     .size(GRID_ICON_SIZE)

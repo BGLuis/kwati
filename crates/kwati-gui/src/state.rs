@@ -10,9 +10,9 @@ use futures::StreamExt;
 use gpui::{AsyncApp, Context, Task, WeakEntity};
 use kwati_core::{
     default_icons_path, list_trash, settings_path, sort_entries_by, volume_kind, Backend,
-    BackendError, Bookmark, ConnectionProfile, ConnectionState, DirWatcher, Entry, History,
-    HostKeyUnknown, IconColor, IconConfig, IconGroup, IconResolver, IconSource, ListOptions,
-    LocalBackend, Location, ReconnectingBackend, RemoteEditWatcher, RemoteFileCache,
+    BackendError, ConnectionProfile, ConnectionState, DirWatcher, Entry, History, HostKeyUnknown,
+    IconColor, IconConfig, IconGroup, IconResolver, IconSource, ListOptions, LocalBackend,
+    Location, PlaceEntry, ReconnectingBackend, RemoteEditWatcher, RemoteFileCache,
     RemoteStreamServer, Selection, Settings, SettingsWarning, SortColumn, SortDirection, SortOrder,
     TrashItem, ViewMode, VolumeKind,
 };
@@ -675,50 +675,56 @@ impl AppState {
         })
     }
 
-    pub fn add_bookmark(&mut self, name: impl Into<String>, path: PathBuf) -> Result<(), String> {
+    pub fn places(&self) -> Vec<PlaceEntry> {
+        self.settings.resolved_places()
+    }
+
+    pub fn is_place_pinned(&self, path: &Path) -> bool {
+        self.places()
+            .iter()
+            .any(|entry| entry.path().is_some_and(|p| p == path))
+    }
+
+    pub fn add_place(&mut self, name: impl Into<String>, path: PathBuf) -> Result<(), String> {
         let name = name.into();
         if name.trim().is_empty() {
-            return Err("Bookmark name cannot be empty.".into());
+            return Err("Place name cannot be empty.".into());
         }
         self.update_settings(|s| {
-            s.add_bookmark(Bookmark { name, path });
+            s.add_place(name, path);
             Ok(())
         })
     }
 
-    pub fn rename_bookmark(&mut self, index: usize, name: impl Into<String>) -> Result<(), String> {
+    pub fn rename_place(&mut self, index: usize, name: impl Into<String>) -> Result<(), String> {
         let name = name.into();
         if name.trim().is_empty() {
-            return Err("Bookmark name cannot be empty.".into());
+            return Err("Place name cannot be empty.".into());
         }
         self.update_settings(|s| {
-            if s.rename_bookmark(index, name) {
+            if s.rename_place(index, name) {
                 Ok(())
             } else {
-                Err("Bookmark index out of range.".into())
+                Err("Place cannot be renamed.".into())
             }
         })
     }
 
-    pub fn remove_bookmark(&mut self, index: usize) -> Result<Bookmark, String> {
+    pub fn remove_place(&mut self, index: usize) -> Result<PlaceEntry, String> {
         let mut removed = None;
         self.update_settings(|s| {
-            removed = s.remove_bookmark(index);
-            if removed.is_some() {
-                Ok(())
-            } else {
-                Err("Bookmark index out of range.".into())
-            }
+            removed = Some(s.remove_place(index).map_err(str::to_string)?);
+            Ok(())
         })?;
         Ok(removed.expect("checked above"))
     }
 
-    pub fn reorder_bookmarks(&mut self, from: usize, to: usize) -> Result<(), String> {
+    pub fn reorder_places(&mut self, from: usize, to: usize) -> Result<(), String> {
         self.update_settings(|s| {
-            if s.reorder_bookmarks(from, to) {
+            if s.reorder_places(from, to) {
                 Ok(())
             } else {
-                Err("Bookmark index out of range.".into())
+                Err("Place index out of range.".into())
             }
         })
     }

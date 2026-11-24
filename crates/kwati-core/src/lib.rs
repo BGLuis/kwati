@@ -41,8 +41,8 @@ pub use icons::{
 };
 pub use move_entry::{move_entry, move_entry_with};
 pub use places::{
-    list_places, resolve_bookmarks, standard_places, standard_places_from, Bookmark, Place,
-    PlaceKind, ResolvedBookmark, SidebarPlaces,
+    default_place_entries, ensure_trash_present, list_places, resolve_bookmarks, standard_places,
+    standard_places_from, Bookmark, Place, PlaceEntry, PlaceKind, ResolvedBookmark, SidebarPlaces,
 };
 pub use prefetch::{
     PrefetchReader, RangeSource, ReadSeekRangeSource, DEFAULT_PREFETCH_BLOCK_SIZE,

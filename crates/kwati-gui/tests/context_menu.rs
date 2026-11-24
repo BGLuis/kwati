@@ -266,19 +266,20 @@ fn bookmark_folder_adds_it_to_the_sidebar_and_it_survives_a_restart(cx: &mut Tes
     cx.run_until_parked();
 
     let sub = root.join("sub");
-    let sidebar_paths = main.read_with(cx, |main, cx| {
+    let has_sub = main.read_with(cx, |main, cx| {
         main.sidebar
             .read(cx)
-            .bookmarks
+            .places
             .iter()
-            .map(|b| (b.name.clone(), b.path.clone()))
-            .collect::<Vec<_>>()
+            .any(|p| p.name == "sub" && p.path() == Some(sub.as_path()))
     });
-    assert_eq!(sidebar_paths, [("sub".to_string(), sub.clone())]);
+    assert!(has_sub);
 
     let (disk, _) = kwati_core::Settings::load_from(&settings_file).unwrap();
-    assert_eq!(disk.bookmarks.len(), 1);
-    assert_eq!(disk.bookmarks[0].path, sub);
+    assert!(disk
+        .resolved_places()
+        .iter()
+        .any(|p| p.path() == Some(sub.as_path())));
 
     // The same folder is offered again only as a disabled item.
     right_click(cx, folder);

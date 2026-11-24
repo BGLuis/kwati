@@ -510,33 +510,39 @@ fn test_sidebar_standard_places_discovery() {
 
 #[test]
 fn test_sidebar_bookmarks_add_remove_reorder_and_missing_target() {
-    use kwati_gui::views::sidebar_view::UserBookmark;
+    use kwati_gui::components::IconName;
+    use kwati_gui::views::sidebar_view::SidebarPlace;
     use std::path::PathBuf;
 
     let existing_dir = std::env::temp_dir();
     let missing_dir = PathBuf::from("/non/existent/path/for/kwati/test/bookmark/12345");
 
-    let bm_valid = UserBookmark::new("Temp Folder", existing_dir);
-    let bm_missing = UserBookmark::new("Old Missing Drive", missing_dir);
+    let place_valid = SidebarPlace::new("Temp Folder", existing_dir, IconName::Folder);
+    let place_missing = SidebarPlace::new("Old Missing Drive", missing_dir, IconName::Folder);
+    let trash = SidebarPlace::trash();
 
-    // Missing target detection
-    assert!(!bm_valid.is_missing());
-    assert!(bm_missing.is_missing());
+    // Missing target detection & removability
+    assert!(!place_valid.is_missing());
+    assert!(place_missing.is_missing());
+    assert!(!trash.is_missing());
+    assert!(place_valid.is_removable());
+    assert!(!trash.is_removable());
 
-    // Bookmarks list operations
-    let mut bookmarks = vec![bm_valid.clone(), bm_missing.clone()];
-    assert_eq!(bookmarks.len(), 2);
+    // Unified places list operations
+    let mut places = vec![place_valid.clone(), place_missing.clone(), trash.clone()];
+    assert_eq!(places.len(), 3);
 
-    // Reorder: move index 1 to 0
-    let item = bookmarks.remove(1);
-    bookmarks.insert(0, item);
-    assert_eq!(bookmarks[0].name, "Old Missing Drive");
-    assert_eq!(bookmarks[1].name, "Temp Folder");
+    // Reorder: move Trash from index 2 to 0
+    let item = places.remove(2);
+    places.insert(0, item);
+    assert!(places[0].is_trash());
+    assert_eq!(places[1].name, "Temp Folder");
+    assert_eq!(places[2].name, "Old Missing Drive");
 
-    // Remove
-    let removed = bookmarks.remove(0);
+    // Remove folder
+    let removed = places.remove(2);
     assert_eq!(removed.name, "Old Missing Drive");
-    assert_eq!(bookmarks.len(), 1);
+    assert_eq!(places.len(), 2);
 }
 
 #[test]
