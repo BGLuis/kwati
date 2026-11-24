@@ -1,4 +1,6 @@
-use crate::{Backend, BackendError, Confirmed, EntryMeta, Listing, Location};
+use crate::{
+    Backend, BackendError, Confirmed, EntryMeta, Listing, Location, RangeSource, ReadSeek,
+};
 use std::io;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -164,6 +166,21 @@ impl Backend for ReconnectingBackend {
 
     fn open_read(&self, location: &Location) -> Result<Box<dyn io::Read + Send>, BackendError> {
         self.read(|b| b.open_read(location))
+    }
+
+    fn open_read_seek(&self, location: &Location) -> Result<Box<dyn ReadSeek>, BackendError> {
+        self.read(|b| b.open_read_seek(location))
+    }
+
+    fn open_range_source(&self, location: &Location) -> Result<Box<dyn RangeSource>, BackendError> {
+        self.read(|b| b.open_range_source(location))
+    }
+
+    fn stat_modified(
+        &self,
+        location: &Location,
+    ) -> Result<Option<std::time::SystemTime>, BackendError> {
+        self.read(|b| b.stat_modified(location))
     }
 
     fn open_write(&self, location: &Location) -> Result<Box<dyn io::Write + Send>, BackendError> {

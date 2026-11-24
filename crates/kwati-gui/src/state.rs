@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc;
@@ -12,10 +12,14 @@ use kwati_core::{
     default_icons_path, list_trash, settings_path, sort_entries_by, volume_kind, Backend,
     BackendError, Bookmark, ConnectionProfile, ConnectionState, DirWatcher, Entry, History,
     HostKeyUnknown, IconColor, IconConfig, IconGroup, IconResolver, IconSource, ListOptions,
-    LocalBackend, Location, ReconnectingBackend, Selection, Settings, SettingsWarning, SortColumn,
-    SortDirection, SortOrder, TrashItem, ViewMode, VolumeKind,
+    LocalBackend, Location, ReconnectingBackend, RemoteEditWatcher, RemoteFileCache,
+    RemoteStreamServer, Selection, Settings, SettingsWarning, SortColumn, SortDirection, SortOrder,
+    TrashItem, ViewMode, VolumeKind,
 };
 
+use crate::actions::remote_files::{
+    default_remote_opener, sync_remote_edit, RemoteExternalOpener, StreamLauncherResolver,
+};
 use crate::layout::PanelLayout;
 use crate::motion::{set_active_motion_preference, JOB_COMPLETE_HOLD, QUICK};
 use crate::remote::{start_location, RemoteSessions};
@@ -66,6 +70,7 @@ pub enum JobKind {
     Move,
     Delete,
     Trash,
+    Open,
 }
 
 /// Completed background job kept briefly for the `secondary` completion pulse and 1s fade.
@@ -289,6 +294,16 @@ pub struct AppState {
     pub view_mode: ViewMode,
     pub panels: PanelLayout,
     pub dir_watcher: Option<DirWatcher>,
+    pub remote_cache: Arc<RemoteFileCache>,
+    remote_stream_server: Arc<OnceLock<Result<RemoteStreamServer, String>>>,
+    remote_edit_watchers: HashMap<Location, RemoteEditWatcher>,
+    remote_edit_tx: mpsc::UnboundedSender<Location>,
+    remote_edit_rx: Option<mpsc::UnboundedReceiver<Location>>,
+    remote_edit_debounce: Duration,
+    uploading_remote_edits: HashSet<Location>,
+    pending_remote_edit_resync: HashSet<Location>,
+    remote_opener: Option<RemoteExternalOpener>,
+    stream_launcher_override: Option<StreamLauncherResolver>,
     settings_path: Option<PathBuf>,
     icons_path: Option<PathBuf>,
     foreground: Option<Foreground>,
@@ -302,6 +317,7 @@ pub struct AppState {
     load_task: Option<Task<()>>,
     trash_task: Option<Task<()>>,
     watch_task: Option<Task<()>>,
+    remote_edit_task: Option<Task<()>>,
 }
 
 impl AppState {
@@ -310,6 +326,7 @@ impl AppState {
         let settings = Settings::default();
         let view_mode = settings.view_mode;
         set_active_motion_preference(settings.motion_preference);
+        let (remote_edit_tx, remote_edit_rx) = mpsc::unbounded();
         Self {
             history: History::with_initial(initial_location.clone()),
             current_location: initial_location,
@@ -353,6 +370,16 @@ impl AppState {
             view_mode,
             panels: PanelLayout::default(),
             dir_watcher: None,
+            remote_cache: Arc::new(RemoteFileCache::new()),
+            remote_stream_server: Arc::new(OnceLock::new()),
+            remote_edit_watchers: HashMap::new(),
+            remote_edit_tx,
+            remote_edit_rx: Some(remote_edit_rx),
+            remote_edit_debounce: Duration::from_millis(500),
+            uploading_remote_edits: HashSet::new(),
+            pending_remote_edit_resync: HashSet::new(),
+            remote_opener: None,
+            stream_launcher_override: None,
             settings_path: None,
             icons_path: None,
             foreground: None,
@@ -363,6 +390,7 @@ impl AppState {
             load_task: None,
             trash_task: None,
             watch_task: None,
+            remote_edit_task: None,
         }
     }
 
@@ -715,6 +743,83 @@ impl AppState {
             cx: cx.to_async(),
             this: cx.weak_entity(),
         });
+        if let Some(mut rx) = self.remote_edit_rx.take() {
+            let this = cx.weak_entity();
+            self.remote_edit_task = Some(cx.spawn(async move |_, cx| {
+                while let Some(location) = rx.next().await {
+                    let updated = this.update(cx, |state, cx| {
+                        sync_remote_edit(state, location);
+                        cx.notify();
+                    });
+                    if updated.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
+    pub(crate) fn stream_server_cell(&self) -> Arc<OnceLock<Result<RemoteStreamServer, String>>> {
+        Arc::clone(&self.remote_stream_server)
+    }
+
+    pub(crate) fn remote_opener(&self) -> RemoteExternalOpener {
+        self.remote_opener
+            .clone()
+            .unwrap_or_else(|| Arc::new(default_remote_opener))
+    }
+
+    pub(crate) fn stream_launcher_override(&self) -> Option<StreamLauncherResolver> {
+        self.stream_launcher_override.clone()
+    }
+
+    pub(crate) fn remote_edit_sender(&self) -> mpsc::UnboundedSender<Location> {
+        self.remote_edit_tx.clone()
+    }
+
+    pub(crate) fn remote_edit_debounce(&self) -> Duration {
+        self.remote_edit_debounce
+    }
+
+    pub(crate) fn has_remote_edit_watcher(&self, location: &Location) -> bool {
+        self.remote_edit_watchers.contains_key(location)
+    }
+
+    pub(crate) fn insert_remote_edit_watcher(
+        &mut self,
+        location: Location,
+        watcher: RemoteEditWatcher,
+    ) {
+        self.remote_edit_watchers.insert(location, watcher);
+    }
+
+    pub(crate) fn begin_remote_edit_upload(&mut self, location: &Location) -> bool {
+        if self.uploading_remote_edits.contains(location) {
+            self.pending_remote_edit_resync.insert(location.clone());
+            return false;
+        }
+        self.uploading_remote_edits.insert(location.clone());
+        true
+    }
+
+    pub(crate) fn finish_remote_edit_upload(&mut self, location: &Location) -> bool {
+        self.uploading_remote_edits.remove(location);
+        self.pending_remote_edit_resync.remove(location)
+    }
+
+    #[doc(hidden)]
+    pub fn set_remote_opener_for_test(&mut self, opener: RemoteExternalOpener) {
+        self.remote_opener = Some(opener);
+    }
+
+    #[doc(hidden)]
+    pub fn set_stream_launcher_for_test(&mut self, resolver: StreamLauncherResolver) {
+        self.stream_launcher_override = Some(resolver);
+    }
+
+    #[doc(hidden)]
+    pub fn set_remote_edit_debounce_for_test(&mut self, debounce: Duration) {
+        self.remote_edit_debounce = debounce;
     }
 
     /// Returns a reference to the first currently selected entry, if any.
@@ -1639,6 +1744,9 @@ impl AppState {
     /// Closes the active session for `profile_id`.
     pub fn disconnect_profile(&mut self, profile_id: &str) {
         self.remote.disconnect(profile_id);
+        if let Some(Ok(server)) = self.remote_stream_server.get() {
+            server.unregister_profile(profile_id);
+        }
         if self.connecting.as_deref() == Some(profile_id) {
             self.connect_generation = self.connect_generation.wrapping_add(1);
             self.connecting = None;

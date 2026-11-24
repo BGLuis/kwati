@@ -823,23 +823,28 @@ impl ListView {
         cx.notify();
     }
 
-    /// Enters a folder, or opens a local file with the system's default application. Remote
-    /// files cannot be opened yet, so they get a notice instead.
+    /// Enters a folder, opens a local file with the system's default application, or opens
+    /// a remote file (streaming seekable media or caching + auto-syncing edits).
     fn open_entry(&mut self, entry: Entry, cx: &mut Context<Self>) {
-        let is_remote = self.app_state.read(cx).is_remote();
         if entry.is_dir() {
             self.app_state.update(cx, |state, _cx| {
                 let location = state.location_of(&entry);
                 state.navigate_to(location);
             });
-        } else if is_remote {
-            self.app_state.update(cx, |state, _cx| {
-                state.set_status(REMOTE_FILE_NOTICE);
-            });
-        } else {
-            if let Err(err) = crate::actions::open_with_system(entry.path()) {
+            return;
+        }
+        let location = self.app_state.read(cx).location_of(&entry);
+        match location {
+            Location::Local(path) => {
+                if let Err(err) = crate::actions::open_with_system(&path) {
+                    self.app_state.update(cx, |state, _cx| {
+                        state.set_status(format!("Cannot open {}: {err}", path.display()));
+                    });
+                }
+            }
+            remote @ Location::Remote { .. } => {
                 self.app_state.update(cx, |state, _cx| {
-                    state.set_status(format!("Cannot open {}: {err}", entry.path().display()));
+                    crate::actions::open_remote_file(state, remote);
                 });
             }
         }
@@ -940,8 +945,6 @@ impl ListView {
         cx.notify();
     }
 }
-
-pub const REMOTE_FILE_NOTICE: &str = "Files on remote locations cannot be opened or previewed yet";
 
 const SIZE_COLUMN: Pixels = px(72.);
 const DATE_COLUMN: Pixels = px(128.);

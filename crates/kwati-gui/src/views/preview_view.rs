@@ -12,8 +12,10 @@ use gpui::{
     div, img, prelude::*, px, uniform_list, Context, Entity, FontWeight, Pixels, ScrollStrategy,
     SharedString, Subscription, Task, UniformListScrollHandle, Window,
 };
-use kwati_core::preview::{read_preview, Preview};
-use kwati_core::{Entry, IconConfig, Location};
+use kwati_core::preview::{preview_from_reader, read_preview, Preview};
+use kwati_core::{
+    is_streamable_media, Backend, Entry, EntryKind, IconConfig, Location, RemoteFileCache,
+};
 
 use crate::components::{
     icon, icon_for, resolve_icon_color, resolved_icon, Ellipsize, IconMotion, IconName,
@@ -21,7 +23,6 @@ use crate::components::{
 use crate::state::{AppState, PreviewData, PreviewKind};
 use crate::theme::Theme;
 use crate::tokens::{size, Fonts, DATA_SIZE};
-use crate::views::list_view::REMOTE_FILE_NOTICE;
 
 const MAX_IMAGE_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_PREVIEW_LINE_CHARS: usize = 200;
@@ -264,9 +265,166 @@ pub fn generate_preview_for(path: &Path) -> (PreviewData, MetadataSummary) {
     }
 }
 
+/// Computes preview data and metadata summary for a remote file via its [`Backend`].
+pub fn generate_remote_preview_for(
+    backend: &dyn Backend,
+    location: &Location,
+    cache: &RemoteFileCache,
+    listed: Option<&Entry>,
+) -> (PreviewData, MetadataSummary) {
+    let path = location.path();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let (is_dir, size, is_regular) = match listed.and_then(|e| e.size.map(|s| (e.is_dir(), s))) {
+        Some((dir, s)) => (dir, s, !dir),
+        None => match backend.stat(location).ok() {
+            Some(m) => (m.kind == EntryKind::Dir, m.len, m.kind == EntryKind::File),
+            None => match listed {
+                Some(entry) => (entry.is_dir(), entry.size.unwrap_or(0), !entry.is_dir()),
+                None => {
+                    let summary = MetadataSummary {
+                        name,
+                        path: path.to_path_buf(),
+                        size: 0,
+                        is_dir: false,
+                        is_image: is_image_path(path),
+                        is_binary: true,
+                        kind_label: file_kind_label(path, false, true).to_string(),
+                    };
+                    return (
+                        PreviewData {
+                            path: path.to_path_buf(),
+                            kind: PreviewKind::Unavailable("Cannot read remote file".into()),
+                        },
+                        summary,
+                    );
+                }
+            },
+        },
+    };
+
+    let build_summary = |is_binary: bool| MetadataSummary {
+        name: name.clone(),
+        path: path.to_path_buf(),
+        size,
+        is_dir,
+        is_image: is_image_path(path),
+        is_binary,
+        kind_label: file_kind_label(path, is_dir, is_binary).to_string(),
+    };
+
+    if is_dir {
+        let summary = build_summary(false);
+        return (
+            PreviewData {
+                path: path.to_path_buf(),
+                kind: PreviewKind::Binary { name, size: 0 },
+            },
+            summary,
+        );
+    }
+
+    if !is_regular {
+        let summary = build_summary(true);
+        return (
+            PreviewData {
+                path: path.to_path_buf(),
+                kind: PreviewKind::Unavailable("Special file — preview not available".into()),
+            },
+            summary,
+        );
+    }
+
+    if is_image_path(path) {
+        let summary = build_summary(false);
+        let kind = if size > MAX_IMAGE_PREVIEW_BYTES {
+            PreviewKind::Unavailable("Image too large to preview".into())
+        } else {
+            let preview_path = cache.preview_path_for(location);
+            let cached_hit = fs::metadata(&preview_path).is_ok_and(|m| m.len() == size);
+            if cached_hit {
+                PreviewKind::Image(preview_path)
+            } else {
+                match download_preview_file(backend, location, &preview_path) {
+                    Ok(()) => PreviewKind::Image(preview_path),
+                    Err(_) => PreviewKind::Binary { name, size },
+                }
+            }
+        };
+        return (
+            PreviewData {
+                path: path.to_path_buf(),
+                kind,
+            },
+            summary,
+        );
+    }
+
+    if is_streamable_media(path) {
+        let summary = build_summary(true);
+        return (
+            PreviewData {
+                path: path.to_path_buf(),
+                kind: PreviewKind::Binary { name, size },
+            },
+            summary,
+        );
+    }
+
+    let preview = backend
+        .open_read(location)
+        .ok()
+        .and_then(|reader| preview_from_reader(reader).ok());
+    match preview {
+        Some(Preview::Text(text)) => {
+            let summary = build_summary(false);
+            (
+                PreviewData {
+                    path: path.to_path_buf(),
+                    kind: PreviewKind::Text(text),
+                },
+                summary,
+            )
+        }
+        _ => {
+            let summary = build_summary(true);
+            (
+                PreviewData {
+                    path: path.to_path_buf(),
+                    kind: PreviewKind::Binary { name, size },
+                },
+                summary,
+            )
+        }
+    }
+}
+
+fn download_preview_file(
+    backend: &dyn Backend,
+    location: &Location,
+    dest: &Path,
+) -> std::io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dest.with_extension("kwati-preview-part");
+    let mut reader = backend
+        .open_read(location)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut file = fs::File::create(&tmp)?;
+    std::io::copy(&mut reader, &mut file)?;
+    drop(file);
+    fs::rename(&tmp, dest)?;
+    Ok(())
+}
+
 pub struct PreviewView {
     pub app_state: Entity<AppState>,
     pub current_path: Option<PathBuf>,
+    current_location: Option<Location>,
     pub metadata: Option<MetadataSummary>,
     text_lines: Arc<Vec<SharedString>>,
     text_lines_path: Option<PathBuf>,
@@ -287,6 +445,7 @@ impl PreviewView {
         Self {
             app_state,
             current_path: None,
+            current_location: None,
             metadata: None,
             text_lines: Arc::new(Vec::new()),
             text_lines_path: None,
@@ -303,6 +462,52 @@ impl PreviewView {
             self.text_lines = Arc::new(Vec::new());
         }
         self.text_lines_path = None;
+    }
+
+    fn spawn_preview_load(
+        &mut self,
+        target_path: PathBuf,
+        cx: &mut Context<Self>,
+        compute: impl FnOnce() -> (PreviewData, MetadataSummary) + Send + 'static,
+    ) {
+        let generation = self.request_generation;
+        self.load_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PREVIEW_DEBOUNCE).await;
+            let still_current = this
+                .read_with(cx, |view, _| view.request_generation == generation)
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+
+            let (preview_data, summary, lines) = cx
+                .background_executor()
+                .spawn(async move {
+                    let (preview_data, summary) = compute();
+                    let lines = match &preview_data.kind {
+                        PreviewKind::Text(text) => prepare_preview_lines(text),
+                        _ => Vec::new(),
+                    };
+                    (preview_data, summary, lines)
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                if view.request_generation != generation {
+                    return;
+                }
+                view.load_task = None;
+                view.metadata = Some(summary);
+                view.text_lines = Arc::new(lines);
+                view.text_lines_path = Some(target_path.clone());
+                view.text_scroll_handle
+                    .scroll_to_item(0, ScrollStrategy::Top);
+                view.app_state.update(cx, |state, _cx| {
+                    state.set_preview(Some(preview_data));
+                });
+                cx.notify();
+            });
+        }));
     }
 
     fn cancel_pending_load(&mut self) {
@@ -329,10 +534,12 @@ impl PreviewView {
         if !preview_open {
             self.cancel_pending_load();
             if self.current_path.is_some()
+                || self.current_location.is_some()
                 || self.metadata.is_some()
                 || self.text_lines_path.is_some()
             {
                 self.current_path = None;
+                self.current_location = None;
                 self.metadata = None;
                 self.clear_text_cache();
             }
@@ -342,8 +549,13 @@ impl PreviewView {
         let Some(location) = selected_location else {
             self.cancel_pending_load();
             let had_preview = app_state.read(cx).preview_state.is_some();
-            if self.current_path.is_some() || self.metadata.is_some() || had_preview {
+            if self.current_path.is_some()
+                || self.current_location.is_some()
+                || self.metadata.is_some()
+                || had_preview
+            {
                 self.current_path = None;
+                self.current_location = None;
                 self.metadata = None;
                 self.clear_text_cache();
                 app_state.update(cx, |state, _cx| {
@@ -357,44 +569,81 @@ impl PreviewView {
         };
 
         let path = location.path().to_path_buf();
-        if self.current_path.as_ref() == Some(&path) {
+        if self.current_location.as_ref() == Some(&location) {
             if icons_changed {
                 cx.notify();
             }
             return;
         }
 
-        let listed = {
+        let (listed, remote_ctx) = {
             let state = app_state.read(cx);
-            state
+            let listed = state
                 .entries
                 .iter()
                 .find(|entry| entry.path == path)
-                .cloned()
+                .cloned();
+            let remote_ctx = if matches!(location, Location::Remote { .. }) {
+                Some((
+                    state.backend_for(&location),
+                    Arc::clone(&state.remote_cache),
+                ))
+            } else {
+                None
+            };
+            (listed, remote_ctx)
         };
 
         match location {
-            Location::Remote { .. } => {
+            remote_loc @ Location::Remote { .. } => {
                 self.cancel_pending_load();
                 self.current_path = Some(path.clone());
-                self.metadata = Some(listed.as_ref().map_or_else(
-                    || MetadataSummary::from_metadata(Path::new(""), None, false),
-                    MetadataSummary::from_listing,
-                ));
+                self.current_location = Some(remote_loc.clone());
+                self.metadata = listed.as_ref().map(MetadataSummary::from_listing);
                 self.clear_text_cache();
+
+                if listed.as_ref().is_some_and(|e| e.is_dir()) {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    app_state.update(cx, |state, _cx| {
+                        state.set_preview(Some(PreviewData {
+                            path,
+                            kind: PreviewKind::Binary { name, size: 0 },
+                        }));
+                    });
+                    cx.notify();
+                    return;
+                }
+
+                let Some((Some(backend), cache)) = remote_ctx else {
+                    app_state.update(cx, |state, _cx| {
+                        state.set_preview(Some(PreviewData {
+                            path,
+                            kind: PreviewKind::Unavailable("Server is not connected".into()),
+                        }));
+                    });
+                    cx.notify();
+                    return;
+                };
 
                 app_state.update(cx, |state, _cx| {
                     state.set_preview(Some(PreviewData {
-                        path,
-                        kind: PreviewKind::Unavailable(REMOTE_FILE_NOTICE.into()),
+                        path: path.clone(),
+                        kind: PreviewKind::Loading,
                     }));
                 });
                 cx.notify();
+
+                self.spawn_preview_load(path, cx, move || {
+                    generate_remote_preview_for(&*backend, &remote_loc, &cache, listed.as_ref())
+                });
             }
-            Location::Local(_) => {
+            local_loc @ Location::Local(_) => {
                 self.cancel_pending_load();
-                let generation = self.request_generation;
                 self.current_path = Some(path.clone());
+                self.current_location = Some(local_loc);
                 self.metadata = listed.as_ref().map(MetadataSummary::from_listing);
                 self.clear_text_cache();
 
@@ -406,45 +655,8 @@ impl PreviewView {
                 });
                 cx.notify();
 
-                let target_path = path;
-                self.load_task = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(PREVIEW_DEBOUNCE).await;
-                    let still_current = this
-                        .read_with(cx, |view, _| view.request_generation == generation)
-                        .unwrap_or(false);
-                    if !still_current {
-                        return;
-                    }
-
-                    let path_for_bg = target_path.clone();
-                    let (preview_data, summary, lines) = cx
-                        .background_executor()
-                        .spawn(async move {
-                            let (preview_data, summary) = generate_preview_for(&path_for_bg);
-                            let lines = match &preview_data.kind {
-                                PreviewKind::Text(text) => prepare_preview_lines(text),
-                                _ => Vec::new(),
-                            };
-                            (preview_data, summary, lines)
-                        })
-                        .await;
-
-                    let _ = this.update(cx, |view, cx| {
-                        if view.request_generation != generation {
-                            return;
-                        }
-                        view.load_task = None;
-                        view.metadata = Some(summary);
-                        view.text_lines = Arc::new(lines);
-                        view.text_lines_path = Some(target_path.clone());
-                        view.text_scroll_handle
-                            .scroll_to_item(0, ScrollStrategy::Top);
-                        view.app_state.update(cx, |state, _cx| {
-                            state.set_preview(Some(preview_data));
-                        });
-                        cx.notify();
-                    });
-                }));
+                let path_for_bg = path.clone();
+                self.spawn_preview_load(path, cx, move || generate_preview_for(&path_for_bg));
             }
         }
     }

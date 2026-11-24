@@ -1,21 +1,29 @@
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use russh::client::{self, Handle};
 use russh::keys::{self, HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::fs::File;
-use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileType, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use russh_sftp::client::{RawSftpSession, SftpSession};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::{Builder, Runtime};
+use tokio::task::JoinSet;
 
+use crate::chunking::split_range;
 use crate::{
     AuthMethod, AuthenticationFailed, Backend, BackendError, Confirmed, ConnectionProfile, Entry,
-    EntryKind, EntryMeta, Listing, Location, Protocol, Secrets,
+    EntryKind, EntryMeta, Listing, Location, Protocol, RangeSource, ReadSeek, Secrets,
 };
+
+const SFTP_MAX_READ_CHUNK: u32 = 256 * 1024 - 4096;
+const SFTP_WINDOW_CHUNKS: usize = 16;
+const SFTP_CHUNK_RETRY_ATTEMPTS: usize = 2;
+const SFTP_STALL_TIMEOUT: Duration = Duration::from_millis(3500);
 
 /// The server presented a host key that is not in [`KnownHosts`]; nothing was sent to it.
 ///
@@ -419,7 +427,12 @@ async fn open(
     credential: Credential,
     handler: HostKeyHandler,
 ) -> io::Result<(Handle<HostKeyHandler>, SftpSession)> {
-    let config = Arc::new(client::Config::default());
+    let config = Arc::new(client::Config {
+        nodelay: true,
+        keepalive_interval: Some(Duration::from_secs(15)),
+        keepalive_max: 3,
+        ..Default::default()
+    });
     let mut session = client::connect(config, (profile.host.as_str(), profile.port), handler)
         .await
         .map_err(ssh_error)?;
@@ -497,6 +510,49 @@ impl Backend for SftpBackend {
         Ok(Box::new(BlockingFile::new(&self.rt, file)))
     }
 
+    fn open_read_seek(&self, location: &Location) -> Result<Box<dyn ReadSeek>, BackendError> {
+        let file = self.block(self.sftp.open(self.path(location)?))?;
+        Ok(Box::new(BlockingFile::new(&self.rt, file)))
+    }
+
+    fn open_range_source(&self, location: &Location) -> Result<Box<dyn RangeSource>, BackendError> {
+        let path = self.path(location)?;
+        let (raw, handle, len) = self.rt.block_on(async {
+            let channel = self
+                ._session
+                .channel_open_session()
+                .await
+                .map_err(ssh_error)?;
+            channel
+                .request_subsystem(true, "sftp")
+                .await
+                .map_err(ssh_error)?;
+            let raw = RawSftpSession::new(channel.into_stream());
+            raw.init().await.map_err(sftp_error)?;
+            let handle = raw
+                .open(path, OpenFlags::READ, FileAttributes::empty())
+                .await
+                .map_err(sftp_error)?
+                .handle;
+            let attrs = raw.fstat(handle.as_str()).await.map_err(sftp_error)?.attrs;
+            Ok::<_, io::Error>((raw, handle, attrs.len()))
+        })?;
+        Ok(Box::new(SftpRangeSource {
+            rt: Arc::clone(&self.rt),
+            raw: Some(Arc::new(raw)),
+            handle: Some(handle),
+            len,
+        }))
+    }
+
+    fn stat_modified(
+        &self,
+        location: &Location,
+    ) -> Result<Option<std::time::SystemTime>, BackendError> {
+        let meta = self.block(self.sftp.symlink_metadata(self.path(location)?))?;
+        Ok(meta.modified().ok())
+    }
+
     fn open_write(&self, location: &Location) -> Result<Box<dyn Write + Send>, BackendError> {
         let file = self.block(self.sftp.create(self.path(location)?))?;
         Ok(Box::new(BlockingFile::new(&self.rt, file)))
@@ -561,6 +617,13 @@ impl Read for BlockingFile {
     }
 }
 
+impl Seek for BlockingFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let rt = self.rt.clone();
+        rt.block_on(self.file().seek(pos))
+    }
+}
+
 impl Write for BlockingFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let rt = self.rt.clone();
@@ -577,6 +640,147 @@ impl Drop for BlockingFile {
     fn drop(&mut self) {
         if let Some(mut file) = self.file.take() {
             let _ = self.rt.block_on(file.shutdown());
+        }
+    }
+}
+
+/// Sliding-window positional SFTP reader using [`RawSftpSession::read`] with `TCP_NODELAY`,
+/// short-read filling, per-chunk retry, and stall detection.
+struct SftpRangeSource {
+    rt: Arc<Runtime>,
+    raw: Option<Arc<RawSftpSession>>,
+    handle: Option<String>,
+    len: u64,
+}
+
+async fn read_sftp_chunk_filling(
+    raw: &RawSftpSession,
+    handle: &str,
+    offset: u64,
+    len: u32,
+) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(len as usize);
+    let mut remaining = len;
+    let mut cursor = offset;
+    while remaining > 0 {
+        let reply = raw
+            .read(handle, cursor, remaining)
+            .await
+            .map_err(sftp_error)?;
+        if reply.data.is_empty() {
+            break;
+        }
+        let n = reply.data.len().min(remaining as usize);
+        out.extend_from_slice(&reply.data[..n]);
+        cursor = cursor.saturating_add(n as u64);
+        remaining -= n as u32;
+    }
+    Ok(out)
+}
+
+async fn read_sftp_chunk_with_retry(
+    raw: &RawSftpSession,
+    handle: &str,
+    offset: u64,
+    len: u32,
+) -> io::Result<Vec<u8>> {
+    let mut last_err = match read_sftp_chunk_filling(raw, handle, offset, len).await {
+        Ok(data) => return Ok(data),
+        Err(err) => err,
+    };
+    for attempt in 1..=SFTP_CHUNK_RETRY_ATTEMPTS {
+        tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+        match read_sftp_chunk_filling(raw, handle, offset, len).await {
+            Ok(data) => return Ok(data),
+            Err(err) => last_err = err,
+        }
+    }
+    Err(last_err)
+}
+
+impl RangeSource for SftpRangeSource {
+    fn read_range(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let (Some(raw), Some(handle)) = (self.raw.as_ref(), self.handle.as_ref()) else {
+            return Err(io::Error::other("SftpRangeSource already closed"));
+        };
+        let want = if offset >= self.len {
+            0
+        } else {
+            (buf.len() as u64).min(self.len - offset) as u32
+        };
+        if want == 0 {
+            return Ok(0);
+        }
+
+        let chunks = split_range(offset, want, SFTP_MAX_READ_CHUNK);
+        let raw = Arc::clone(raw);
+        let handle = handle.clone();
+
+        self.rt.block_on(async move {
+            let mut next_idx = 0usize;
+            let mut in_flight: JoinSet<(u64, u32, io::Result<Vec<u8>>)> = JoinSet::new();
+
+            while next_idx < chunks.len() && in_flight.len() < SFTP_WINDOW_CHUNKS {
+                let (chunk_off, chunk_len) = chunks[next_idx];
+                next_idx += 1;
+                let raw_c = Arc::clone(&raw);
+                let handle_c = handle.clone();
+                in_flight.spawn(async move {
+                    let res =
+                        read_sftp_chunk_with_retry(&raw_c, &handle_c, chunk_off, chunk_len).await;
+                    (chunk_off, chunk_len, res)
+                });
+            }
+
+            let mut total = 0usize;
+            while !in_flight.is_empty() {
+                let joined = tokio::time::timeout(SFTP_STALL_TIMEOUT, in_flight.join_next())
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "SFTP: stalled waiting for read chunk",
+                        )
+                    })?;
+                let Some(task_res) = joined else {
+                    break;
+                };
+                let (chunk_off, chunk_len, data_res) = task_res
+                    .map_err(|e| io::Error::other(format!("SFTP read task failed: {e}")))?;
+                let data = data_res?;
+                let n = data.len().min(chunk_len as usize);
+                let start_in_buf = (chunk_off - offset) as usize;
+                buf[start_in_buf..start_in_buf + n].copy_from_slice(&data[..n]);
+                total += n;
+
+                if next_idx < chunks.len() {
+                    let (next_off, next_len) = chunks[next_idx];
+                    next_idx += 1;
+                    let raw_c = Arc::clone(&raw);
+                    let handle_c = handle.clone();
+                    in_flight.spawn(async move {
+                        let res =
+                            read_sftp_chunk_with_retry(&raw_c, &handle_c, next_off, next_len).await;
+                        (next_off, next_len, res)
+                    });
+                }
+            }
+            Ok(total)
+        })
+    }
+
+    fn len(&self) -> Option<u64> {
+        Some(self.len)
+    }
+}
+
+impl Drop for SftpRangeSource {
+    fn drop(&mut self) {
+        if let (Some(raw), Some(handle)) = (self.raw.take(), self.handle.take()) {
+            self.rt.block_on(async move {
+                let _ = raw.close(handle).await;
+                let _ = raw.close_session();
+            });
         }
     }
 }

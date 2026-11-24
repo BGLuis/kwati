@@ -4,7 +4,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
@@ -18,7 +18,7 @@ use suppaftp::{
 
 use crate::{
     AuthenticationFailed, Backend, BackendError, Confirmed, ConnectionProfile, Entry, EntryKind,
-    EntryMeta, Listing, Location, Protocol, Secrets,
+    EntryMeta, Listing, Location, Protocol, RangeSource, Secrets,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -219,6 +219,7 @@ struct Remote {
     name: String,
     kind: EntryKind,
     len: u64,
+    modified: Option<SystemTime>,
 }
 
 /// Turns the lines of an `MLSD` or `LIST` reply into entries. `LIST` has no standard format, so
@@ -255,10 +256,12 @@ fn remote_entry(file: File) -> Option<Remote> {
     } else {
         0
     };
+    let modified = (file.modified() != std::time::UNIX_EPOCH).then(|| file.modified());
     Some(Remote {
         name: name.to_owned(),
         kind,
         len,
+        modified,
     })
 }
 
@@ -362,7 +365,27 @@ impl Session {
     }
 
     fn download(&mut self, path: &str, busy: &Arc<AtomicBool>) -> FtpResult<Box<dyn Read + Send>> {
-        session!(self, s => Ok(Box::new(Transfer::start(s.retr_as_stream(path)?, busy))))
+        self.download_from(path, 0, busy)
+    }
+
+    fn download_from(
+        &mut self,
+        path: &str,
+        offset: u64,
+        busy: &Arc<AtomicBool>,
+    ) -> FtpResult<Box<dyn Read + Send>> {
+        session!(self, s => {
+            if offset > 0 {
+                let offset = usize::try_from(offset).map_err(|_| {
+                    FtpError::ConnectionError(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "FTP offset exceeds usize",
+                    ))
+                })?;
+                s.resume_transfer(offset)?;
+            }
+            Ok(Box::new(Transfer::start(s.retr_as_stream(path)?, busy)))
+        })
     }
 
     fn upload(&mut self, path: &str, busy: &Arc<AtomicBool>) -> FtpResult<Box<dyn Write + Send>> {
@@ -391,6 +414,7 @@ impl Inner {
                 name: String::new(),
                 kind: EntryKind::Dir,
                 len: 0,
+                modified: None,
             });
         };
         self.read_dir(parent)?
@@ -441,7 +465,7 @@ impl Inner {
 /// flush the writer takes no more data.
 pub struct FtpBackend {
     profile_id: String,
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
     transferring: Arc<AtomicBool>,
 }
 
@@ -503,7 +527,7 @@ impl FtpBackend {
         session.clear_timeouts();
         Ok(Self {
             profile_id: profile.id.clone(),
-            inner: Mutex::new(Inner { session, mlsd }),
+            inner: Arc::new(Mutex::new(Inner { session, mlsd })),
             transferring: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -810,6 +834,23 @@ impl Backend for FtpBackend {
         })
     }
 
+    fn open_range_source(&self, location: &Location) -> Result<Box<dyn RangeSource>, BackendError> {
+        let path = wire_path(remote_path(&self.profile_id, location)?)?;
+        let meta = self.stat(location)?;
+        Ok(Box::new(FtpRangeSource {
+            inner: Arc::clone(&self.inner),
+            transferring: Arc::clone(&self.transferring),
+            path,
+            len: meta.len,
+            data: None,
+            data_pos: 0,
+        }))
+    }
+
+    fn stat_modified(&self, location: &Location) -> Result<Option<SystemTime>, BackendError> {
+        self.with(location, |inner, path| Ok(inner.stat(path)?.modified))
+    }
+
     fn open_write(&self, location: &Location) -> Result<Box<dyn Write + Send>, BackendError> {
         self.with(location, |inner, path| {
             inner
@@ -918,6 +959,77 @@ impl<T: TlsStream> Write for Transfer<T> {
 impl<T: TlsStream> Drop for Transfer<T> {
     fn drop(&mut self) {
         let _ = self.finish();
+    }
+}
+
+/// Positional FTP reader using a single open `RETR` stream for sequential reads and `REST`+`RETR`
+/// only when a non-sequential seek occurs.
+struct FtpRangeSource {
+    inner: Arc<Mutex<Inner>>,
+    transferring: Arc<AtomicBool>,
+    path: String,
+    len: u64,
+    data: Option<Box<dyn Read + Send>>,
+    data_pos: u64,
+}
+
+impl FtpRangeSource {
+    fn open_stream_at(&mut self, offset: u64) -> io::Result<()> {
+        // Drop any active stream first so `transferring` resets before locking `inner`.
+        self.data = None;
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.transferring.load(Ordering::SeqCst) {
+            return Err(busy());
+        }
+        let stream = inner
+            .session
+            .download_from(&self.path, offset, &self.transferring)
+            .map_err(ftp_error)?;
+        self.data = Some(stream);
+        self.data_pos = offset;
+        Ok(())
+    }
+}
+
+impl RangeSource for FtpRangeSource {
+    fn read_range(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || offset >= self.len {
+            return Ok(0);
+        }
+        if self.data.is_none() || self.data_pos != offset {
+            self.open_stream_at(offset)?;
+        }
+
+        let stream = self.data.as_mut().expect("stream opened above");
+        let mut total = 0usize;
+        while total < buf.len() {
+            match stream.read(&mut buf[total..]) {
+                Ok(0) => {
+                    self.data = None;
+                    break;
+                }
+                Ok(n) => total += n,
+                Err(err) => {
+                    self.data = None;
+                    return Err(err);
+                }
+            }
+        }
+        self.data_pos = self.data_pos.saturating_add(total as u64);
+        Ok(total)
+    }
+
+    fn len(&self) -> Option<u64> {
+        Some(self.len)
+    }
+}
+
+impl Drop for FtpRangeSource {
+    fn drop(&mut self) {
+        self.data = None;
     }
 }
 
@@ -1131,18 +1243,21 @@ mod tests {
             ]),
             true,
         );
+        let mtime = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_603_120_770));
         assert_eq!(
             entries,
             [
                 Remote {
                     name: "sub dir".into(),
                     kind: EntryKind::Dir,
-                    len: 0
+                    len: 0,
+                    modified: mtime,
                 },
                 Remote {
                     name: "a b.txt".into(),
                     kind: EntryKind::File,
-                    len: 1234
+                    len: 1234,
+                    modified: mtime,
                 },
             ]
         );
@@ -1161,26 +1276,19 @@ mod tests {
             ]),
             false,
         );
+        let summary: Vec<_> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind, e.len))
+            .collect();
         assert_eq!(
-            entries,
+            summary,
             [
-                Remote {
-                    name: "docs".into(),
-                    kind: EntryKind::Dir,
-                    len: 0
-                },
-                Remote {
-                    name: "readme.txt".into(),
-                    kind: EntryKind::File,
-                    len: 512
-                },
-                Remote {
-                    name: "link".into(),
-                    kind: EntryKind::Symlink,
-                    len: 0
-                },
+                ("docs", EntryKind::Dir, 0),
+                ("readme.txt", EntryKind::File, 512),
+                ("link", EntryKind::Symlink, 0),
             ]
         );
+        assert!(entries.iter().all(|e| e.modified.is_some()));
     }
 
     #[test]
@@ -1193,21 +1301,18 @@ mod tests {
             ]),
             false,
         );
+        let summary: Vec<_> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind, e.len))
+            .collect();
         assert_eq!(
-            entries,
+            summary,
             [
-                Remote {
-                    name: "pub".into(),
-                    kind: EntryKind::Dir,
-                    len: 0
-                },
-                Remote {
-                    name: "readme.txt".into(),
-                    kind: EntryKind::File,
-                    len: 403
-                },
+                ("pub", EntryKind::Dir, 0),
+                ("readme.txt", EntryKind::File, 403)
             ]
         );
+        assert!(entries.iter().all(|e| e.modified.is_some()));
     }
 
     #[test]

@@ -1,22 +1,26 @@
 use std::collections::HashSet;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use smb::{
     Client, ClientConfig, ConnectionConfig, CreateOptions, Dialect, DirAccessMask, Directory,
-    FileAccessMask, FileAttributes, FileCreateArgs, FileDispositionInformation,
-    FileIdBothDirectoryInformation, FileRenameInformation, FileStandardInformation, Resource,
-    ResourceHandle, Status, UncPath,
+    FileAccessMask, FileAttributes, FileBasicInformation, FileCreateArgs,
+    FileDispositionInformation, FileIdBothDirectoryInformation, FileRenameInformation,
+    FileStandardInformation, GetLen, Resource, ResourceHandle, Status, UncPath,
 };
 
+use crate::chunking::split_range;
 use crate::{
     AuthenticationFailed, Backend, BackendError, Confirmed, ConnectionProfile, Entry, EntryKind,
-    EntryMeta, Listing, Location, Protocol, Secrets,
+    EntryMeta, Listing, Location, Protocol, RangeSource, ReadSeek, Secrets,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(15);
+const SMB_CONCURRENT_CHUNK_SIZE: u32 = 1024 * 1024;
+const SMB_MAX_CONCURRENT_CHUNKS: usize = 4;
+const SMB_CHUNK_RETRY_ATTEMPTS: u32 = 2;
 
 /// A Windows or Samba server, browsed and changed through the [`Backend`] trait, with the pure
 /// Rust `smb` client in its blocking mode (no runtime of its own).
@@ -271,6 +275,173 @@ impl Drop for SmbFile {
     }
 }
 
+/// Random-access reader over an SMB file (`smb::File::seek` in 0.12.1 does not update its
+/// internal cursor, so this wrapper tracks `pos` explicitly and calls `read_block`).
+struct SmbSeekFile {
+    file: Option<smb::File>,
+    pos: u64,
+    len: u64,
+}
+
+impl Read for SmbSeekFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let file = self.file.as_ref().expect("open until dropped");
+        let n = file.read_block(buf, self.pos, None, false)?;
+        self.pos = self.pos.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
+impl Seek for SmbSeekFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let target: i128 = match pos {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.len) + i128::from(offset),
+            SeekFrom::Current(offset) => i128::from(self.pos) + i128::from(offset),
+        };
+        let next = u64::try_from(target)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid seek position"))?;
+        self.pos = next;
+        Ok(self.pos)
+    }
+}
+
+impl Drop for SmbSeekFile {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.close();
+        }
+    }
+}
+
+/// Concurrent positional reader over an SMB file (`smb::File::read_block` takes `&self` and
+/// multiplexes requests by `MessageId` over the single connection).
+struct SmbRangeSource {
+    file: Option<Arc<smb::File>>,
+    len: u64,
+}
+
+impl SmbRangeSource {
+    fn read_chunk_filling(file: &smb::File, offset: u64, dst: &mut [u8]) -> io::Result<usize> {
+        let mut filled = 0usize;
+        while filled < dst.len() {
+            let n = file.read_block(
+                &mut dst[filled..],
+                offset.saturating_add(filled as u64),
+                None,
+                false,
+            )?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        Ok(filled)
+    }
+
+    fn read_chunk_with_retry(file: &smb::File, offset: u64, dst: &mut [u8]) -> io::Result<usize> {
+        let mut last_err = match Self::read_chunk_filling(file, offset, dst) {
+            Ok(n) => return Ok(n),
+            Err(err) => err,
+        };
+        for attempt in 1..=SMB_CHUNK_RETRY_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(100 * u64::from(attempt)));
+            match Self::read_chunk_filling(file, offset, dst) {
+                Ok(n) => return Ok(n),
+                Err(err) => last_err = err,
+            }
+        }
+        Err(last_err)
+    }
+}
+
+impl RangeSource for SmbRangeSource {
+    fn read_range(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(file) = self.file.as_ref() else {
+            return Err(io::Error::other("SmbRangeSource already closed"));
+        };
+        let want = if offset >= self.len {
+            0
+        } else {
+            (buf.len() as u64).min(self.len - offset) as u32
+        };
+        if want == 0 {
+            return Ok(0);
+        }
+
+        let chunks = split_range(offset, want, SMB_CONCURRENT_CHUNK_SIZE);
+        let mut total = 0usize;
+
+        for batch in chunks.chunks(SMB_MAX_CONCURRENT_CHUNKS) {
+            if batch.len() == 1 {
+                let (chunk_offset, chunk_len) = batch[0];
+                let start_in_buf = (chunk_offset - offset) as usize;
+                let end_in_buf = start_in_buf + chunk_len as usize;
+                let n = Self::read_chunk_with_retry(
+                    file,
+                    chunk_offset,
+                    &mut buf[start_in_buf..end_in_buf],
+                )?;
+                total += n;
+                if n < chunk_len as usize {
+                    break;
+                }
+                continue;
+            }
+
+            let mut slot_bufs: Vec<Vec<u8>> = batch
+                .iter()
+                .map(|&(_, len)| vec![0u8; len as usize])
+                .collect();
+            let results: Vec<io::Result<usize>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = batch
+                    .iter()
+                    .zip(slot_bufs.iter_mut())
+                    .map(|(&(chunk_offset, _), slot)| {
+                        scope.spawn(move || Self::read_chunk_with_retry(file, chunk_offset, slot))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(io::Error::other("SMB concurrent read worker panicked"))
+                        })
+                    })
+                    .collect()
+            });
+
+            for ((chunk_offset, chunk_len), (slot, res)) in
+                batch.iter().zip(slot_bufs.into_iter().zip(results))
+            {
+                let n = res?;
+                let start_in_buf = (chunk_offset - offset) as usize;
+                buf[start_in_buf..start_in_buf + n].copy_from_slice(&slot[..n]);
+                total += n;
+                if n < *chunk_len as usize {
+                    return Ok(total);
+                }
+            }
+        }
+
+        Ok(total)
+    }
+
+    fn len(&self) -> Option<u64> {
+        Some(self.len)
+    }
+}
+
+impl Drop for SmbRangeSource {
+    fn drop(&mut self) {
+        if let Some(arc) = self.file.take() {
+            if let Ok(file) = Arc::try_unwrap(arc) {
+                let _ = file.close();
+            }
+        }
+    }
+}
+
 impl Backend for SmbBackend {
     fn list(&self, location: &Location) -> Result<Listing, BackendError> {
         Ok(Listing::new(self.list_dir(location)?))
@@ -300,6 +471,39 @@ impl Backend for SmbBackend {
             .open(location, &FileCreateArgs::make_open_existing(access))?
             .into_file()?;
         Ok(Box::new(SmbFile(Some(file))))
+    }
+
+    fn open_read_seek(&self, location: &Location) -> Result<Box<dyn ReadSeek>, BackendError> {
+        let access = FileAccessMask::new().with_generic_read(true);
+        let file = self
+            .open(location, &FileCreateArgs::make_open_existing(access))?
+            .into_file()?;
+        let len = file.get_len().map_err(smb_error)?;
+        Ok(Box::new(SmbSeekFile {
+            file: Some(file),
+            pos: 0,
+            len,
+        }))
+    }
+
+    fn open_range_source(&self, location: &Location) -> Result<Box<dyn RangeSource>, BackendError> {
+        let access = FileAccessMask::new().with_generic_read(true);
+        let file = self
+            .open(location, &FileCreateArgs::make_open_existing(access))?
+            .into_file()?;
+        let len = file.get_len().map_err(smb_error)?;
+        Ok(Box::new(SmbRangeSource {
+            file: Some(Arc::new(file)),
+            len,
+        }))
+    }
+
+    fn stat_modified(&self, location: &Location) -> Result<Option<SystemTime>, BackendError> {
+        let access = FileAccessMask::new().with_file_read_attributes(true);
+        let handle = self.open(location, &FileCreateArgs::make_open_existing(access))?;
+        let info =
+            handle.with(|resource| handle_of(resource).query_info::<FileBasicInformation>())?;
+        Ok((!info.last_write_time.is_zero()).then(|| SystemTime::from(info.last_write_time)))
     }
 
     fn open_write(&self, location: &Location) -> Result<Box<dyn Write + Send>, BackendError> {

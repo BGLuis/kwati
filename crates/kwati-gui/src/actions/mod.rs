@@ -1,11 +1,13 @@
 pub mod navigation;
 pub mod open_with;
 pub mod operations;
+pub mod remote_files;
 pub mod remote_sync;
 
 pub use navigation::*;
 pub use open_with::*;
 pub use operations::*;
+pub use remote_files::*;
 pub use remote_sync::*;
 
 use gpui::{actions, App, KeyBinding};

@@ -1,4 +1,5 @@
 mod bounded;
+pub mod chunking;
 mod connection;
 mod copy;
 mod delete;
@@ -6,14 +7,17 @@ mod ftp;
 pub mod icons;
 mod move_entry;
 pub mod places;
+pub mod prefetch;
 mod profiles;
 mod remote;
+mod remote_edit;
 pub mod remote_poll;
 mod search;
 mod secrets;
 mod settings;
 mod sftp;
 mod smb;
+mod stream;
 mod transfer;
 mod trash;
 pub mod volume;
@@ -40,11 +44,18 @@ pub use places::{
     list_places, resolve_bookmarks, standard_places, standard_places_from, Bookmark, Place,
     PlaceKind, ResolvedBookmark, SidebarPlaces,
 };
+pub use prefetch::{
+    PrefetchReader, RangeSource, ReadSeekRangeSource, DEFAULT_PREFETCH_BLOCK_SIZE,
+    DEFAULT_SEEK_BLOCK_SIZE,
+};
 pub use profiles::{
     default_path as profiles_path, AuthMethod, ConnectionProfile, ConnectionProfiles,
     PendingSecret, Protocol,
 };
 pub use remote::connect_profile;
+pub use remote_edit::{
+    content_digest, PrepareOutcome, RemoteEditWatcher, RemoteFileCache, SyncOutcome,
+};
 pub use remote_poll::{RemotePoller, MIN_POLL_INTERVAL};
 pub use search::{RemoteSearchOptions, SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use secrets::{KeyringSecrets, Secrets, SecretsError};
@@ -55,6 +66,9 @@ pub use settings::{
 };
 pub use sftp::{known_hosts_path, HostKeyChanged, HostKeyUnknown, KnownHosts, SftpBackend};
 pub use smb::SmbBackend;
+pub use stream::{
+    is_browser_native_media, is_streamable_media, media_mime_type, RemoteStreamServer,
+};
 pub use transfer::{copy_between, move_between};
 pub use trash::{
     empty_trash, is_restore_conflict, is_trash_browsing_supported, is_trash_unavailable,
@@ -702,6 +716,10 @@ pub struct EntryMeta {
     pub len: u64,
 }
 
+/// A readable and seekable stream returned by [`Backend::open_read_seek`].
+pub trait ReadSeek: io::Read + io::Seek + Send {}
+impl<T: io::Read + io::Seek + Send> ReadSeek for T {}
+
 /// A storage backend. Only [`Backend::list`] is required; every other operation defaults to
 /// [`BackendError::Unsupported`], and [`Backend::trash`] to a trash-unavailable error, so a
 /// backend implements what its protocol supports.
@@ -730,6 +748,27 @@ pub trait Backend: Send + Sync {
 
     fn open_read(&self, _location: &Location) -> Result<Box<dyn io::Read + Send>, BackendError> {
         Err(BackendError::Unsupported)
+    }
+
+    /// Opens a seekable reader when the protocol supports random-access reads.
+    fn open_read_seek(&self, _location: &Location) -> Result<Box<dyn ReadSeek>, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Opens a positional [`RangeSource`] for buffered/parallel streaming. Defaults to adapting
+    /// [`Backend::open_read_seek`] + [`Backend::stat`].
+    fn open_range_source(&self, location: &Location) -> Result<Box<dyn RangeSource>, BackendError> {
+        let reader = self.open_read_seek(location)?;
+        let len = self.stat(location).ok().map(|m| m.len);
+        Ok(Box::new(ReadSeekRangeSource::new(reader, len)))
+    }
+
+    /// Returns the last modification timestamp of `location` when available.
+    fn stat_modified(
+        &self,
+        _location: &Location,
+    ) -> Result<Option<std::time::SystemTime>, BackendError> {
+        Ok(None)
     }
 
     /// Creates the file, or truncates it if it exists.
@@ -853,6 +892,17 @@ impl Backend for LocalBackend {
 
     fn open_read(&self, location: &Location) -> Result<Box<dyn io::Read + Send>, BackendError> {
         Ok(Box::new(fs::File::open(local_path(location)?)?))
+    }
+
+    fn open_read_seek(&self, location: &Location) -> Result<Box<dyn ReadSeek>, BackendError> {
+        Ok(Box::new(fs::File::open(local_path(location)?)?))
+    }
+
+    fn stat_modified(
+        &self,
+        location: &Location,
+    ) -> Result<Option<std::time::SystemTime>, BackendError> {
+        Ok(fs::symlink_metadata(local_path(location)?)?.modified().ok())
     }
 
     fn open_write(&self, location: &Location) -> Result<Box<dyn io::Write + Send>, BackendError> {
