@@ -9,8 +9,8 @@ use gpui::{
     PathPromptOptions, Subscription, Task, Window,
 };
 use kwati_core::{
-    list_installed_themes, IconGroup, IconSource, MotionPreference, Settings, SortColumn,
-    SortDirection, ViewMode, ICON_TYPE_SPECS,
+    list_installed_themes, FolderSettingsScope, IconGroup, IconSource, MotionPreference, Settings,
+    SortColumn, SortDirection, ViewMode, ICON_TYPE_SPECS,
 };
 
 use crate::components::{
@@ -41,7 +41,10 @@ pub enum SettingKey {
     ShowSidebar,
     DefaultSortColumn,
     DefaultSortDirection,
+    FoldersFirst,
+    HiddenLast,
     ViewMode,
+    FolderSettingsScope,
     MotionPreference,
     ListTimeoutSecs,
     RefreshIntervalSecs,
@@ -58,6 +61,7 @@ pub enum SettingControlKind {
     SortColumn,
     SortDirection,
     ViewMode,
+    FolderSettingsScope,
     MotionPreference,
     Number {
         min: u32,
@@ -87,8 +91,8 @@ pub const SETTINGS_ROWS: &[SettingRowSpec] = &[
     SettingRowSpec {
         key: SettingKey::ShowHidden,
         section: SettingsSectionId::General,
-        label: "Mostrar arquivos ocultos",
-        description: "Exibe arquivos e pastas iniciados por ponto nas listagens.",
+        label: "Mostrar arquivos ocultos (padrão)",
+        description: "Exibe arquivos e pastas iniciados por ponto nas pastas sem configuração própria.",
         kind: SettingControlKind::Toggle,
     },
     SettingRowSpec {
@@ -102,22 +106,43 @@ pub const SETTINGS_ROWS: &[SettingRowSpec] = &[
         key: SettingKey::DefaultSortColumn,
         section: SettingsSectionId::General,
         label: "Ordenação padrão (coluna)",
-        description: "Critério principal usado ao listar pastas.",
+        description: "Critério principal usado ao listar pastas sem configuração própria.",
         kind: SettingControlKind::SortColumn,
     },
     SettingRowSpec {
         key: SettingKey::DefaultSortDirection,
         section: SettingsSectionId::General,
         label: "Ordenação padrão (direção)",
-        description: "Ordem crescente ou decrescente da listagem.",
+        description: "Ordem crescente ou decrescente padrão da listagem.",
         kind: SettingControlKind::SortDirection,
+    },
+    SettingRowSpec {
+        key: SettingKey::FoldersFirst,
+        section: SettingsSectionId::General,
+        label: "Pastas primeiro (padrão)",
+        description: "Mantém as pastas agrupadas antes dos arquivos na listagem.",
+        kind: SettingControlKind::Toggle,
+    },
+    SettingRowSpec {
+        key: SettingKey::HiddenLast,
+        section: SettingsSectionId::General,
+        label: "Arquivos ocultos por último (padrão)",
+        description: "Move arquivos e pastas ocultos para o final da listagem.",
+        kind: SettingControlKind::Toggle,
     },
     SettingRowSpec {
         key: SettingKey::ViewMode,
         section: SettingsSectionId::General,
-        label: "Modo de visualização",
-        description: "Exibe arquivos como detalhes, grade de ícones ou lista compacta.",
+        label: "Modo de visualização (padrão)",
+        description: "Exibe arquivos como detalhes, grade de ícones ou lista compacta por padrão.",
         kind: SettingControlKind::ViewMode,
+    },
+    SettingRowSpec {
+        key: SettingKey::FolderSettingsScope,
+        section: SettingsSectionId::General,
+        label: "Escopo das alterações de pasta",
+        description: "Define se mudanças de visualização, ordenação e ocultos valem só na pasta atual ou em todas.",
+        kind: SettingControlKind::FolderSettingsScope,
     },
     SettingRowSpec {
         key: SettingKey::MotionPreference,
@@ -574,6 +599,16 @@ impl SettingsView {
                 state.set_sidebar_open(next);
                 Ok(())
             }
+            SettingKey::FoldersFirst => {
+                let next = !state.settings.folders_first;
+                state.set_folders_first(next);
+                Ok(())
+            }
+            SettingKey::HiddenLast => {
+                let next = !state.settings.hidden_last;
+                state.set_hidden_last(next);
+                Ok(())
+            }
             SettingKey::RemotePollEnabled => {
                 let next = !state.settings.remote_poll_enabled;
                 let interval = state.settings.remote_poll_interval_secs;
@@ -634,6 +669,18 @@ impl SettingsView {
             state.set_view_mode(mode);
             Ok(())
         });
+        cx.notify();
+        res
+    }
+
+    pub fn set_folder_settings_scope(
+        &mut self,
+        scope: FolderSettingsScope,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let res = self
+            .app_state
+            .update(cx, |state, _| state.set_folder_settings_scope(scope));
         cx.notify();
         res
     }
@@ -963,6 +1010,8 @@ impl SettingsView {
                 let active = match spec.key {
                     SettingKey::ShowHidden => settings.show_hidden,
                     SettingKey::ShowSidebar => settings.show_sidebar,
+                    SettingKey::FoldersFirst => settings.folders_first,
+                    SettingKey::HiddenLast => settings.hidden_last,
                     SettingKey::RemotePollEnabled => settings.remote_poll_enabled,
                     _ => false,
                 };
@@ -1020,10 +1069,15 @@ impl SettingsView {
                 let choices = [
                     (SortColumn::Name, "Nome"),
                     (SortColumn::Size, "Tamanho"),
-                    (SortColumn::Date, "Data"),
+                    (SortColumn::Date, "Modificado"),
+                    (SortColumn::Created, "Criado em"),
+                    (SortColumn::Accessed, "Acessado"),
+                    (SortColumn::Type, "Tipo"),
                 ];
                 div()
                     .flex()
+                    .flex_wrap()
+                    .justify_end()
                     .items_center()
                     .gap(space::S4)
                     .children(choices.into_iter().enumerate().map(|(ix, (col, label))| {
@@ -1135,6 +1189,47 @@ impl SettingsView {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     let _ = this.set_view_mode(mode, cx);
+                                }),
+                            )
+                    }))
+                    .into_any_element()
+            }
+            SettingControlKind::FolderSettingsScope => {
+                let current = settings.folder_settings_scope;
+                let choices = [
+                    (FolderSettingsScope::PerFolder, "Pasta atual"),
+                    (FolderSettingsScope::AllFolders, "Todas as pastas"),
+                ];
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(space::S4)
+                    .children(choices.into_iter().enumerate().map(|(ix, (scope, label))| {
+                        let selected = current == scope;
+                        div()
+                            .id(("folder-scope-opt", ix))
+                            .px(space::S8)
+                            .py(space::S4)
+                            .rounded(radius::CONTROL)
+                            .border_1()
+                            .border_color(if selected { theme.accent } else { theme.border })
+                            .bg(if selected {
+                                theme.selection
+                            } else {
+                                theme.surface_raised
+                            })
+                            .text_label()
+                            .text_color(if selected {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            })
+                            .cursor_pointer()
+                            .child(label)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    let _ = this.set_folder_settings_scope(scope, cx);
                                 }),
                             )
                     }))

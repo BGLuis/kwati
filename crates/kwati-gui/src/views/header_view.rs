@@ -356,7 +356,7 @@ impl HeaderView {
 
     pub fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
         self.app_state.update(cx, |state, cx| {
-            state.set_view_mode(mode);
+            state.set_current_view_mode(mode);
             cx.notify();
         });
         cx.notify();

@@ -8,7 +8,9 @@ use gpui::{
     point, px, size, AppContext as _, Entity, Modifiers, MouseButton, Pixels, Point,
     TestAppContext, VisualTestContext,
 };
-use kwati_core::Location;
+use kwati_core::{
+    FolderSettingsScope, Location, Settings, SortColumn, SortDirection, SortOrder, ViewMode,
+};
 use kwati_gui::actions::operations::clear_clipboard;
 use kwati_gui::actions::register_keybindings;
 use kwati_gui::components::register_text_input_keybindings;
@@ -108,9 +110,43 @@ fn menu_actions(main: &Entity<MainView>, cx: &mut VisualTestContext) -> Vec<Cont
             .iter()
             .filter_map(|e| match e {
                 ContextMenuEntry::Item { action, .. } => Some(*action),
-                ContextMenuEntry::Separator => None,
+                ContextMenuEntry::Submenu { .. } | ContextMenuEntry::Separator => None,
             })
             .collect()
+    })
+}
+
+fn menu_submenu_labels(main: &Entity<MainView>, cx: &mut VisualTestContext) -> Vec<&'static str> {
+    main.read_with(cx, |main, cx| {
+        main.context_menu
+            .read(cx)
+            .entries()
+            .iter()
+            .filter_map(|e| match e {
+                ContextMenuEntry::Submenu { label, .. } => Some(*label),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+fn submenu_entries_for(
+    main: &Entity<MainView>,
+    cx: &mut VisualTestContext,
+    submenu_label: &str,
+) -> Vec<ContextMenuEntry> {
+    main.read_with(cx, |main, cx| {
+        main.context_menu
+            .read(cx)
+            .entries()
+            .iter()
+            .find_map(|e| match e {
+                ContextMenuEntry::Submenu { label, items } if *label == submenu_label => {
+                    Some(items.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
     })
 }
 
@@ -203,9 +239,104 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
         [
             ContextMenuAction::Paste,
             ContextMenuAction::NewFolder,
+            ContextMenuAction::ToggleShowHidden,
+            ContextMenuAction::ApplyFolderSettingsToAll,
             ContextMenuAction::Refresh,
         ]
     );
+    assert_eq!(menu_submenu_labels(&main, cx), ["View", "Sort by"]);
+
+    let view_items = submenu_entries_for(&main, cx, "View");
+    assert!(view_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::SetViewMode(ViewMode::Details),
+        label: "Details",
+        shortcut: Some("Ctrl+1"),
+        enabled: true,
+        destructive: false,
+        checked: true,
+    }));
+    assert!(view_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::SetViewMode(ViewMode::Grid),
+        label: "Grid",
+        shortcut: Some("Ctrl+2"),
+        enabled: true,
+        destructive: false,
+        checked: false,
+    }));
+    assert!(view_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::ToggleSidebar,
+        label: "Show Sidebar",
+        shortcut: Some("F9"),
+        enabled: true,
+        destructive: false,
+        checked: true,
+    }));
+    assert!(view_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::TogglePreview,
+        label: "Show Preview",
+        shortcut: Some("Alt+P"),
+        enabled: true,
+        destructive: false,
+        checked: true,
+    }));
+
+    let sort_items = submenu_entries_for(&main, cx, "Sort by");
+    assert!(sort_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::SetSortColumn(SortColumn::Name),
+        label: "Name",
+        shortcut: None,
+        enabled: true,
+        destructive: false,
+        checked: true,
+    }));
+    assert!(sort_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::SetSortColumn(SortColumn::Created),
+        label: "Created",
+        shortcut: None,
+        enabled: true,
+        destructive: false,
+        checked: false,
+    }));
+    assert!(sort_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::SetSortColumn(SortColumn::Accessed),
+        label: "Accessed",
+        shortcut: None,
+        enabled: true,
+        destructive: false,
+        checked: false,
+    }));
+    assert!(sort_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::SetSortColumn(SortColumn::Type),
+        label: "Type",
+        shortcut: None,
+        enabled: true,
+        destructive: false,
+        checked: false,
+    }));
+    assert!(sort_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::SetSortDirection(SortDirection::Ascending),
+        label: "A to Z",
+        shortcut: None,
+        enabled: true,
+        destructive: false,
+        checked: true,
+    }));
+    assert!(sort_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::ToggleFoldersFirst,
+        label: "Folders First",
+        shortcut: None,
+        enabled: true,
+        destructive: false,
+        checked: true,
+    }));
+    assert!(sort_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::ToggleHiddenLast,
+        label: "Hidden Files Last",
+        shortcut: None,
+        enabled: true,
+        destructive: false,
+        checked: false,
+    }));
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -312,6 +443,240 @@ fn shift_f10_and_escape_toggle_context_menu_and_keyboard_runs_action(cx: &mut Te
     assert!(!is_menu_open(&main, cx));
     let dialog = main.read_with(cx, |main, cx| main.dialogs.read(cx).current_dialog.clone());
     assert!(matches!(dialog, DialogKind::Rename { .. }));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn menu_item_bounds(cx: &mut VisualTestContext, selector: &str) -> Point<Pixels> {
+    cx.debug_bounds(Box::leak(selector.to_string().into_boxed_str()))
+        .unwrap_or_else(|| panic!("missing bounds for {selector}"))
+        .center()
+}
+
+#[gpui::test]
+fn empty_space_context_menu_submenus_apply_per_folder_and_persist(cx: &mut TestAppContext) {
+    let root = fixture("per_folder");
+    let _clipboard = clipboard();
+    let dir_a = root.join("folder_a");
+    let dir_b = root.join("folder_b");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+    fs::write(dir_a.join("small.txt"), "1").unwrap();
+    fs::write(dir_a.join("large.txt"), "1234567890").unwrap();
+    fs::write(dir_a.join(".secret_a"), "hidden").unwrap();
+    fs::write(dir_b.join("only_b.txt"), "b").unwrap();
+    fs::write(dir_b.join(".secret_b"), "hidden").unwrap();
+    let settings_file = root.join("settings.toml");
+
+    let (main, cx) = open_window(cx, &dir_a);
+    main.update(cx, |main, cx| {
+        main.app_state.update(cx, |state, _| {
+            state.set_settings_path(Some(settings_file.clone()));
+        });
+    });
+
+    // Open empty-space context menu and hover "View" submenu (entry index 3), click "Grid" (subitem 1).
+    let empty = point(px(500.), px(400.));
+    right_click(cx, empty);
+    assert!(is_menu_open(&main, cx));
+    let view_row = menu_item_bounds(cx, "context-menu-item-3");
+    cx.simulate_mouse_move(view_row, None, Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        main.read_with(cx, |m, cx| m.context_menu.read(cx).open_submenu()),
+        Some(3)
+    );
+    let grid_item = menu_item_bounds(cx, "context-menu-subitem-1");
+    left_click(cx, grid_item, Modifiers::none());
+
+    main.read_with(cx, |m, cx| {
+        let s = m.app_state.read(cx);
+        assert_eq!(s.view_mode, ViewMode::Grid);
+        assert_eq!(s.settings.view_mode, ViewMode::Details);
+    });
+
+    // Open via Shift+F10 with no selection and use keyboard into "Sort by" -> "Size" -> "Descending".
+    cx.simulate_keystrokes("shift-f10");
+    assert!(is_menu_open(&main, cx));
+    // Items: Paste(0, disabled), New Folder(1), View(3), Sort by(4), Show Hidden(5).
+    // Initial focus is on New Folder(1). Down -> View(3), Down -> Sort by(4), Right -> Name(0), Down -> Size(1), Enter.
+    cx.simulate_keystrokes("down down right down enter");
+    cx.run_until_parked();
+    main.read_with(cx, |m, cx| {
+        assert_eq!(m.app_state.read(cx).sort_column, SortColumn::Size);
+    });
+
+    cx.simulate_keystrokes("shift-f10");
+    // Open Sort by(4) -> Down x7 -> Descending(8) -> Enter.
+    cx.simulate_keystrokes("down down right down down down down down down down enter");
+    cx.run_until_parked();
+    main.read_with(cx, |m, cx| {
+        assert_eq!(
+            m.app_state.read(cx).sort_direction,
+            SortDirection::Descending
+        );
+    });
+
+    // Verify contextual direction labels update to Smallest/Largest first when SortColumn::Size is active.
+    right_click(cx, empty);
+    let sort_items = submenu_entries_for(&main, cx, "Sort by");
+    assert!(sort_items.contains(&ContextMenuEntry::Item {
+        action: ContextMenuAction::SetSortDirection(SortDirection::Descending),
+        label: "Largest first",
+        shortcut: None,
+        enabled: true,
+        destructive: false,
+        checked: true,
+    }));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Toggle "Folders First" off and "Hidden Files Last" on via Sort by submenu.
+    right_click(cx, empty);
+    let sort_row = menu_item_bounds(cx, "context-menu-item-4");
+    cx.simulate_mouse_move(sort_row, None, Modifiers::none());
+    cx.run_until_parked();
+    let folders_first_item = menu_item_bounds(cx, "context-menu-subitem-10");
+    left_click(cx, folders_first_item, Modifiers::none());
+
+    right_click(cx, empty);
+    let sort_row = menu_item_bounds(cx, "context-menu-item-4");
+    cx.simulate_mouse_move(sort_row, None, Modifiers::none());
+    cx.run_until_parked();
+    let hidden_last_item = menu_item_bounds(cx, "context-menu-subitem-11");
+    left_click(cx, hidden_last_item, Modifiers::none());
+
+    main.read_with(cx, |m, cx| {
+        let s = m.app_state.read(cx);
+        assert!(!s.folders_first);
+        assert!(s.hidden_last);
+        assert!(s.settings.folders_first);
+        assert!(!s.settings.hidden_last);
+    });
+
+    // Toggle "Show Hidden Files" from context menu.
+    right_click(cx, empty);
+    let hidden_row = menu_item_bounds(cx, "context-menu-item-5");
+    left_click(cx, hidden_row, Modifiers::none());
+    main.read_with(cx, |m, cx| {
+        let s = m.app_state.read(cx);
+        assert!(s.show_hidden);
+        assert!(!s.settings.show_hidden);
+        assert!(s.entries.iter().any(|e| e.name() == ".secret_a"));
+    });
+
+    // Navigating to folder_b keeps global defaults (Details, Name Asc, hidden false).
+    main.update(cx, |m, cx| {
+        m.app_state
+            .update(cx, |s, _| s.navigate_to(Location::Local(dir_b.clone())));
+    });
+    cx.run_until_parked();
+    main.read_with(cx, |m, cx| {
+        let s = m.app_state.read(cx);
+        assert_eq!(s.view_mode, ViewMode::Details);
+        assert_eq!(s.sort_column, SortColumn::Name);
+        assert_eq!(s.sort_direction, SortDirection::Ascending);
+        assert!(!s.show_hidden);
+        assert!(!s.entries.iter().any(|e| e.name() == ".secret_b"));
+    });
+
+    // Navigating back to folder_a restores its per-folder settings.
+    main.update(cx, |m, cx| {
+        m.app_state
+            .update(cx, |s, _| s.navigate_to(Location::Local(dir_a.clone())));
+    });
+    cx.run_until_parked();
+    main.read_with(cx, |m, cx| {
+        let s = m.app_state.read(cx);
+        assert_eq!(s.view_mode, ViewMode::Grid);
+        assert_eq!(s.sort_column, SortColumn::Size);
+        assert_eq!(s.sort_direction, SortDirection::Descending);
+        assert!(s.show_hidden);
+    });
+
+    // Persisted settings load properly into a fresh AppState starting at folder_a.
+    let mut reloaded = AppState::new(Location::Local(dir_a.clone()));
+    reloaded.load_settings_from(&settings_file).unwrap();
+    assert_eq!(reloaded.view_mode, ViewMode::Grid);
+    assert_eq!(reloaded.sort_column, SortColumn::Size);
+    assert_eq!(reloaded.sort_direction, SortDirection::Descending);
+    assert!(reloaded.show_hidden);
+
+    // Clicking "Apply to All Folders" (index 6) in folder_a applies settings globally.
+    right_click(cx, empty);
+    let apply_all_row = menu_item_bounds(cx, "context-menu-item-6");
+    left_click(cx, apply_all_row, Modifiers::none());
+    let (disk, warnings) = Settings::load_from(&settings_file).unwrap();
+    assert!(warnings.is_empty());
+    assert_eq!(disk.view_mode, ViewMode::Grid);
+    assert_eq!(
+        disk.default_sort,
+        SortOrder::new(SortColumn::Size, SortDirection::Descending)
+    );
+    assert!(disk.show_hidden);
+    assert!(disk.folder_preferences.is_empty());
+
+    // Navigating to folder_b now uses those promoted global settings.
+    main.update(cx, |m, cx| {
+        m.app_state
+            .update(cx, |s, _| s.navigate_to(Location::Local(dir_b.clone())));
+    });
+    cx.run_until_parked();
+    main.read_with(cx, |m, cx| {
+        let s = m.app_state.read(cx);
+        assert_eq!(s.view_mode, ViewMode::Grid);
+        assert_eq!(s.sort_column, SortColumn::Size);
+        assert_eq!(s.sort_direction, SortDirection::Descending);
+        assert!(s.show_hidden);
+    });
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[gpui::test]
+fn settings_scope_all_folders_applies_context_menu_changes_globally(cx: &mut TestAppContext) {
+    let root = fixture("scope_all");
+    let _clipboard = clipboard();
+    let dir_a = root.join("folder_a");
+    let dir_b = root.join("folder_b");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+    let settings_file = root.join("settings.toml");
+
+    let (main, cx) = open_window(cx, &dir_a);
+    main.update(cx, |main, cx| {
+        main.app_state.update(cx, |state, _| {
+            state.set_settings_path(Some(settings_file.clone()));
+        });
+        main.settings.update(cx, |sv, cx| {
+            sv.set_folder_settings_scope(FolderSettingsScope::AllFolders, cx)
+                .unwrap();
+        });
+    });
+
+    let empty = point(px(500.), px(400.));
+    right_click(cx, empty);
+    let view_row = menu_item_bounds(cx, "context-menu-item-3");
+    cx.simulate_mouse_move(view_row, None, Modifiers::none());
+    cx.run_until_parked();
+    let compact_item = menu_item_bounds(cx, "context-menu-subitem-2");
+    left_click(cx, compact_item, Modifiers::none());
+
+    main.read_with(cx, |m, cx| {
+        let s = m.app_state.read(cx);
+        assert_eq!(s.view_mode, ViewMode::CompactList);
+        assert_eq!(s.settings.view_mode, ViewMode::CompactList);
+        assert!(s.settings.folder_preferences.is_empty());
+    });
+
+    main.update(cx, |m, cx| {
+        m.app_state
+            .update(cx, |s, _| s.navigate_to(Location::Local(dir_b.clone())));
+    });
+    cx.run_until_parked();
+    main.read_with(cx, |m, cx| {
+        assert_eq!(m.app_state.read(cx).view_mode, ViewMode::CompactList);
+    });
 
     let _ = fs::remove_dir_all(&root);
 }

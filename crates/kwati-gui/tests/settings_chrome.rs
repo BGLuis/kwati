@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use gpui::{point, px, size, AppContext as _, Modifiers, MouseButton, TestAppContext};
 use kwati_core::{
-    group_for_type_key, AuthMethod, ConnectionProfile, IconConfig, IconGroup, IconSource, Location,
-    PlaceEntry, Protocol, Settings, SortColumn, SortDirection, SortOrder, ICON_TYPE_SPECS,
+    group_for_type_key, AuthMethod, ConnectionProfile, FolderSettingsScope, IconConfig, IconGroup,
+    IconSource, Location, PlaceEntry, Protocol, Settings, SortColumn, SortDirection, SortOrder,
+    ICON_TYPE_SPECS,
 };
 use kwati_gui::state::AppState;
 use kwati_gui::views::header_view::{
@@ -38,6 +39,12 @@ fn settings_view_applies_and_persists_changes(cx: &mut TestAppContext) {
         view.set_sort_column(SortColumn::Size, cx).unwrap();
         view.set_sort_direction(SortDirection::Descending, cx)
             .unwrap();
+        view.toggle_bool_setting(SettingKey::FoldersFirst, cx)
+            .unwrap();
+        view.toggle_bool_setting(SettingKey::HiddenLast, cx)
+            .unwrap();
+        view.set_folder_settings_scope(FolderSettingsScope::AllFolders, cx)
+            .unwrap();
         view.toggle_bool_setting(SettingKey::RemotePollEnabled, cx)
             .unwrap();
         view.set_numeric_input(SettingKey::ListTimeoutSecs, "22", cx)
@@ -61,6 +68,14 @@ fn settings_view_applies_and_persists_changes(cx: &mut TestAppContext) {
             state.settings.default_sort,
             SortOrder::new(SortColumn::Size, SortDirection::Descending)
         );
+        assert!(!state.folders_first);
+        assert!(state.hidden_last);
+        assert!(!state.settings.folders_first);
+        assert!(state.settings.hidden_last);
+        assert_eq!(
+            state.settings.folder_settings_scope,
+            FolderSettingsScope::AllFolders
+        );
         assert!(state.settings.remote_poll_enabled);
         assert_eq!(state.settings.list_timeout_secs, 22);
         assert_eq!(state.settings.refresh_interval_secs, 12);
@@ -76,6 +91,9 @@ fn settings_view_applies_and_persists_changes(cx: &mut TestAppContext) {
         disk.default_sort,
         SortOrder::new(SortColumn::Size, SortDirection::Descending)
     );
+    assert!(!disk.folders_first);
+    assert!(disk.hidden_last);
+    assert_eq!(disk.folder_settings_scope, FolderSettingsScope::AllFolders);
     assert!(disk.remote_poll_enabled);
     assert_eq!(disk.list_timeout_secs, 22);
     assert_eq!(disk.refresh_interval_secs, 12);

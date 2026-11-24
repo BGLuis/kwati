@@ -1,6 +1,7 @@
 use kwati_core::{
-    is_hidden_entry, list_dir, list_dir_with_options, sort_entries, sort_entries_by, Backend,
-    BackendError, Entry, ListOptions, Listing, LocalBackend, Location, SortColumn, SortDirection,
+    is_hidden_entry, list_dir, list_dir_with_options, sort_entries, sort_entries_by,
+    sort_entries_with, Backend, BackendError, Entry, ListOptions, Listing, LocalBackend, Location,
+    SortColumn, SortDirection,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -503,4 +504,65 @@ fn is_hidden_entry_direct() {
         assert!(is_hidden_entry(std::ffi::OsStr::new(".hidden"), None));
         assert!(!is_hidden_entry(std::ffi::OsStr::new("visible"), None));
     }
+}
+
+#[test]
+fn sort_entries_with_type_created_accessed_folders_first_and_hidden_last() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let t1 = UNIX_EPOCH + Duration::from_secs(100);
+    let t2 = UNIX_EPOCH + Duration::from_secs(200);
+    let t3 = UNIX_EPOCH + Duration::from_secs(300);
+
+    let dir_a = Entry::new(OsString::from("a_dir"), PathBuf::from("a_dir"), true)
+        .with_created(t3)
+        .with_accessed(t1);
+    let file_b = Entry::new(OsString::from("b.txt"), PathBuf::from("b.txt"), false)
+        .with_created(t1)
+        .with_accessed(t3);
+    let file_a = Entry::new(OsString::from("a.md"), PathBuf::from("a.md"), false)
+        .with_created(t2)
+        .with_accessed(t2);
+    let hidden_c = Entry::new(OsString::from(".env"), PathBuf::from(".env"), false)
+        .with_created(t1)
+        .with_accessed(t1);
+
+    // 1. Sort by Type ascending with folders_first = true, hidden_last = true
+    let mut entries = vec![
+        hidden_c.clone(),
+        file_b.clone(),
+        dir_a.clone(),
+        file_a.clone(),
+    ];
+    sort_entries_with(
+        &mut entries,
+        SortColumn::Type,
+        SortDirection::Ascending,
+        true,
+        true,
+    );
+    let names: Vec<&str> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+    assert_eq!(names, vec!["a_dir", "a.md", "b.txt", ".env"]);
+
+    // 2. Sort by Created descending with folders_first = false (mixes folders and files)
+    sort_entries_with(
+        &mut entries,
+        SortColumn::Created,
+        SortDirection::Descending,
+        false,
+        false,
+    );
+    let names: Vec<&str> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+    assert_eq!(names, vec!["a_dir", "a.md", ".env", "b.txt"]);
+
+    // 3. Sort by Accessed descending with folders_first = false
+    sort_entries_with(
+        &mut entries,
+        SortColumn::Accessed,
+        SortDirection::Descending,
+        false,
+        false,
+    );
+    let names: Vec<&str> = entries.iter().map(|e| e.name.to_str().unwrap()).collect();
+    assert_eq!(names, vec!["b.txt", "a.md", ".env", "a_dir"]);
 }

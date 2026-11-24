@@ -389,6 +389,7 @@ fn a_remote_listing_honours_hidden_files_and_sort_order() {
         show_hidden: false,
         sort_column: SortColumn::Name,
         sort_direction: SortDirection::Descending,
+        ..ListOptions::default()
     };
     assert_eq!(names(descending), ["dir", "b.txt", "a.txt"]);
     assert_eq!(

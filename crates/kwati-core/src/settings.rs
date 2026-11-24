@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -5,11 +6,13 @@ use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
 use crate::places::{default_place_entries, ensure_trash_present, Bookmark, PlaceEntry};
-use crate::{SortColumn, SortDirection, SortOrder};
+use crate::{Location, SortColumn, SortDirection, SortOrder};
 
 pub const CURRENT_VERSION: u32 = 1;
 pub const DEFAULT_SHOW_HIDDEN: bool = false;
 pub const DEFAULT_SHOW_SIDEBAR: bool = true;
+pub const DEFAULT_FOLDERS_FIRST: bool = true;
+pub const DEFAULT_HIDDEN_LAST: bool = false;
 pub const DEFAULT_REFRESH_INTERVAL_SECS: u32 = 5;
 pub const MIN_REFRESH_INTERVAL_SECS: u32 = 1;
 pub const MAX_REFRESH_INTERVAL_SECS: u32 = 3600;
@@ -51,6 +54,49 @@ pub enum ViewMode {
     Grid,
 }
 
+/// Whether view, sort, and hidden-file changes from the file list or context menu apply only
+/// to the active folder or globally to all folders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FolderSettingsScope {
+    #[default]
+    PerFolder,
+    AllFolders,
+}
+
+/// Per-folder overrides for listing display and sorting. `None` inherits the global default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FolderPreferences {
+    pub view_mode: Option<ViewMode>,
+    pub sort_column: Option<SortColumn>,
+    pub sort_direction: Option<SortDirection>,
+    pub show_hidden: Option<bool>,
+    pub folders_first: Option<bool>,
+    pub hidden_last: Option<bool>,
+}
+
+impl FolderPreferences {
+    /// Returns `true` when every field inherits the global default.
+    pub fn is_empty(&self) -> bool {
+        self.view_mode.is_none()
+            && self.sort_column.is_none()
+            && self.sort_direction.is_none()
+            && self.show_hidden.is_none()
+            && self.folders_first.is_none()
+            && self.hidden_last.is_none()
+    }
+}
+
+/// Effective listing settings for a specific folder after applying any per-folder override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedFolderSettings {
+    pub view_mode: ViewMode,
+    pub sort_column: SortColumn,
+    pub sort_direction: SortDirection,
+    pub show_hidden: bool,
+    pub folders_first: bool,
+    pub hidden_last: bool,
+}
+
 /// User settings. Features add their own options here, each with a default.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -58,7 +104,11 @@ pub struct Settings {
     pub show_hidden: bool,
     pub show_sidebar: bool,
     pub default_sort: SortOrder,
+    pub folders_first: bool,
+    pub hidden_last: bool,
     pub view_mode: ViewMode,
+    pub folder_settings_scope: FolderSettingsScope,
+    pub folder_preferences: BTreeMap<Location, FolderPreferences>,
     pub refresh_interval_secs: u32,
     /// Seconds a directory listing may take before it is abandoned (see `list_dir_bounded`).
     pub list_timeout_secs: u32,
@@ -82,7 +132,11 @@ impl Default for Settings {
             show_hidden: DEFAULT_SHOW_HIDDEN,
             show_sidebar: DEFAULT_SHOW_SIDEBAR,
             default_sort: SortOrder::default(),
+            folders_first: DEFAULT_FOLDERS_FIRST,
+            hidden_last: DEFAULT_HIDDEN_LAST,
             view_mode: ViewMode::default(),
+            folder_settings_scope: FolderSettingsScope::default(),
+            folder_preferences: BTreeMap::new(),
             refresh_interval_secs: DEFAULT_REFRESH_INTERVAL_SECS,
             list_timeout_secs: DEFAULT_LIST_TIMEOUT_SECS,
             remote_poll_enabled: false,
@@ -180,7 +234,10 @@ fn parse_sort_column(raw: &str) -> Option<SortColumn> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "name" => Some(SortColumn::Name),
         "size" => Some(SortColumn::Size),
-        "date" => Some(SortColumn::Date),
+        "date" | "modified" => Some(SortColumn::Date),
+        "created" => Some(SortColumn::Created),
+        "accessed" => Some(SortColumn::Accessed),
+        "type" => Some(SortColumn::Type),
         _ => None,
     }
 }
@@ -198,6 +255,9 @@ fn sort_column_str(column: SortColumn) -> &'static str {
         SortColumn::Name => "name",
         SortColumn::Size => "size",
         SortColumn::Date => "date",
+        SortColumn::Created => "created",
+        SortColumn::Accessed => "accessed",
+        SortColumn::Type => "type",
     }
 }
 
@@ -240,6 +300,235 @@ fn view_mode_str(mode: ViewMode) -> &'static str {
         ViewMode::CompactList => "compact_list",
         ViewMode::Grid => "grid",
     }
+}
+
+fn parse_folder_settings_scope(raw: &str) -> Option<FolderSettingsScope> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "per_folder" | "per-folder" | "folder" | "current" => Some(FolderSettingsScope::PerFolder),
+        "all_folders" | "all-folders" | "all" | "global" => Some(FolderSettingsScope::AllFolders),
+        _ => None,
+    }
+}
+
+fn folder_settings_scope_str(scope: FolderSettingsScope) -> &'static str {
+    match scope {
+        FolderSettingsScope::PerFolder => "per_folder",
+        FolderSettingsScope::AllFolders => "all_folders",
+    }
+}
+
+fn take_folder_settings_scope_or_default(
+    table: &mut Table,
+    default: FolderSettingsScope,
+    warnings: &mut Vec<SettingsWarning>,
+) -> FolderSettingsScope {
+    let Some(value) = table.remove("folder_settings_scope") else {
+        return default;
+    };
+    match value {
+        Value::String(raw) => match parse_folder_settings_scope(&raw) {
+            Some(scope) => scope,
+            None => {
+                warnings.push(SettingsWarning {
+                    key: "folder_settings_scope",
+                    message: format!("unknown folder_settings_scope '{raw}'"),
+                });
+                default
+            }
+        },
+        _ => {
+            warnings.push(SettingsWarning {
+                key: "folder_settings_scope",
+                message: "folder_settings_scope must be a string".into(),
+            });
+            default
+        }
+    }
+}
+
+fn take_folder_preferences(
+    table: &mut Table,
+    warnings: &mut Vec<SettingsWarning>,
+) -> BTreeMap<Location, FolderPreferences> {
+    let mut map = BTreeMap::new();
+    let Some(val) = table.remove("folder_preferences") else {
+        return map;
+    };
+    let Value::Array(items) = val else {
+        warnings.push(SettingsWarning {
+            key: "folder_preferences",
+            message: "folder_preferences must be an array of tables".into(),
+        });
+        return map;
+    };
+
+    for (idx, item) in items.into_iter().enumerate() {
+        let Value::Table(mut t) = item else {
+            warnings.push(SettingsWarning {
+                key: "folder_preferences",
+                message: format!("folder preference entry at index {idx} is not a table"),
+            });
+            continue;
+        };
+
+        let kind = t.remove("kind").and_then(|v| match v {
+            Value::String(s) => Some(s),
+            _ => None,
+        });
+        let path = t.remove("path").and_then(|v| match v {
+            Value::String(s) if !s.is_empty() => Some(PathBuf::from(s)),
+            _ => None,
+        });
+
+        let location = match (kind.as_deref(), path) {
+            (Some("local") | None, Some(path)) => Location::Local(path),
+            (Some("remote"), Some(path)) => {
+                let profile_id = t.remove("profile_id").and_then(|v| match v {
+                    Value::String(s) if !s.is_empty() => Some(s),
+                    _ => None,
+                });
+                match profile_id {
+                    Some(profile_id) => Location::Remote { profile_id, path },
+                    None => {
+                        warnings.push(SettingsWarning {
+                            key: "folder_preferences",
+                            message: format!(
+                                "remote folder preference at index {idx} is missing profile_id"
+                            ),
+                        });
+                        continue;
+                    }
+                }
+            }
+            (Some(other), _) if other != "local" && other != "remote" => {
+                warnings.push(SettingsWarning {
+                    key: "folder_preferences",
+                    message: format!("unknown folder preference kind '{other}' at index {idx}"),
+                });
+                continue;
+            }
+            _ => {
+                warnings.push(SettingsWarning {
+                    key: "folder_preferences",
+                    message: format!("invalid folder preference entry at index {idx}"),
+                });
+                continue;
+            }
+        };
+
+        let view_mode = match t.remove("view_mode") {
+            None => None,
+            Some(Value::String(raw)) => match parse_view_mode(&raw) {
+                Some(mode) => Some(mode),
+                None => {
+                    warnings.push(SettingsWarning {
+                        key: "folder_preferences",
+                        message: format!("unknown view_mode '{raw}' at index {idx}"),
+                    });
+                    None
+                }
+            },
+            Some(_) => {
+                warnings.push(SettingsWarning {
+                    key: "folder_preferences",
+                    message: format!("view_mode at index {idx} must be a string"),
+                });
+                None
+            }
+        };
+
+        let sort_column = match t.remove("sort_column") {
+            None => None,
+            Some(Value::String(raw)) => match parse_sort_column(&raw) {
+                Some(col) => Some(col),
+                None => {
+                    warnings.push(SettingsWarning {
+                        key: "folder_preferences",
+                        message: format!("unknown sort_column '{raw}' at index {idx}"),
+                    });
+                    None
+                }
+            },
+            Some(_) => {
+                warnings.push(SettingsWarning {
+                    key: "folder_preferences",
+                    message: format!("sort_column at index {idx} must be a string"),
+                });
+                None
+            }
+        };
+
+        let sort_direction = match t.remove("sort_direction") {
+            None => None,
+            Some(Value::String(raw)) => match parse_sort_direction(&raw) {
+                Some(dir) => Some(dir),
+                None => {
+                    warnings.push(SettingsWarning {
+                        key: "folder_preferences",
+                        message: format!("unknown sort_direction '{raw}' at index {idx}"),
+                    });
+                    None
+                }
+            },
+            Some(_) => {
+                warnings.push(SettingsWarning {
+                    key: "folder_preferences",
+                    message: format!("sort_direction at index {idx} must be a string"),
+                });
+                None
+            }
+        };
+
+        let show_hidden = match t.remove("show_hidden") {
+            None => None,
+            Some(Value::Boolean(b)) => Some(b),
+            Some(_) => {
+                warnings.push(SettingsWarning {
+                    key: "folder_preferences",
+                    message: format!("show_hidden at index {idx} must be a boolean"),
+                });
+                None
+            }
+        };
+
+        let folders_first = match t.remove("folders_first") {
+            None => None,
+            Some(Value::Boolean(b)) => Some(b),
+            Some(_) => {
+                warnings.push(SettingsWarning {
+                    key: "folder_preferences",
+                    message: format!("folders_first at index {idx} must be a boolean"),
+                });
+                None
+            }
+        };
+
+        let hidden_last = match t.remove("hidden_last") {
+            None => None,
+            Some(Value::Boolean(b)) => Some(b),
+            Some(_) => {
+                warnings.push(SettingsWarning {
+                    key: "folder_preferences",
+                    message: format!("hidden_last at index {idx} must be a boolean"),
+                });
+                None
+            }
+        };
+
+        let prefs = FolderPreferences {
+            view_mode,
+            sort_column,
+            sort_direction,
+            show_hidden,
+            folders_first,
+            hidden_last,
+        };
+        if !prefs.is_empty() {
+            map.insert(location, prefs);
+        }
+    }
+
+    map
 }
 
 fn take_view_mode_or_default(
@@ -497,7 +786,25 @@ impl Settings {
         );
         let default_sort =
             take_default_sort_or_default(&mut table, defaults.default_sort, &mut warnings);
+        let folders_first = take_bool_or_default(
+            &mut table,
+            "folders_first",
+            defaults.folders_first,
+            &mut warnings,
+        );
+        let hidden_last = take_bool_or_default(
+            &mut table,
+            "hidden_last",
+            defaults.hidden_last,
+            &mut warnings,
+        );
         let view_mode = take_view_mode_or_default(&mut table, defaults.view_mode, &mut warnings);
+        let folder_settings_scope = take_folder_settings_scope_or_default(
+            &mut table,
+            defaults.folder_settings_scope,
+            &mut warnings,
+        );
+        let folder_preferences = take_folder_preferences(&mut table, &mut warnings);
         let refresh_interval_secs = take_bounded_u32_or_default(
             &mut table,
             "refresh_interval_secs",
@@ -664,7 +971,11 @@ impl Settings {
             show_hidden,
             show_sidebar,
             default_sort,
+            folders_first,
+            hidden_last,
             view_mode,
+            folder_settings_scope,
+            folder_preferences,
             refresh_interval_secs,
             list_timeout_secs,
             remote_poll_enabled,
@@ -677,6 +988,139 @@ impl Settings {
             unknown: table,
         };
         Ok((settings, warnings))
+    }
+
+    /// Resolves the effective display and sorting settings for `location`, applying any per-folder
+    /// overrides on top of the global defaults.
+    pub fn resolve_folder_settings(&self, location: &Location) -> ResolvedFolderSettings {
+        let prefs = self.folder_preferences.get(location);
+        ResolvedFolderSettings {
+            view_mode: prefs.and_then(|p| p.view_mode).unwrap_or(self.view_mode),
+            sort_column: prefs
+                .and_then(|p| p.sort_column)
+                .unwrap_or(self.default_sort.column),
+            sort_direction: prefs
+                .and_then(|p| p.sort_direction)
+                .unwrap_or(self.default_sort.direction),
+            show_hidden: prefs
+                .and_then(|p| p.show_hidden)
+                .unwrap_or(self.show_hidden),
+            folders_first: prefs
+                .and_then(|p| p.folders_first)
+                .unwrap_or(self.folders_first),
+            hidden_last: prefs
+                .and_then(|p| p.hidden_last)
+                .unwrap_or(self.hidden_last),
+        }
+    }
+
+    /// Returns `true` if `location` has at least one per-folder override stored.
+    pub fn has_folder_override(&self, location: &Location) -> bool {
+        self.folder_preferences
+            .get(location)
+            .is_some_and(|p| !p.is_empty())
+    }
+
+    fn update_folder_preference(
+        &mut self,
+        location: &Location,
+        update: impl FnOnce(&mut FolderPreferences),
+    ) {
+        let mut prefs = self
+            .folder_preferences
+            .get(location)
+            .copied()
+            .unwrap_or_default();
+        update(&mut prefs);
+        if prefs.is_empty() {
+            self.folder_preferences.remove(location);
+        } else {
+            self.folder_preferences.insert(location.clone(), prefs);
+        }
+    }
+
+    /// Stores a per-folder view mode override for `location`.
+    pub fn set_folder_view_mode(&mut self, location: &Location, mode: ViewMode) {
+        self.update_folder_preference(location, |p| p.view_mode = Some(mode));
+    }
+
+    /// Stores a per-folder sort column and direction override for `location`.
+    pub fn set_folder_sort(
+        &mut self,
+        location: &Location,
+        column: SortColumn,
+        direction: SortDirection,
+    ) {
+        self.update_folder_preference(location, |p| {
+            p.sort_column = Some(column);
+            p.sort_direction = Some(direction);
+        });
+    }
+
+    /// Stores a per-folder hidden-files override for `location`.
+    pub fn set_folder_show_hidden(&mut self, location: &Location, show: bool) {
+        self.update_folder_preference(location, |p| p.show_hidden = Some(show));
+    }
+
+    /// Stores a per-folder folders-first override for `location`.
+    pub fn set_folder_folders_first(&mut self, location: &Location, folders_first: bool) {
+        self.update_folder_preference(location, |p| p.folders_first = Some(folders_first));
+    }
+
+    /// Stores a per-folder hidden-last override for `location`.
+    pub fn set_folder_hidden_last(&mut self, location: &Location, hidden_last: bool) {
+        self.update_folder_preference(location, |p| p.hidden_last = Some(hidden_last));
+    }
+
+    /// Clears all per-folder `view_mode` overrides (used when applying a global change).
+    pub fn clear_all_folder_view_mode_overrides(&mut self) {
+        self.folder_preferences.retain(|_, p| {
+            p.view_mode = None;
+            !p.is_empty()
+        });
+    }
+
+    /// Clears all per-folder sort overrides (used when applying a global change).
+    pub fn clear_all_folder_sort_overrides(&mut self) {
+        self.folder_preferences.retain(|_, p| {
+            p.sort_column = None;
+            p.sort_direction = None;
+            !p.is_empty()
+        });
+    }
+
+    /// Clears all per-folder `show_hidden` overrides (used when applying a global change).
+    pub fn clear_all_folder_show_hidden_overrides(&mut self) {
+        self.folder_preferences.retain(|_, p| {
+            p.show_hidden = None;
+            !p.is_empty()
+        });
+    }
+
+    /// Clears all per-folder `folders_first` overrides (used when applying a global change).
+    pub fn clear_all_folder_folders_first_overrides(&mut self) {
+        self.folder_preferences.retain(|_, p| {
+            p.folders_first = None;
+            !p.is_empty()
+        });
+    }
+
+    /// Clears all per-folder `hidden_last` overrides (used when applying a global change).
+    pub fn clear_all_folder_hidden_last_overrides(&mut self) {
+        self.folder_preferences.retain(|_, p| {
+            p.hidden_last = None;
+            !p.is_empty()
+        });
+    }
+
+    /// Applies `resolved` as the global defaults and clears all per-folder overrides.
+    pub fn apply_folder_settings_to_all(&mut self, resolved: ResolvedFolderSettings) {
+        self.view_mode = resolved.view_mode;
+        self.default_sort = SortOrder::new(resolved.sort_column, resolved.sort_direction);
+        self.show_hidden = resolved.show_hidden;
+        self.folders_first = resolved.folders_first;
+        self.hidden_last = resolved.hidden_last;
+        self.folder_preferences.clear();
     }
 
     /// Atomically replaces the file at `path`: writes a temporary file in the same folder, then
@@ -824,10 +1268,74 @@ impl Settings {
             Value::String(sort_direction_str(self.default_sort.direction).into()),
         );
         table.insert("default_sort".into(), Value::Table(sort_table));
+        table.insert("folders_first".into(), Value::Boolean(self.folders_first));
+        table.insert("hidden_last".into(), Value::Boolean(self.hidden_last));
         table.insert(
             "view_mode".into(),
             Value::String(view_mode_str(self.view_mode).into()),
         );
+        table.insert(
+            "folder_settings_scope".into(),
+            Value::String(folder_settings_scope_str(self.folder_settings_scope).into()),
+        );
+        if !self.folder_preferences.is_empty() {
+            let folder_tables: Vec<Value> = self
+                .folder_preferences
+                .iter()
+                .filter(|(_, p)| !p.is_empty())
+                .map(|(loc, prefs)| {
+                    let mut t = Table::new();
+                    match loc {
+                        Location::Local(path) => {
+                            t.insert("kind".into(), Value::String("local".into()));
+                            t.insert(
+                                "path".into(),
+                                Value::String(path.to_string_lossy().to_string()),
+                            );
+                        }
+                        Location::Remote { profile_id, path } => {
+                            t.insert("kind".into(), Value::String("remote".into()));
+                            t.insert("profile_id".into(), Value::String(profile_id.clone()));
+                            t.insert(
+                                "path".into(),
+                                Value::String(path.to_string_lossy().to_string()),
+                            );
+                        }
+                    }
+                    if let Some(mode) = prefs.view_mode {
+                        t.insert(
+                            "view_mode".into(),
+                            Value::String(view_mode_str(mode).into()),
+                        );
+                    }
+                    if let Some(col) = prefs.sort_column {
+                        t.insert(
+                            "sort_column".into(),
+                            Value::String(sort_column_str(col).into()),
+                        );
+                    }
+                    if let Some(dir) = prefs.sort_direction {
+                        t.insert(
+                            "sort_direction".into(),
+                            Value::String(sort_direction_str(dir).into()),
+                        );
+                    }
+                    if let Some(show) = prefs.show_hidden {
+                        t.insert("show_hidden".into(), Value::Boolean(show));
+                    }
+                    if let Some(folders_first) = prefs.folders_first {
+                        t.insert("folders_first".into(), Value::Boolean(folders_first));
+                    }
+                    if let Some(hidden_last) = prefs.hidden_last {
+                        t.insert("hidden_last".into(), Value::Boolean(hidden_last));
+                    }
+                    Value::Table(t)
+                })
+                .collect();
+            if !folder_tables.is_empty() {
+                table.insert("folder_preferences".into(), Value::Array(folder_tables));
+            }
+        }
         table.insert(
             "refresh_interval_secs".into(),
             Value::Integer(self.refresh_interval_secs.into()),
@@ -1250,5 +1758,69 @@ mod tests {
         assert_eq!(fallback.view_mode, ViewMode::Details);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].key, "view_mode");
+    }
+
+    #[test]
+    fn settings_folder_scope_and_per_folder_preferences_roundtrip() {
+        let dir = TestDir::new("settings_folder_prefs");
+        let path = dir.path.join("settings.toml");
+        let folder_a = Location::Local(dir.path.join("a"));
+        let folder_b = Location::Local(dir.path.join("b"));
+        let remote_c = Location::Remote {
+            profile_id: "srv".into(),
+            path: PathBuf::from("/data"),
+        };
+
+        let mut s = Settings::default();
+        assert_eq!(s.folder_settings_scope, FolderSettingsScope::PerFolder);
+        s.folder_settings_scope = FolderSettingsScope::AllFolders;
+        s.set_folder_view_mode(&folder_a, ViewMode::Grid);
+        s.set_folder_sort(&folder_a, SortColumn::Created, SortDirection::Descending);
+        s.set_folder_folders_first(&folder_a, false);
+        s.set_folder_hidden_last(&folder_a, true);
+        s.set_folder_show_hidden(&remote_c, true);
+        s.save_to(&path).unwrap();
+
+        let (loaded, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            loaded.folder_settings_scope,
+            FolderSettingsScope::AllFolders
+        );
+        assert!(loaded.has_folder_override(&folder_a));
+        assert!(!loaded.has_folder_override(&folder_b));
+        assert!(loaded.has_folder_override(&remote_c));
+
+        let resolved_a = loaded.resolve_folder_settings(&folder_a);
+        assert_eq!(resolved_a.view_mode, ViewMode::Grid);
+        assert_eq!(resolved_a.sort_column, SortColumn::Created);
+        assert_eq!(resolved_a.sort_direction, SortDirection::Descending);
+        assert!(!resolved_a.show_hidden);
+        assert!(!resolved_a.folders_first);
+        assert!(resolved_a.hidden_last);
+
+        let resolved_b = loaded.resolve_folder_settings(&folder_b);
+        assert_eq!(resolved_b.view_mode, ViewMode::Details);
+        assert_eq!(resolved_b.sort_column, SortColumn::Name);
+        assert_eq!(resolved_b.sort_direction, SortDirection::Ascending);
+        assert!(!resolved_b.show_hidden);
+        assert!(resolved_b.folders_first);
+        assert!(!resolved_b.hidden_last);
+
+        let resolved_c = loaded.resolve_folder_settings(&remote_c);
+        assert_eq!(resolved_c.view_mode, ViewMode::Details);
+        assert!(resolved_c.show_hidden);
+
+        let mut applied = loaded;
+        applied.apply_folder_settings_to_all(resolved_a);
+        assert_eq!(applied.view_mode, ViewMode::Grid);
+        assert_eq!(
+            applied.default_sort,
+            SortOrder::new(SortColumn::Created, SortDirection::Descending)
+        );
+        assert!(!applied.show_hidden);
+        assert!(!applied.folders_first);
+        assert!(applied.hidden_last);
+        assert!(applied.folder_preferences.is_empty());
     }
 }

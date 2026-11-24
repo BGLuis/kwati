@@ -60,9 +60,10 @@ pub use remote_poll::{RemotePoller, MIN_POLL_INTERVAL};
 pub use search::{RemoteSearchOptions, SearchHandle, SearchHit, SearchOptions, Searcher};
 pub use secrets::{KeyringSecrets, Secrets, SecretsError};
 pub use settings::{
-    default_path as settings_path, MotionPreference, Settings, SettingsWarning, ViewMode,
-    DEFAULT_REFRESH_INTERVAL_SECS, DEFAULT_REMOTE_POLL_INTERVAL_SECS, DEFAULT_REMOTE_SEARCH_DEPTH,
-    DEFAULT_REMOTE_SEARCH_PARALLEL, MIN_REMOTE_POLL_INTERVAL_SECS,
+    default_path as settings_path, FolderPreferences, FolderSettingsScope, MotionPreference,
+    ResolvedFolderSettings, Settings, SettingsWarning, ViewMode, DEFAULT_REFRESH_INTERVAL_SECS,
+    DEFAULT_REMOTE_POLL_INTERVAL_SECS, DEFAULT_REMOTE_SEARCH_DEPTH, DEFAULT_REMOTE_SEARCH_PARALLEL,
+    MIN_REMOTE_POLL_INTERVAL_SECS,
 };
 pub use sftp::{known_hosts_path, HostKeyChanged, HostKeyUnknown, KnownHosts, SftpBackend};
 pub use smb::SmbBackend;
@@ -100,6 +101,8 @@ pub struct Entry {
     pub is_dir: bool,
     pub size: Option<u64>,
     pub modified: Option<std::time::SystemTime>,
+    pub created: Option<std::time::SystemTime>,
+    pub accessed: Option<std::time::SystemTime>,
     pub is_hidden: bool,
 }
 
@@ -112,6 +115,8 @@ impl Entry {
             is_dir,
             size: None,
             modified: None,
+            created: None,
+            accessed: None,
             is_hidden,
         }
     }
@@ -123,6 +128,16 @@ impl Entry {
 
     pub fn with_modified(mut self, modified: std::time::SystemTime) -> Self {
         self.modified = Some(modified);
+        self
+    }
+
+    pub fn with_created(mut self, created: std::time::SystemTime) -> Self {
+        self.created = Some(created);
+        self
+    }
+
+    pub fn with_accessed(mut self, accessed: std::time::SystemTime) -> Self {
+        self.accessed = Some(accessed);
         self
     }
 
@@ -149,6 +164,14 @@ impl Entry {
 
     pub fn modified(&self) -> Option<std::time::SystemTime> {
         self.modified
+    }
+
+    pub fn created(&self) -> Option<std::time::SystemTime> {
+        self.created
+    }
+
+    pub fn accessed(&self) -> Option<std::time::SystemTime> {
+        self.accessed
     }
 
     pub fn is_hidden(&self) -> bool {
@@ -202,6 +225,9 @@ pub enum SortColumn {
     Name,
     Size,
     Date,
+    Created,
+    Accessed,
+    Type,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -228,6 +254,8 @@ pub struct ListOptions {
     pub show_hidden: bool,
     pub sort_column: SortColumn,
     pub sort_direction: SortDirection,
+    pub folders_first: bool,
+    pub hidden_last: bool,
 }
 
 impl Default for ListOptions {
@@ -236,6 +264,8 @@ impl Default for ListOptions {
             show_hidden: false,
             sort_column: SortColumn::Name,
             sort_direction: SortDirection::Ascending,
+            folders_first: true,
+            hidden_last: false,
         }
     }
 }
@@ -255,6 +285,16 @@ impl ListOptions {
         self.sort_direction = direction;
         self
     }
+
+    pub fn folders_first(mut self, folders_first: bool) -> Self {
+        self.folders_first = folders_first;
+        self
+    }
+
+    pub fn hidden_last(mut self, hidden_last: bool) -> Self {
+        self.hidden_last = hidden_last;
+        self
+    }
 }
 
 pub fn sort_entries(entries: &mut [Entry]) {
@@ -262,9 +302,47 @@ pub fn sort_entries(entries: &mut [Entry]) {
 }
 
 pub fn sort_entries_by(entries: &mut [Entry], column: SortColumn, direction: SortDirection) {
+    sort_entries_with(entries, column, direction, true, false);
+}
+
+fn entry_type_sort_key(entry: &Entry) -> (u8, String) {
+    if entry.is_dir {
+        return (0, String::new());
+    }
+    let ext = entry
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext.is_empty() {
+        (1, ext)
+    } else {
+        (2, ext)
+    }
+}
+
+/// Sorts `entries` by `column` and `direction`, optionally grouping folders first and hidden entries last.
+pub fn sort_entries_with(
+    entries: &mut [Entry],
+    column: SortColumn,
+    direction: SortDirection,
+    folders_first: bool,
+    hidden_last: bool,
+) {
     entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
+        let dir_ord = if folders_first {
+            b.is_dir.cmp(&a.is_dir)
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        let hidden_ord = if hidden_last {
+            a.is_hidden.cmp(&b.is_hidden)
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        dir_ord
+            .then(hidden_ord)
             .then_with(|| {
                 let ord = match column {
                     SortColumn::Name => {
@@ -274,11 +352,19 @@ pub fn sort_entries_by(entries: &mut [Entry], column: SortColumn, direction: Sor
                     }
                     SortColumn::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
                     SortColumn::Date => a.modified.cmp(&b.modified),
+                    SortColumn::Created => a.created.cmp(&b.created),
+                    SortColumn::Accessed => a.accessed.cmp(&b.accessed),
+                    SortColumn::Type => entry_type_sort_key(a).cmp(&entry_type_sort_key(b)),
                 };
                 match direction {
                     SortDirection::Ascending => ord,
                     SortDirection::Descending => ord.reverse(),
                 }
+            })
+            .then_with(|| {
+                let a_lower = a.name.to_string_lossy().to_lowercase();
+                let b_lower = b.name.to_string_lossy().to_lowercase();
+                a_lower.cmp(&b_lower)
             })
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.path.cmp(&b.path))
@@ -379,6 +465,8 @@ pub fn list_dir_with_options(path: &Path, options: &ListOptions) -> io::Result<L
             metadata.as_ref().map(|meta| meta.len())
         };
         let modified = metadata.as_ref().and_then(|meta| meta.modified().ok());
+        let created = metadata.as_ref().and_then(|meta| meta.created().ok());
+        let accessed = metadata.as_ref().and_then(|meta| meta.accessed().ok());
 
         entries.push(Entry {
             name,
@@ -386,13 +474,20 @@ pub fn list_dir_with_options(path: &Path, options: &ListOptions) -> io::Result<L
             is_dir,
             size,
             modified,
+            created,
+            accessed,
             is_hidden,
         });
     }
 
-    let mut listing = Listing { entries };
-    listing.sort_by(options.sort_column, options.sort_direction);
-    Ok(listing)
+    sort_entries_with(
+        &mut entries,
+        options.sort_column,
+        options.sort_direction,
+        options.folders_first,
+        options.hidden_last,
+    );
+    Ok(Listing { entries })
 }
 
 fn contains_path_separator(path: &Path) -> bool {
@@ -736,7 +831,13 @@ pub trait Backend: Send + Sync {
             Location::Remote { .. } => {
                 let mut entries = self.list(location)?.into_entries();
                 entries.retain(|entry| options.show_hidden || !entry.is_hidden);
-                sort_entries_by(&mut entries, options.sort_column, options.sort_direction);
+                sort_entries_with(
+                    &mut entries,
+                    options.sort_column,
+                    options.sort_direction,
+                    options.folders_first,
+                    options.hidden_last,
+                );
                 Ok(Listing { entries })
             }
         }

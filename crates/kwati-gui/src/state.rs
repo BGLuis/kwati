@@ -9,12 +9,12 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{AsyncApp, Context, Task, WeakEntity};
 use kwati_core::{
-    default_icons_path, list_trash, settings_path, sort_entries_by, volume_kind, Backend,
-    BackendError, ConnectionProfile, ConnectionState, DirWatcher, Entry, History, HostKeyUnknown,
-    IconColor, IconConfig, IconGroup, IconResolver, IconSource, ListOptions, LocalBackend,
-    Location, PlaceEntry, ReconnectingBackend, RemoteEditWatcher, RemoteFileCache,
-    RemoteStreamServer, Selection, Settings, SettingsWarning, SortColumn, SortDirection, SortOrder,
-    TrashItem, ViewMode, VolumeKind,
+    default_icons_path, list_trash, settings_path, sort_entries_with, volume_kind, Backend,
+    BackendError, ConnectionProfile, ConnectionState, DirWatcher, Entry, FolderSettingsScope,
+    History, HostKeyUnknown, IconColor, IconConfig, IconGroup, IconResolver, IconSource,
+    ListOptions, LocalBackend, Location, PlaceEntry, ReconnectingBackend, RemoteEditWatcher,
+    RemoteFileCache, RemoteStreamServer, ResolvedFolderSettings, Selection, Settings,
+    SettingsWarning, SortColumn, SortDirection, SortOrder, TrashItem, ViewMode, VolumeKind,
 };
 
 use crate::actions::remote_files::{
@@ -291,6 +291,8 @@ pub struct AppState {
     pub sort_column: SortColumn,
     pub sort_direction: SortDirection,
     pub show_hidden: bool,
+    pub folders_first: bool,
+    pub hidden_last: bool,
     pub view_mode: ViewMode,
     pub panels: PanelLayout,
     pub dir_watcher: Option<DirWatcher>,
@@ -324,7 +326,7 @@ impl AppState {
     /// Creates an isolated in-memory state suitable for headless tests (no disk config/keyring I/O).
     pub fn new(initial_location: Location) -> Self {
         let settings = Settings::default();
-        let view_mode = settings.view_mode;
+        let resolved = settings.resolve_folder_settings(&initial_location);
         set_active_motion_preference(settings.motion_preference);
         let (remote_edit_tx, remote_edit_rx) = mpsc::unbounded();
         Self {
@@ -364,10 +366,12 @@ impl AppState {
             pending_change_origin: EntryChangeOrigin::UserAction,
             highlighted_inserts: Vec::new(),
             recent_deletions: Vec::new(),
-            sort_column: SortColumn::Name,
-            sort_direction: SortDirection::Ascending,
-            show_hidden: false,
-            view_mode,
+            sort_column: resolved.sort_column,
+            sort_direction: resolved.sort_direction,
+            show_hidden: resolved.show_hidden,
+            folders_first: resolved.folders_first,
+            hidden_last: resolved.hidden_last,
+            view_mode: resolved.view_mode,
             panels: PanelLayout::default(),
             dir_watcher: None,
             remote_cache: Arc::new(RemoteFileCache::new()),
@@ -429,10 +433,13 @@ impl AppState {
     }
 
     fn apply_loaded_settings(&mut self, settings: Settings, warnings: Vec<SettingsWarning>) {
-        self.show_hidden = settings.show_hidden;
-        self.sort_column = settings.default_sort.column;
-        self.sort_direction = settings.default_sort.direction;
-        self.view_mode = settings.view_mode;
+        let resolved = settings.resolve_folder_settings(&self.current_location);
+        self.show_hidden = resolved.show_hidden;
+        self.folders_first = resolved.folders_first;
+        self.hidden_last = resolved.hidden_last;
+        self.sort_column = resolved.sort_column;
+        self.sort_direction = resolved.sort_direction;
+        self.view_mode = resolved.view_mode;
         self.panels.sidebar_open = settings.show_sidebar;
         set_active_motion_preference(settings.motion_preference);
         self.settings = settings;
@@ -496,7 +503,20 @@ impl AppState {
             *settings = Settings::default();
             Ok(())
         })?;
-        self.view_mode = self.settings.view_mode;
+        let resolved = self
+            .settings
+            .resolve_folder_settings(&self.current_location);
+        self.view_mode = resolved.view_mode;
+        self.sort_column = resolved.sort_column;
+        self.sort_direction = resolved.sort_direction;
+        self.folders_first = resolved.folders_first;
+        self.hidden_last = resolved.hidden_last;
+        if self.show_hidden != resolved.show_hidden {
+            self.show_hidden = resolved.show_hidden;
+            self.reload_entries();
+        } else {
+            self.re_sort_entries();
+        }
         self.panels.sidebar_open = self.settings.show_sidebar;
         self.settings_warnings.clear();
         Ok(())
@@ -1168,10 +1188,13 @@ impl AppState {
             (Arrival::Reload, Some(pending)) => pending,
             _ => (target, arrival),
         };
+        let target_settings = self.settings.resolve_folder_settings(&target);
         let options = ListOptions {
-            show_hidden: self.show_hidden,
-            sort_column: self.sort_column,
-            sort_direction: self.sort_direction,
+            show_hidden: target_settings.show_hidden,
+            sort_column: target_settings.sort_column,
+            sort_direction: target_settings.sort_direction,
+            folders_first: target_settings.folders_first,
+            hidden_last: target_settings.hidden_last,
         };
         let timeout = self.list_timeout();
         let is_network = is_network_location(&target);
@@ -1295,6 +1318,13 @@ impl AppState {
         self.trash_active = false;
         self.trash_task = None;
         self.trash_loading = false;
+        let resolved = self.settings.resolve_folder_settings(&target);
+        self.view_mode = resolved.view_mode;
+        self.sort_column = resolved.sort_column;
+        self.sort_direction = resolved.sort_direction;
+        self.show_hidden = resolved.show_hidden;
+        self.folders_first = resolved.folders_first;
+        self.hidden_last = resolved.hidden_last;
         self.current_location = target;
         self.selection.clear();
         self.preview_state = None;
@@ -1372,75 +1402,313 @@ impl AppState {
         }));
     }
 
-    /// Toggles sorting on the given column.
-    /// Clicking the active column inverts direction; clicking another resets to Ascending.
-    pub fn toggle_sort(&mut self, column: SortColumn) {
-        if self.sort_column == column {
-            self.sort_direction = match self.sort_direction {
-                SortDirection::Ascending => SortDirection::Descending,
-                SortDirection::Descending => SortDirection::Ascending,
-            };
-        } else {
-            self.sort_column = column;
-            self.sort_direction = SortDirection::Ascending;
-        }
-
+    fn re_sort_entries(&mut self) {
         let mut entries = (*self.entries).clone();
-        sort_entries_by(&mut entries, self.sort_column, self.sort_direction);
+        sort_entries_with(
+            &mut entries,
+            self.sort_column,
+            self.sort_direction,
+            self.folders_first,
+            self.hidden_last,
+        );
         self.set_entries(entries);
     }
 
-    /// Toggles the visibility of hidden files and reloads the directory listing.
-    pub fn toggle_hidden(&mut self) {
-        self.show_hidden = !self.show_hidden;
-        self.reload_entries();
+    /// Toggles sorting on the given column for the active scope (current folder or global).
+    /// Clicking the active column inverts direction; clicking another resets to Ascending.
+    pub fn toggle_sort(&mut self, column: SortColumn) {
+        let direction = if self.sort_column == column {
+            match self.sort_direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            }
+        } else {
+            SortDirection::Ascending
+        };
+        self.set_current_sort(column, direction);
     }
 
-    /// Sets hidden file visibility, persists when configured, and reloads the directory listing if changed.
+    /// Toggles the visibility of hidden files for the active scope and reloads the directory listing.
+    pub fn toggle_hidden(&mut self) {
+        self.set_current_show_hidden(!self.show_hidden);
+    }
+
+    /// Sets global hidden file visibility, persists when configured, and reloads the directory
+    /// listing if the effective value for the current folder changed.
     pub fn set_show_hidden(&mut self, show: bool) {
-        if self.settings.show_hidden != show {
+        let clear_overrides =
+            self.settings.folder_settings_scope == FolderSettingsScope::AllFolders;
+        if self.settings.show_hidden != show || clear_overrides {
             if let Err(err) = self.update_settings(|s| {
                 s.show_hidden = show;
+                if clear_overrides {
+                    s.clear_all_folder_show_hidden_overrides();
+                }
                 Ok(())
             }) {
                 self.set_status(err);
             }
         }
-        if self.show_hidden != show {
-            self.show_hidden = show;
+        let effective = self
+            .settings
+            .resolve_folder_settings(&self.current_location)
+            .show_hidden;
+        if self.show_hidden != effective {
+            self.show_hidden = effective;
             self.reload_entries();
         }
     }
 
-    /// Sets the sort column and direction, persists when configured, and re-sorts the current entries.
-    pub fn set_sort(&mut self, column: SortColumn, direction: SortDirection) {
-        let order = SortOrder { column, direction };
-        if self.settings.default_sort != order {
+    /// Sets global `folders_first` placement, persists, and re-sorts when effective for the current folder.
+    pub fn set_folders_first(&mut self, folders_first: bool) {
+        let clear_overrides =
+            self.settings.folder_settings_scope == FolderSettingsScope::AllFolders;
+        if self.settings.folders_first != folders_first || clear_overrides {
             if let Err(err) = self.update_settings(|s| {
-                s.default_sort = order;
+                s.folders_first = folders_first;
+                if clear_overrides {
+                    s.clear_all_folder_folders_first_overrides();
+                }
                 Ok(())
             }) {
                 self.set_status(err);
             }
         }
-        self.sort_column = column;
-        self.sort_direction = direction;
-        let mut entries = (*self.entries).clone();
-        sort_entries_by(&mut entries, self.sort_column, self.sort_direction);
-        self.set_entries(entries);
+        let effective = self
+            .settings
+            .resolve_folder_settings(&self.current_location)
+            .folders_first;
+        if self.folders_first != effective {
+            self.folders_first = effective;
+            self.re_sort_entries();
+        }
     }
 
-    /// Sets the active listing view mode and persists it when configured.
-    pub fn set_view_mode(&mut self, mode: ViewMode) {
-        if self.settings.view_mode != mode {
+    /// Sets global `hidden_last` placement, persists, and re-sorts when effective for the current folder.
+    pub fn set_hidden_last(&mut self, hidden_last: bool) {
+        let clear_overrides =
+            self.settings.folder_settings_scope == FolderSettingsScope::AllFolders;
+        if self.settings.hidden_last != hidden_last || clear_overrides {
             if let Err(err) = self.update_settings(|s| {
-                s.view_mode = mode;
+                s.hidden_last = hidden_last;
+                if clear_overrides {
+                    s.clear_all_folder_hidden_last_overrides();
+                }
                 Ok(())
             }) {
                 self.set_status(err);
             }
         }
-        self.view_mode = mode;
+        let effective = self
+            .settings
+            .resolve_folder_settings(&self.current_location)
+            .hidden_last;
+        if self.hidden_last != effective {
+            self.hidden_last = effective;
+            self.re_sort_entries();
+        }
+    }
+
+    /// Sets the global sort column and direction, persists when configured, and re-sorts entries
+    /// when effective for the current folder.
+    pub fn set_sort(&mut self, column: SortColumn, direction: SortDirection) {
+        let order = SortOrder { column, direction };
+        let clear_overrides =
+            self.settings.folder_settings_scope == FolderSettingsScope::AllFolders;
+        if self.settings.default_sort != order || clear_overrides {
+            if let Err(err) = self.update_settings(|s| {
+                s.default_sort = order;
+                if clear_overrides {
+                    s.clear_all_folder_sort_overrides();
+                }
+                Ok(())
+            }) {
+                self.set_status(err);
+            }
+        }
+        let effective = self
+            .settings
+            .resolve_folder_settings(&self.current_location);
+        self.sort_column = effective.sort_column;
+        self.sort_direction = effective.sort_direction;
+        self.re_sort_entries();
+    }
+
+    /// Sets the global listing view mode and persists it when configured.
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        let clear_overrides =
+            self.settings.folder_settings_scope == FolderSettingsScope::AllFolders;
+        if self.settings.view_mode != mode || clear_overrides {
+            if let Err(err) = self.update_settings(|s| {
+                s.view_mode = mode;
+                if clear_overrides {
+                    s.clear_all_folder_view_mode_overrides();
+                }
+                Ok(())
+            }) {
+                self.set_status(err);
+            }
+        }
+        self.view_mode = self
+            .settings
+            .resolve_folder_settings(&self.current_location)
+            .view_mode;
+    }
+
+    /// Sets whether explorer view/sort/hidden changes apply per folder or to all folders.
+    pub fn set_folder_settings_scope(&mut self, scope: FolderSettingsScope) -> Result<(), String> {
+        self.update_settings(|s| {
+            s.folder_settings_scope = scope;
+            Ok(())
+        })
+    }
+
+    /// Sets view mode from the explorer UI (context menu, header switcher, shortcuts),
+    /// persisting either for the current folder or globally according to `folder_settings_scope`.
+    pub fn set_current_view_mode(&mut self, mode: ViewMode) {
+        match self.settings.folder_settings_scope {
+            FolderSettingsScope::PerFolder => {
+                let location = self.current_location.clone();
+                if let Err(err) = self.update_settings(|s| {
+                    s.set_folder_view_mode(&location, mode);
+                    Ok(())
+                }) {
+                    self.set_status(err);
+                }
+                self.view_mode = mode;
+            }
+            FolderSettingsScope::AllFolders => {
+                self.set_view_mode(mode);
+            }
+        }
+    }
+
+    /// Sets sort column and direction from the explorer UI according to `folder_settings_scope`.
+    pub fn set_current_sort(&mut self, column: SortColumn, direction: SortDirection) {
+        match self.settings.folder_settings_scope {
+            FolderSettingsScope::PerFolder => {
+                let location = self.current_location.clone();
+                if let Err(err) = self.update_settings(|s| {
+                    s.set_folder_sort(&location, column, direction);
+                    Ok(())
+                }) {
+                    self.set_status(err);
+                }
+                self.sort_column = column;
+                self.sort_direction = direction;
+                self.re_sort_entries();
+            }
+            FolderSettingsScope::AllFolders => {
+                self.set_sort(column, direction);
+            }
+        }
+    }
+
+    /// Updates only the sort column in the explorer UI while keeping the current direction.
+    pub fn set_current_sort_column(&mut self, column: SortColumn) {
+        self.set_current_sort(column, self.sort_direction);
+    }
+
+    /// Updates only the sort direction in the explorer UI while keeping the current column.
+    pub fn set_current_sort_direction(&mut self, direction: SortDirection) {
+        self.set_current_sort(self.sort_column, direction);
+    }
+
+    /// Sets hidden-files visibility from the explorer UI according to `folder_settings_scope`.
+    pub fn set_current_show_hidden(&mut self, show: bool) {
+        match self.settings.folder_settings_scope {
+            FolderSettingsScope::PerFolder => {
+                let location = self.current_location.clone();
+                if let Err(err) = self.update_settings(|s| {
+                    s.set_folder_show_hidden(&location, show);
+                    Ok(())
+                }) {
+                    self.set_status(err);
+                }
+                if self.show_hidden != show {
+                    self.show_hidden = show;
+                    self.reload_entries();
+                }
+            }
+            FolderSettingsScope::AllFolders => {
+                self.set_show_hidden(show);
+            }
+        }
+    }
+
+    /// Sets `folders_first` from the explorer UI according to `folder_settings_scope`.
+    pub fn set_current_folders_first(&mut self, folders_first: bool) {
+        match self.settings.folder_settings_scope {
+            FolderSettingsScope::PerFolder => {
+                let location = self.current_location.clone();
+                if let Err(err) = self.update_settings(|s| {
+                    s.set_folder_folders_first(&location, folders_first);
+                    Ok(())
+                }) {
+                    self.set_status(err);
+                }
+                if self.folders_first != folders_first {
+                    self.folders_first = folders_first;
+                    self.re_sort_entries();
+                }
+            }
+            FolderSettingsScope::AllFolders => {
+                self.set_folders_first(folders_first);
+            }
+        }
+    }
+
+    /// Sets `hidden_last` from the explorer UI according to `folder_settings_scope`.
+    pub fn set_current_hidden_last(&mut self, hidden_last: bool) {
+        match self.settings.folder_settings_scope {
+            FolderSettingsScope::PerFolder => {
+                let location = self.current_location.clone();
+                if let Err(err) = self.update_settings(|s| {
+                    s.set_folder_hidden_last(&location, hidden_last);
+                    Ok(())
+                }) {
+                    self.set_status(err);
+                }
+                if self.hidden_last != hidden_last {
+                    self.hidden_last = hidden_last;
+                    self.re_sort_entries();
+                }
+            }
+            FolderSettingsScope::AllFolders => {
+                self.set_hidden_last(hidden_last);
+            }
+        }
+    }
+
+    /// Toggles `folders_first` for the active scope and re-sorts the listing.
+    pub fn toggle_folders_first(&mut self) {
+        self.set_current_folders_first(!self.folders_first);
+    }
+
+    /// Toggles `hidden_last` for the active scope and re-sorts the listing.
+    pub fn toggle_hidden_last(&mut self) {
+        self.set_current_hidden_last(!self.hidden_last);
+    }
+
+    /// Promotes the active folder's view, sort, and hidden-file settings to global defaults
+    /// and clears per-folder overrides so every folder shares them.
+    pub fn apply_current_folder_settings_to_all(&mut self) {
+        let resolved = ResolvedFolderSettings {
+            view_mode: self.view_mode,
+            sort_column: self.sort_column,
+            sort_direction: self.sort_direction,
+            show_hidden: self.show_hidden,
+            folders_first: self.folders_first,
+            hidden_last: self.hidden_last,
+        };
+        if let Err(err) = self.update_settings(|s| {
+            s.apply_folder_settings_to_all(resolved);
+            Ok(())
+        }) {
+            self.set_status(err);
+        } else {
+            self.set_completion_status("Applied folder settings to all folders");
+        }
     }
 
     /// Shows or hides the sidebar and persists the choice when configured.
@@ -1460,14 +1728,14 @@ impl AppState {
         self.set_sidebar_open(!self.panels.sidebar_open);
     }
 
-    /// Cycles through `Details -> Grid -> CompactList -> Details` and persists the choice.
+    /// Cycles through `Details -> Grid -> CompactList -> Details` for the active scope.
     pub fn cycle_view_mode(&mut self) -> ViewMode {
         let next = match self.view_mode {
             ViewMode::Details => ViewMode::Grid,
             ViewMode::Grid => ViewMode::CompactList,
             ViewMode::CompactList => ViewMode::Details,
         };
-        self.set_view_mode(next);
+        self.set_current_view_mode(next);
         next
     }
 

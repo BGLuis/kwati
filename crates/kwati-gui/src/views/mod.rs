@@ -11,7 +11,9 @@ pub mod settings_view;
 pub mod sidebar_view;
 pub mod trash_view;
 
-pub use context_menu::{ContextMenuAction, ContextMenuEntry, ContextMenuEvent, ContextMenuView};
+pub use context_menu::{
+    ContextMenuAction, ContextMenuEntry, ContextMenuEvent, ContextMenuView, FolderMenuState,
+};
 pub use dialogs::{DialogKind, DialogsView};
 pub use header_view::HeaderView;
 pub use jobs_view::JobsView;
@@ -567,6 +569,63 @@ impl MainView {
                 }
                 self.focus_active_content(window, cx);
             }
+            ContextMenuAction::SetViewMode(mode) => {
+                self.set_view_mode(mode, cx);
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::SetSortColumn(column) => {
+                self.app_state.update(cx, |state, cx| {
+                    state.set_current_sort_column(column);
+                    cx.notify();
+                });
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::SetSortDirection(direction) => {
+                self.app_state.update(cx, |state, cx| {
+                    state.set_current_sort_direction(direction);
+                    cx.notify();
+                });
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::ToggleShowHidden => {
+                self.app_state.update(cx, |state, cx| {
+                    state.toggle_hidden();
+                    cx.notify();
+                });
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::ToggleFoldersFirst => {
+                self.app_state.update(cx, |state, cx| {
+                    state.toggle_folders_first();
+                    cx.notify();
+                });
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::ToggleHiddenLast => {
+                self.app_state.update(cx, |state, cx| {
+                    state.toggle_hidden_last();
+                    cx.notify();
+                });
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::ToggleSidebar => {
+                self.app_state.update(cx, |state, cx| {
+                    state.toggle_sidebar();
+                    cx.notify();
+                });
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::TogglePreview => {
+                self.resize_panels(cx, PanelLayout::toggle_preview);
+                self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::ApplyFolderSettingsToAll => {
+                self.app_state.update(cx, |state, cx| {
+                    state.apply_current_folder_settings_to_all();
+                    cx.notify();
+                });
+                self.list.read(cx).focus_handle.focus(window);
+            }
         }
     }
 
@@ -638,7 +697,7 @@ impl MainView {
 
     fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
         self.app_state.update(cx, |state, cx| {
-            state.set_view_mode(mode);
+            state.set_current_view_mode(mode);
             cx.notify();
         });
         cx.notify();
@@ -982,6 +1041,9 @@ pub fn format_status_selection_metadata(state: &AppState) -> String {
         SortColumn::Name => "Name",
         SortColumn::Size => "Size",
         SortColumn::Date => "Modified",
+        SortColumn::Created => "Created",
+        SortColumn::Accessed => "Accessed",
+        SortColumn::Type => "Type",
     };
     let dir = match state.sort_direction {
         SortDirection::Ascending => "▲",
