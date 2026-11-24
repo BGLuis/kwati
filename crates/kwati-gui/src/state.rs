@@ -405,6 +405,7 @@ impl AppState {
         self.sort_column = settings.default_sort.column;
         self.sort_direction = settings.default_sort.direction;
         self.view_mode = settings.view_mode;
+        self.panels.sidebar_open = settings.show_sidebar;
         set_active_motion_preference(settings.motion_preference);
         self.settings = settings;
         self.settings_warnings = warnings;
@@ -468,6 +469,7 @@ impl AppState {
             Ok(())
         })?;
         self.view_mode = self.settings.view_mode;
+        self.panels.sidebar_open = self.settings.show_sidebar;
         self.settings_warnings.clear();
         Ok(())
     }
@@ -1322,6 +1324,23 @@ impl AppState {
             }
         }
         self.view_mode = mode;
+    }
+
+    /// Shows or hides the sidebar and persists the choice when configured.
+    pub fn set_sidebar_open(&mut self, open: bool) {
+        if self.settings.show_sidebar != open {
+            if let Err(err) = self.update_settings(|s| {
+                s.show_sidebar = open;
+                Ok(())
+            }) {
+                self.set_status(err);
+            }
+        }
+        self.panels.sidebar_open = open;
+    }
+
+    pub fn toggle_sidebar(&mut self) {
+        self.set_sidebar_open(!self.panels.sidebar_open);
     }
 
     /// Cycles through `Details -> Grid -> CompactList -> Details` and persists the choice.

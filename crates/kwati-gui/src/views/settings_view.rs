@@ -38,6 +38,7 @@ pub enum SettingsSectionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingKey {
     ShowHidden,
+    ShowSidebar,
     DefaultSortColumn,
     DefaultSortDirection,
     ViewMode,
@@ -88,6 +89,13 @@ pub const SETTINGS_ROWS: &[SettingRowSpec] = &[
         section: SettingsSectionId::General,
         label: "Mostrar arquivos ocultos",
         description: "Exibe arquivos e pastas iniciados por ponto nas listagens.",
+        kind: SettingControlKind::Toggle,
+    },
+    SettingRowSpec {
+        key: SettingKey::ShowSidebar,
+        section: SettingsSectionId::General,
+        label: "Mostrar barra lateral",
+        description: "Exibe locais, favoritos e drives à esquerda da lista (F9).",
         kind: SettingControlKind::Toggle,
     },
     SettingRowSpec {
@@ -557,6 +565,15 @@ impl SettingsView {
                 state.set_show_hidden(next);
                 Ok(())
             }
+            SettingKey::ShowSidebar => {
+                let next = !state.settings.show_sidebar;
+                state.update_settings(|s| {
+                    s.show_sidebar = next;
+                    Ok(())
+                })?;
+                state.set_sidebar_open(next);
+                Ok(())
+            }
             SettingKey::RemotePollEnabled => {
                 let next = !state.settings.remote_poll_enabled;
                 let interval = state.settings.remote_poll_interval_secs;
@@ -945,6 +962,7 @@ impl SettingsView {
             SettingControlKind::Toggle => {
                 let active = match spec.key {
                     SettingKey::ShowHidden => settings.show_hidden,
+                    SettingKey::ShowSidebar => settings.show_sidebar,
                     SettingKey::RemotePollEnabled => settings.remote_poll_enabled,
                     _ => false,
                 };
