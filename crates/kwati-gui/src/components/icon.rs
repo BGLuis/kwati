@@ -671,6 +671,35 @@ pub fn resolve_icon_color(type_key: &str, prefs: &IconPreferences, theme: &Theme
         .into()
 }
 
+/// Renders a pre-resolved icon driven by `motion` at an explicit square size using `color`.
+pub fn render_resolved_icon(
+    resolved: &ResolvedIcon,
+    builtin: IconName,
+    motion: IconMotion,
+    icon_size: Pixels,
+    color: impl Into<Hsla>,
+) -> AnyElement {
+    let color = color.into();
+    match resolved {
+        ResolvedIcon::BuiltIn => animated_icon_sized(builtin, motion, icon_size, color),
+        ResolvedIcon::Image { path, is_symbolic } => {
+            if *is_symbolic {
+                svg()
+                    .path(format!("fs-symbolic:{}", path.display()))
+                    .size(icon_size)
+                    .flex_none()
+                    .text_color(color)
+                    .into_any_element()
+            } else {
+                img(path.clone())
+                    .size(icon_size)
+                    .flex_none()
+                    .into_any_element()
+            }
+        }
+    }
+}
+
 /// Renders an icon driven by `motion` at an explicit square size using `color`, or loads a
 /// custom theme/image icon when configured in `prefs`.
 ///
@@ -684,23 +713,9 @@ pub fn resolved_icon(
     prefs: &IconPreferences,
     resolver: &IconResolver,
 ) -> AnyElement {
-    let color = color.into();
     let size_px = (icon_size / px(1.0)).round().max(1.0) as u16;
-    match resolver.resolve(prefs, builtin.key_name(), size_px) {
-        ResolvedIcon::BuiltIn => animated_icon_sized(builtin, motion, icon_size, color),
-        ResolvedIcon::Image { path, is_symbolic } => {
-            if is_symbolic {
-                svg()
-                    .path(format!("fs-symbolic:{}", path.display()))
-                    .size(icon_size)
-                    .flex_none()
-                    .text_color(color)
-                    .into_any_element()
-            } else {
-                img(path).size(icon_size).flex_none().into_any_element()
-            }
-        }
-    }
+    let resolved = resolver.resolve(prefs, builtin.key_name(), size_px);
+    render_resolved_icon(&resolved, builtin, motion, icon_size, color)
 }
 
 fn load_builtin_svg(path: &str) -> Option<&'static [u8]> {

@@ -52,44 +52,77 @@ pub fn icon_for_entry(
     is_remote: bool,
     specials: &SpecialFolders,
 ) -> IconName {
-    if is_dir {
-        return folder_icon_for(path, is_remote, specials);
+    let (icon, needs_probe) = fast_icon_for_entry(path, is_dir, is_remote, specials);
+    if needs_probe {
+        probe_entry_icon(path, is_dir, icon)
+    } else {
+        icon
     }
-    file_icon_for(path, is_remote)
 }
 
-fn folder_icon_for(path: &Path, is_remote: bool, specials: &SpecialFolders) -> IconName {
+/// Resolves an entry icon using only path/name/extension heuristics without touching disk,
+/// returning `(icon, needs_disk_probe)` so callers can run `.git`/executable checks off-thread.
+pub fn fast_icon_for_entry(
+    path: &Path,
+    is_dir: bool,
+    is_remote: bool,
+    specials: &SpecialFolders,
+) -> (IconName, bool) {
+    if is_dir {
+        return fast_folder_icon_for(path, is_remote, specials);
+    }
+    fast_file_icon_for(path, is_remote)
+}
+
+/// Completes the disk probe (`.git` directory or executable permission bit) for an entry whose
+/// fast icon was [`IconName::Folder`] or [`IconName::File`].
+pub fn probe_entry_icon(path: &Path, is_dir: bool, base: IconName) -> IconName {
+    if is_dir {
+        if base == IconName::Folder && path.join(".git").symlink_metadata().is_ok() {
+            return IconName::FolderProjects;
+        }
+    } else if base == IconName::File && path.extension().is_none() && is_executable_file(path) {
+        return IconName::FileBinary;
+    }
+    base
+}
+
+fn fast_folder_icon_for(
+    path: &Path,
+    is_remote: bool,
+    specials: &SpecialFolders,
+) -> (IconName, bool) {
     if !is_remote {
         // Check home before other XDG dirs in case an unconfigured XDG dir aliases $HOME.
         if specials.home.as_deref() == Some(path) {
-            return IconName::FolderHome;
+            return (IconName::FolderHome, false);
         }
         if specials.desktop.as_deref() == Some(path) {
-            return IconName::FolderDesktop;
+            return (IconName::FolderDesktop, false);
         }
         if specials.documents.as_deref() == Some(path) {
-            return IconName::FolderDocuments;
+            return (IconName::FolderDocuments, false);
         }
         if specials.downloads.as_deref() == Some(path) {
-            return IconName::FolderDownloads;
+            return (IconName::FolderDownloads, false);
         }
         if specials.pictures.as_deref() == Some(path) {
-            return IconName::FolderPictures;
+            return (IconName::FolderPictures, false);
         }
         if specials.music.as_deref() == Some(path) {
-            return IconName::FolderMusic;
+            return (IconName::FolderMusic, false);
         }
         if specials.videos.as_deref() == Some(path) {
-            return IconName::FolderVideos;
+            return (IconName::FolderVideos, false);
         }
         if specials.public.as_deref() == Some(path) {
-            return IconName::FolderPublic;
+            return (IconName::FolderPublic, false);
         }
     }
 
     let raw = path.to_string_lossy();
     if raw.starts_with("//") || raw.starts_with(r"\\") {
-        return IconName::FolderNetwork;
+        return (IconName::FolderNetwork, false);
     }
 
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -97,43 +130,35 @@ fn folder_icon_for(path: &Path, is_remote: bool, specials: &SpecialFolders) -> I
             name.to_ascii_lowercase().as_str(),
             "projects" | "src" | "dev" | "repos"
         ) {
-            return IconName::FolderProjects;
+            return (IconName::FolderProjects, false);
         }
     }
 
-    if !is_remote && path.join(".git").symlink_metadata().is_ok() {
-        return IconName::FolderProjects;
-    }
-
-    IconName::Folder
+    (IconName::Folder, !is_remote)
 }
 
-fn file_icon_for(path: &Path, is_remote: bool) -> IconName {
+fn fast_file_icon_for(path: &Path, is_remote: bool) -> (IconName, bool) {
     let file_name = path.file_name().and_then(|n| n.to_str());
     if let Some(name) = file_name {
         if matches!(name, "id_rsa" | "id_ed25519") {
-            return IconName::FileKey;
+            return (IconName::FileKey, false);
         }
     }
 
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let lower = ext.to_ascii_lowercase();
         if let Some(icon) = icon_for_extension(&lower) {
-            return icon;
+            return (icon, false);
         }
     }
 
     if let Some(name) = file_name {
         if name.starts_with('.') && name != "." && name != ".." {
-            return IconName::FileConfig;
+            return (IconName::FileConfig, false);
         }
     }
 
-    if !is_remote && path.extension().is_none() && is_executable_file(path) {
-        return IconName::FileBinary;
-    }
-
-    IconName::File
+    (IconName::File, !is_remote && path.extension().is_none())
 }
 
 fn icon_for_extension(ext: &str) -> Option<IconName> {

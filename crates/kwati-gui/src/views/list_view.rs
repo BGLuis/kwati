@@ -3,17 +3,21 @@
 //! Uses `uniform_list` to render only visible rows, with support for columns
 //! (name, size, date), sort headers, and scrollbar synchronization.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    div, font, point, prelude::*, px, relative, transparent_black, uniform_list, Context,
-    CursorStyle, Div, Entity, EventEmitter, FocusHandle, Focusable, Font, Hsla, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy,
+    div, font, point, prelude::*, px, transparent_black, uniform_list, Context, CursorStyle, Div,
+    Entity, EventEmitter, FocusHandle, Focusable, Font, Hsla, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString,
     Stateful, TextRun, UniformListScrollHandle, Window,
 };
 use kwati_core::{
-    Entry, IconPreferences, IconResolver, Location, SortColumn, SortDirection, ViewMode,
+    Entry, IconPreferences, IconResolver, Location, ResolvedIcon, SortColumn, SortDirection,
+    ViewMode,
 };
 
 use crate::actions::navigation::{
@@ -23,8 +27,9 @@ use crate::actions::navigation::{
 use crate::actions::operations::get_location_clipboard;
 use crate::components::interactive::focus_ring_color;
 use crate::components::{
-    icon_for_entry, resolve_icon_color, resolved_icon, Ellipsize, IconMotion, IconName,
-    ScrollbarState, SpecialFolders,
+    fast_icon_for_entry, icon_for_entry, probe_entry_icon, render_resolved_icon,
+    resolve_icon_color, uniform_list_scroll_metrics, uniform_list_scrollbar, Ellipsize, IconMotion,
+    IconName, ScrollbarDrag, ScrollbarState, SpecialFolders,
 };
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
@@ -155,6 +160,7 @@ pub struct ListView {
     pub focus_handle: FocusHandle,
     pub scroll_handle: UniformListScrollHandle,
     pub scrollbar_state: ScrollbarState,
+    pub scrollbar_drag: Rc<RefCell<ScrollbarDrag>>,
     pub row_height: Pixels,
     grid_columns: usize,
     last_view_mode: ViewMode,
@@ -173,6 +179,17 @@ pub struct ListView {
     exiting_rows: Vec<ExitingRow>,
     exiting_scroll_top: usize,
     motion: MotionTracker<ListMotionKey>,
+    special_folders: SpecialFolders,
+    entry_icon_cache: Vec<Option<IconName>>,
+    queued_icon_probes: HashSet<usize>,
+    pending_icon_probes: Vec<(usize, PathBuf, bool, IconName)>,
+    row_text_cache: Vec<Option<(SharedString, SharedString, SharedString)>>,
+    grid_label_cache: Vec<Option<(SharedString, Option<SharedString>)>>,
+    resolved_icon_cache: HashMap<(IconName, u16), ResolvedIcon>,
+    base_icon_color_cache: HashMap<IconName, Hsla>,
+    cached_icon_prefs: IconPreferences,
+    cached_theme: Option<Theme>,
+    cached_grid_font: Option<SharedString>,
     requested_frame_in_render: bool,
     animation_frame_requests: usize,
     last_frame_requested_view: Option<gpui::EntityId>,
@@ -189,7 +206,7 @@ impl Focusable for ListView {
 impl ListView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
-        let (initial_rev, initial_loc, initial_entries, initial_mode) = {
+        let (initial_rev, initial_loc, initial_entries, initial_mode, initial_icon_prefs) = {
             let state = app_state.read(cx);
             let cur = state.current_location.clone();
             let snaps = state
@@ -197,13 +214,20 @@ impl ListView {
                 .iter()
                 .map(|e| (entry_location(&cur, e), e.clone()))
                 .collect();
-            (state.listing_revision, cur, snaps, state.view_mode)
+            (
+                state.listing_revision,
+                cur,
+                snaps,
+                state.view_mode,
+                state.icon_config.active.clone(),
+            )
         };
         Self {
             app_state,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             scrollbar_state: ScrollbarState::default(),
+            scrollbar_drag: Rc::new(RefCell::new(ScrollbarDrag::default())),
             row_height: base_row_height(initial_mode),
             grid_columns: DEFAULT_GRID_COLUMNS,
             last_view_mode: initial_mode,
@@ -222,6 +246,17 @@ impl ListView {
             exiting_rows: Vec::new(),
             exiting_scroll_top: 0,
             motion: MotionTracker::new(),
+            special_folders: SpecialFolders::from_system(),
+            entry_icon_cache: Vec::new(),
+            queued_icon_probes: HashSet::new(),
+            pending_icon_probes: Vec::new(),
+            row_text_cache: Vec::new(),
+            grid_label_cache: Vec::new(),
+            resolved_icon_cache: HashMap::new(),
+            base_icon_color_cache: HashMap::new(),
+            cached_icon_prefs: initial_icon_prefs,
+            cached_theme: None,
+            cached_grid_font: None,
             requested_frame_in_render: false,
             animation_frame_requests: 0,
             last_frame_requested_view: None,
@@ -350,6 +385,18 @@ impl ListView {
         cx.notify();
     }
 
+    fn on_entry_click_at(
+        &mut self,
+        ix: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.app_state.read(cx).entries.get(ix).cloned() {
+            self.on_entry_click(ix, entry, event, window, cx);
+        }
+    }
+
     pub fn on_entry_click(
         &mut self,
         ix: usize,
@@ -384,6 +431,18 @@ impl ListView {
             }
         });
         cx.notify();
+    }
+
+    fn on_entry_right_click_at(
+        &mut self,
+        ix: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.app_state.read(cx).entries.get(ix).cloned() {
+            self.on_entry_right_click(entry, event, window, cx);
+        }
     }
 
     pub fn on_entry_right_click(
@@ -868,82 +927,6 @@ impl ListView {
         });
         cx.notify();
     }
-
-    fn on_scrollbar_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.scrollbar_state.can_scroll() {
-            return;
-        }
-        self.scrollbar_state.is_dragging = true;
-        self.scrollbar_state.drag_start_y = event.position.y;
-        self.scrollbar_state.drag_start_offset = self.scrollbar_state.current_offset;
-
-        let track_height = px(600.);
-        let ratio = (event.position.y / track_height).clamp(0.0, 1.0);
-        let max_offset = self
-            .scrollbar_state
-            .total_items
-            .saturating_sub(self.scrollbar_state.visible_items);
-        let target = ((ratio * max_offset as f32).round() as usize).min(max_offset);
-        self.scrollbar_state.current_offset = target;
-
-        if target >= max_offset {
-            self.scroll_to_bottom();
-        } else {
-            self.scroll_handle
-                .scroll_to_item_strict(target, ScrollStrategy::Top);
-        }
-        cx.notify();
-    }
-
-    fn on_scrollbar_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.scrollbar_state.is_dragging = false;
-        cx.notify();
-    }
-
-    fn on_scrollbar_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.scrollbar_state.is_dragging || !self.scrollbar_state.can_scroll() {
-            return;
-        }
-        let track_height = px(600.);
-        let thumb_ratio = self.scrollbar_state.thumb_ratio();
-        let usable_track = track_height * (1.0 - thumb_ratio);
-        if usable_track <= px(0.) {
-            return;
-        }
-        let delta_y = event.position.y - self.scrollbar_state.drag_start_y;
-        let delta_ratio = delta_y / usable_track;
-        let max_offset = self
-            .scrollbar_state
-            .total_items
-            .saturating_sub(self.scrollbar_state.visible_items);
-        let delta_offset = (delta_ratio * max_offset as f32).round() as isize;
-        let new_offset = (self.scrollbar_state.drag_start_offset as isize + delta_offset)
-            .clamp(0, max_offset as isize) as usize;
-        self.scrollbar_state.current_offset = new_offset;
-
-        if new_offset >= max_offset {
-            self.scroll_to_bottom();
-        } else {
-            self.scroll_handle
-                .scroll_to_item_strict(new_offset, ScrollStrategy::Top);
-        }
-        cx.notify();
-    }
 }
 
 const SIZE_COLUMN: Pixels = px(72.);
@@ -1112,11 +1095,136 @@ struct ItemVisuals {
     icon_scale: f32,
     icon_motion: IconMotion,
     glyph: IconName,
+    resolved_icon: ResolvedIcon,
     glyph_col: Hsla,
     text_col: Hsla,
 }
 
 impl ListView {
+    fn cached_entry_icon(&mut self, ix: usize, entry: &Entry, is_remote: bool) -> IconName {
+        if self.entry_icon_cache.len() <= ix {
+            self.entry_icon_cache.resize(ix + 1, None);
+        }
+        if let Some(icon) = self.entry_icon_cache[ix] {
+            return icon;
+        }
+        let is_dir = entry.is_dir();
+        let (icon, needs_probe) =
+            fast_icon_for_entry(&entry.path, is_dir, is_remote, &self.special_folders);
+        self.entry_icon_cache[ix] = Some(icon);
+        if needs_probe && self.queued_icon_probes.insert(ix) {
+            self.pending_icon_probes
+                .push((ix, entry.path.clone(), is_dir, icon));
+        }
+        icon
+    }
+
+    fn flush_icon_probes(&mut self, cx: &mut Context<Self>) {
+        if self.pending_icon_probes.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.pending_icon_probes);
+        let rev = self.last_listing_revision;
+        cx.spawn(async move |this, cx| {
+            let updates = cx
+                .background_executor()
+                .spawn(async move {
+                    batch
+                        .into_iter()
+                        .filter_map(|(ix, path, is_dir, base)| {
+                            let resolved = probe_entry_icon(&path, is_dir, base);
+                            (resolved != base).then_some((ix, resolved))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            if updates.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                if this.last_listing_revision != rev {
+                    return;
+                }
+                for (ix, icon) in updates {
+                    if ix < this.entry_icon_cache.len() {
+                        this.entry_icon_cache[ix] = Some(icon);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn cached_row_text(
+        &mut self,
+        ix: usize,
+        entry: &Entry,
+    ) -> (SharedString, SharedString, SharedString) {
+        if self.row_text_cache.len() <= ix {
+            self.row_text_cache.resize(ix + 1, None);
+        }
+        if let Some(cached) = &self.row_text_cache[ix] {
+            return cached.clone();
+        }
+        let name: SharedString = entry.display_name().into();
+        let size_str: SharedString = format_size(entry.size, entry.is_dir()).into();
+        let date_str: SharedString = format_modified(entry.modified).into();
+        let tuple = (name, size_str, date_str);
+        self.row_text_cache[ix] = Some(tuple.clone());
+        tuple
+    }
+
+    fn cached_resolved_icon(
+        &mut self,
+        glyph: IconName,
+        icon_size: Pixels,
+        icon_prefs: &IconPreferences,
+        icon_resolver: &IconResolver,
+    ) -> ResolvedIcon {
+        let size_px = (icon_size / px(1.0)).round().max(1.0) as u16;
+        let key = (glyph, size_px);
+        if let Some(resolved) = self.resolved_icon_cache.get(&key) {
+            return resolved.clone();
+        }
+        let resolved = icon_resolver.resolve(icon_prefs, glyph.key_name(), size_px);
+        self.resolved_icon_cache.insert(key, resolved.clone());
+        resolved
+    }
+
+    fn cached_base_icon_color(
+        &mut self,
+        glyph: IconName,
+        icon_prefs: &IconPreferences,
+        theme: &Theme,
+    ) -> Hsla {
+        if let Some(&col) = self.base_icon_color_cache.get(&glyph) {
+            return col;
+        }
+        let col = resolve_icon_color(glyph.key_name(), icon_prefs, theme);
+        self.base_icon_color_cache.insert(glyph, col);
+        col
+    }
+
+    fn cached_grid_label(
+        &mut self,
+        ix: usize,
+        name: &str,
+        font: Font,
+        window: &Window,
+    ) -> (SharedString, Option<SharedString>) {
+        if self.grid_label_cache.len() <= ix {
+            self.grid_label_cache.resize(ix + 1, None);
+        }
+        if let Some(cached) = &self.grid_label_cache[ix] {
+            return cached.clone();
+        }
+        let (l1, l2) = fit_two_line_label(name, GRID_LABEL_MAX_WIDTH, font, BODY_SIZE, window);
+        let pair = (SharedString::from(l1), l2.map(SharedString::from));
+        self.grid_label_cache[ix] = Some(pair.clone());
+        pair
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn compute_item_visuals(
         &mut self,
@@ -1127,72 +1235,88 @@ impl ListView {
         is_focused_row: bool,
         is_cut: bool,
         is_remote: bool,
-        specials: &SpecialFolders,
+        base_icon_size: Pixels,
         scroll_top_entry: usize,
         now: Instant,
         reduced: bool,
         theme: &Theme,
         icon_prefs: &IconPreferences,
+        icon_resolver: &IconResolver,
     ) -> ItemVisuals {
         let is_hovered = self.hovered_location.as_ref() == Some(loc);
         let is_pressed = self.pressed_location.as_ref() == Some(loc);
         let is_dir = entry.is_dir();
         let is_hidden = entry.is_hidden;
+        let has_scalars = self.motion.has_scalars();
 
-        let hover_t = self.motion.step_scalar(
-            ListMotionKey::Hover(loc.clone()),
-            0.0,
-            if is_hovered { 1.0 } else { 0.0 },
-            INSTANT,
-            Curve::EaseOut,
-            MotionKind::OpacityOrColor,
-            now,
-            reduced,
-        );
-        let press_t = self.motion.step_scalar(
-            ListMotionKey::Press(loc.clone()),
-            0.0,
-            if is_pressed { 1.0 } else { 0.0 },
-            INSTANT,
-            Curve::Spring,
-            MotionKind::MovementOrScale,
-            now,
-            reduced,
-        );
-        let select_t = self.motion.step_scalar(
-            ListMotionKey::SelectBg(loc.clone()),
-            0.0,
-            if is_selected { 1.0 } else { 0.0 },
-            INSTANT,
-            Curve::EaseOut,
-            MotionKind::OpacityOrColor,
-            now,
-            reduced,
-        );
-        let focus_t = self.motion.step_scalar(
-            ListMotionKey::FocusRing(loc.clone()),
-            0.0,
-            if is_focused_row { 1.0 } else { 0.0 },
-            INSTANT,
-            Curve::Spring,
-            MotionKind::OpacityOrColor,
-            now,
-            reduced,
-        );
-        let cut_t = self.motion.step_scalar(
-            ListMotionKey::CutFade(loc.clone()),
-            0.0,
-            if is_cut { 1.0 } else { 0.0 },
-            INSTANT,
-            Curve::EaseOut,
-            MotionKind::OpacityOrColor,
-            now,
-            reduced,
-        );
-        let folder_open_t = if is_dir {
-            self.motion.step_scalar(
+        let hover_t = if is_hovered || has_scalars {
+            self.motion.step_scalar_or_zero(
+                ListMotionKey::Hover(loc.clone()),
+                if is_hovered { 1.0 } else { 0.0 },
+                INSTANT,
+                Curve::EaseOut,
+                MotionKind::OpacityOrColor,
+                now,
+                reduced,
+            )
+        } else {
+            0.0
+        };
+        let press_t = if is_pressed || has_scalars {
+            self.motion.step_scalar_or_zero(
+                ListMotionKey::Press(loc.clone()),
+                if is_pressed { 1.0 } else { 0.0 },
+                INSTANT,
+                Curve::Spring,
+                MotionKind::MovementOrScale,
+                now,
+                reduced,
+            )
+        } else {
+            0.0
+        };
+        let select_t = if is_selected || has_scalars {
+            self.motion.step_scalar_or_zero(
+                ListMotionKey::SelectBg(loc.clone()),
+                if is_selected { 1.0 } else { 0.0 },
+                INSTANT,
+                Curve::EaseOut,
+                MotionKind::OpacityOrColor,
+                now,
+                reduced,
+            )
+        } else {
+            0.0
+        };
+        let focus_t = if is_focused_row || has_scalars {
+            self.motion.step_scalar_or_zero(
+                ListMotionKey::FocusRing(loc.clone()),
+                if is_focused_row { 1.0 } else { 0.0 },
+                INSTANT,
+                Curve::Spring,
+                MotionKind::OpacityOrColor,
+                now,
+                reduced,
+            )
+        } else {
+            0.0
+        };
+        let cut_t = if is_cut || has_scalars {
+            self.motion.step_scalar_or_zero(
+                ListMotionKey::CutFade(loc.clone()),
+                if is_cut { 1.0 } else { 0.0 },
+                INSTANT,
+                Curve::EaseOut,
+                MotionKind::OpacityOrColor,
+                now,
+                reduced,
+            )
+        } else {
+            0.0
+        };
+        let folder_open_t = if is_dir && (is_hovered || has_scalars) {
+            self.motion.step_scalar_or_zero(
                 ListMotionKey::FolderOpen(loc.clone()),
-                0.0,
                 if is_hovered { 1.0 } else { 0.0 },
                 INSTANT,
                 Curve::Spring,
@@ -1285,8 +1409,14 @@ impl ListView {
         } else {
             IconMotion::Rest
         };
-        let glyph = icon_for_entry(&entry.path, is_dir, is_remote, specials);
-        let mut glyph_col = resolve_icon_color(glyph.key_name(), icon_prefs, theme);
+        let glyph = self.cached_entry_icon(ix, entry, is_remote);
+        let resolved_icon = self.cached_resolved_icon(
+            glyph,
+            base_icon_size * icon_scale,
+            icon_prefs,
+            icon_resolver,
+        );
+        let mut glyph_col = self.cached_base_icon_color(glyph, icon_prefs, theme);
         if !is_dir && is_hidden && !is_selected {
             let neutral: Hsla = theme.text.into();
             if glyph_col == neutral {
@@ -1310,6 +1440,7 @@ impl ListView {
             icon_scale,
             icon_motion,
             glyph,
+            resolved_icon,
             glyph_col,
             text_col,
         }
@@ -1319,13 +1450,10 @@ impl ListView {
         el: Stateful<Div>,
         ix: usize,
         loc: Location,
-        entry: Entry,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let loc_hover = loc.clone();
         let loc_press = loc;
-        let entry_for_click = entry.clone();
-        let entry_for_rclick = entry;
 
         el.on_hover(cx.listener(move |this, hovered, _, cx| {
             if *hovered {
@@ -1341,7 +1469,7 @@ impl ListView {
             MouseButton::Left,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                 this.pressed_location = Some(loc_press.clone());
-                this.on_entry_click(ix, entry_for_click.clone(), event, window, cx);
+                this.on_entry_click_at(ix, event, window, cx);
             }),
         )
         .on_mouse_up(
@@ -1365,7 +1493,7 @@ impl ListView {
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                this.on_entry_right_click(entry_for_rclick.clone(), event, window, cx);
+                this.on_entry_right_click_at(ix, event, window, cx);
             }),
         )
     }
@@ -1375,19 +1503,14 @@ impl ListView {
         &mut self,
         ix: usize,
         entry: &Entry,
-        loc: &Location,
+        loc: Location,
         is_selected: bool,
         vis: ItemVisuals,
         theme: &Theme,
         fonts: &Fonts,
-        icon_prefs: &IconPreferences,
-        icon_resolver: &IconResolver,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let is_dir = entry.is_dir();
-        let name = entry.display_name();
-        let size_str = format_size(entry.size, is_dir);
-        let date_str = format_modified(entry.modified);
+        let (name, size_str, date_str) = self.cached_row_text(ix, entry);
         let secondary_col: Hsla = if is_selected {
             theme.text.into()
         } else {
@@ -1415,7 +1538,7 @@ impl ListView {
             .text_body()
             .text_color(vis.text_col);
 
-        Self::attach_entry_interactions(base, ix, loc.clone(), entry.clone(), cx)
+        Self::attach_entry_interactions(base, ix, loc, cx)
             .child(
                 div()
                     .flex_1()
@@ -1424,13 +1547,12 @@ impl ListView {
                     .flex()
                     .items_center()
                     .gap(space::S8)
-                    .child(resolved_icon(
+                    .child(render_resolved_icon(
+                        &vis.resolved_icon,
                         vis.glyph,
                         vis.icon_motion,
                         size::ICON * vis.icon_scale,
                         vis.glyph_col,
-                        icon_prefs,
-                        icon_resolver,
                     ))
                     .child(div().flex_1().ellipsize().child(name)),
             )
@@ -1453,18 +1575,15 @@ impl ListView {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_compact_row(
         &mut self,
         ix: usize,
         entry: &Entry,
-        loc: &Location,
+        loc: Location,
         vis: ItemVisuals,
-        icon_prefs: &IconPreferences,
-        icon_resolver: &IconResolver,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let name = entry.display_name();
+        let (name, _, _) = self.cached_row_text(ix, entry);
         let base = div()
             .id(ix)
             .relative()
@@ -1486,14 +1605,13 @@ impl ListView {
             .text_body()
             .text_color(vis.text_col);
 
-        Self::attach_entry_interactions(base, ix, loc.clone(), entry.clone(), cx)
-            .child(resolved_icon(
+        Self::attach_entry_interactions(base, ix, loc, cx)
+            .child(render_resolved_icon(
+                &vis.resolved_icon,
                 vis.glyph,
                 vis.icon_motion,
                 size::ICON * vis.icon_scale,
                 vis.glyph_col,
-                icon_prefs,
-                icon_resolver,
             ))
             .child(div().flex_1().ellipsize().child(name))
             .into_any_element()
@@ -1504,22 +1622,14 @@ impl ListView {
         &mut self,
         ix: usize,
         entry: &Entry,
-        loc: &Location,
+        loc: Location,
         vis: ItemVisuals,
         fonts: &Fonts,
-        icon_prefs: &IconPreferences,
-        icon_resolver: &IconResolver,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let name = entry.display_name();
-        let (line1, line2) = fit_two_line_label(
-            &name,
-            GRID_LABEL_MAX_WIDTH,
-            font(fonts.sans.clone()),
-            BODY_SIZE,
-            window,
-        );
+        let (name, _, _) = self.cached_row_text(ix, entry);
+        let (line1, line2) = self.cached_grid_label(ix, &name, font(fonts.sans.clone()), window);
         let base = div()
             .id(ix)
             .relative()
@@ -1544,7 +1654,7 @@ impl ListView {
             .text_body()
             .text_color(vis.text_col);
 
-        Self::attach_entry_interactions(base, ix, loc.clone(), entry.clone(), cx)
+        Self::attach_entry_interactions(base, ix, loc, cx)
             .child(
                 div()
                     .size(GRID_ICON_SIZE)
@@ -1552,13 +1662,12 @@ impl ListView {
                     .items_center()
                     .justify_center()
                     .flex_none()
-                    .child(resolved_icon(
+                    .child(render_resolved_icon(
+                        &vis.resolved_icon,
                         vis.glyph,
                         vis.icon_motion,
                         GRID_ICON_SIZE * vis.icon_scale,
                         vis.glyph_col,
-                        icon_prefs,
-                        icon_resolver,
                     )),
             )
             .child(
@@ -1616,6 +1725,11 @@ impl ListView {
         let dir_changed = self.last_location.as_ref() != Some(&state.current_location);
         self.last_listing_revision = state.listing_revision;
         self.last_location = Some(state.current_location.clone());
+        self.entry_icon_cache.clear();
+        self.queued_icon_probes.clear();
+        self.pending_icon_probes.clear();
+        self.row_text_cache.clear();
+        self.grid_label_cache.clear();
 
         let new_entries: Vec<(Location, Entry)> = state
             .entries
@@ -1779,13 +1893,6 @@ impl Render for ListView {
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
         let now = Instant::now();
-        let current_top = self
-            .scroll_handle
-            .0
-            .borrow()
-            .base_handle
-            .logical_scroll_top()
-            .0;
 
         let view_mode = self.current_view_mode(cx);
         let cols = self.active_grid_columns();
@@ -1806,25 +1913,50 @@ impl Render for ListView {
         }
 
         let row_h_px = self.row_height / px(1.);
+        let fallback_visible = if view_mode == ViewMode::Grid { 6 } else { 25 };
 
         let (
             entries,
-            selection,
             current,
             sort_column,
             sort_direction,
             show_hidden,
             reduced,
             focused_location,
-            icon_prefs,
             icon_resolver,
+            list_item_count,
+            scroll_metrics,
         ) = {
             let state: &AppState = self.app_state.read(cx);
             let r = is_reduced_motion(state.settings.motion_preference);
-            self.sync_listing_transitions(state, view_mode, cols, current_top, row_h_px, now, r);
+            let entry_count = state.entries.len();
+            let list_item_count = if view_mode == ViewMode::Grid {
+                entry_count.div_ceil(cols)
+            } else {
+                entry_count
+            };
+            let scroll_metrics = uniform_list_scroll_metrics(
+                &self.scroll_handle,
+                self.row_height,
+                list_item_count,
+                fallback_visible,
+            );
+            self.sync_listing_transitions(
+                state,
+                view_mode,
+                cols,
+                scroll_metrics.current_top,
+                row_h_px,
+                now,
+                r,
+            );
+            if state.icon_config.active != self.cached_icon_prefs {
+                self.cached_icon_prefs = state.icon_config.active.clone();
+                self.resolved_icon_cache.clear();
+                self.base_icon_color_cache.clear();
+            }
             (
                 state.entries.clone(),
-                state.selection.clone(),
                 state.current_location.clone(),
                 state.sort_column,
                 state.sort_direction,
@@ -1836,19 +1968,30 @@ impl Render for ListView {
                         .and_then(|ix| state.entries.get(ix))
                         .map(|e| entry_location(&state.current_location, e))
                 }),
-                state.icon_config.active.clone(),
                 state.icon_resolver.clone(),
+                list_item_count,
+                scroll_metrics,
             )
         };
+        if self.cached_theme.as_ref() != Some(&theme) {
+            self.cached_theme = Some(theme);
+            self.base_icon_color_cache.clear();
+        }
+        if self.cached_grid_font.as_ref() != Some(&fonts.sans) {
+            self.cached_grid_font = Some(fonts.sans.clone());
+            self.grid_label_cache.clear();
+        }
         let entry_count = entries.len();
-        let list_item_count = if view_mode == ViewMode::Grid {
-            entry_count.div_ceil(cols)
-        } else {
-            entry_count
-        };
-        let visible_items = self.visible_row_count(view_mode, list_item_count);
-        self.scrollbar_state
-            .set_metrics(list_item_count, visible_items, current_top);
+        let current_top = scroll_metrics.current_top;
+        if scroll_metrics.scroll_px > px(0.) {
+            self.nav_anim = None;
+        }
+        self.scrollbar_state.set_metrics(
+            list_item_count,
+            scroll_metrics.visible_items,
+            current_top,
+        );
+        self.scrollbar_state.is_dragging = self.scrollbar_drag.borrow().is_dragging;
 
         let cut_sources: HashSet<Location> = get_location_clipboard()
             .filter(|c| c.is_cut)
@@ -1917,9 +2060,14 @@ impl Render for ListView {
 
         let is_remote = matches!(current, Location::Remote { .. });
         let entries_clone = entries;
-        let special_folders = SpecialFolders::from_system();
         let (row_text, row_muted) = (theme.text, theme.text_muted);
         let row_fonts = fonts.clone();
+        let icon_prefs_for_rows = self.cached_icon_prefs.clone();
+        let base_icon_size = if view_mode == ViewMode::Grid {
+            GRID_ICON_SIZE
+        } else {
+            size::ICON
+        };
 
         let sort_indicator = |col: SortColumn| -> &'static str {
             if sort_column == col {
@@ -1948,7 +2096,8 @@ impl Render for ListView {
                         (self.exiting_scroll_top as isize - current_top as isize) as f32 * row_h_px;
                     let top_px = ex.top_px + scroll_shift_px;
                     let glyph = ex.icon;
-                    let mut glyph_col = resolve_icon_color(glyph.key_name(), &icon_prefs, &theme);
+                    let mut glyph_col =
+                        resolve_icon_color(glyph.key_name(), &icon_prefs_for_rows, &theme);
                     if !ex.is_dir && ex.is_hidden {
                         let neutral: Hsla = row_text.into();
                         if glyph_col == neutral {
@@ -1957,6 +2106,11 @@ impl Render for ListView {
                             glyph_col.a *= 0.65;
                         }
                     }
+                    let resolved_exiting_icon = icon_resolver.resolve(
+                        &icon_prefs_for_rows,
+                        glyph.key_name(),
+                        (size::ICON / px(1.0)).round().max(1.0) as u16,
+                    );
 
                     div()
                         .absolute()
@@ -1980,13 +2134,12 @@ impl Render for ListView {
                                 .flex()
                                 .items_center()
                                 .gap(space::S8)
-                                .child(resolved_icon(
+                                .child(render_resolved_icon(
+                                    &resolved_exiting_icon,
                                     glyph,
                                     IconMotion::Rest,
                                     size::ICON,
                                     glyph_col,
-                                    &icon_prefs,
-                                    &icon_resolver,
                                 ))
                                 .child(div().flex_1().ellipsize().child(ex.name.clone())),
                         )
@@ -2267,18 +2420,91 @@ impl Render for ListView {
                                               cx| {
                                             let mut items: Vec<gpui::AnyElement> =
                                                 Vec::with_capacity(range.len());
+                                            let visible_rows: Vec<(
+                                                usize,
+                                                Location,
+                                                bool,
+                                                bool,
+                                                bool,
+                                            )> = {
+                                                let state = this.app_state.read(cx);
+                                                let sel = &state.selection;
+                                                match view_mode {
+                                                    ViewMode::Details | ViewMode::CompactList => {
+                                                        range
+                                                            .clone()
+                                                            .filter_map(|ix| {
+                                                                entries_clone.get(ix).map(|entry| {
+                                                                    let loc = entry_location(
+                                                                        &current, entry,
+                                                                    );
+                                                                    let is_selected =
+                                                                        sel.contains(&loc);
+                                                                    let is_focused = list_focused
+                                                                        && focused_location
+                                                                            .as_ref()
+                                                                            == Some(&loc);
+                                                                    let is_cut =
+                                                                        cut_sources.contains(&loc);
+                                                                    (
+                                                                        ix,
+                                                                        loc,
+                                                                        is_selected,
+                                                                        is_focused,
+                                                                        is_cut,
+                                                                    )
+                                                                })
+                                                            })
+                                                            .collect()
+                                                    }
+                                                    ViewMode::Grid => {
+                                                        let mut out =
+                                                            Vec::with_capacity(range.len() * cols);
+                                                        for row_ix in range.clone() {
+                                                            let start = row_ix * cols;
+                                                            let end =
+                                                                (start + cols).min(entry_count);
+                                                            for ix in start..end {
+                                                                if let Some(entry) =
+                                                                    entries_clone.get(ix)
+                                                                {
+                                                                    let loc = entry_location(
+                                                                        &current, entry,
+                                                                    );
+                                                                    let is_selected =
+                                                                        sel.contains(&loc);
+                                                                    let is_focused = list_focused
+                                                                        && focused_location
+                                                                            .as_ref()
+                                                                            == Some(&loc);
+                                                                    let is_cut =
+                                                                        cut_sources.contains(&loc);
+                                                                    out.push((
+                                                                        ix,
+                                                                        loc,
+                                                                        is_selected,
+                                                                        is_focused,
+                                                                        is_cut,
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                        out
+                                                    }
+                                                }
+                                            };
+
                                             match view_mode {
                                                 ViewMode::Details | ViewMode::CompactList => {
-                                                    for ix in range {
+                                                    for (
+                                                        ix,
+                                                        loc,
+                                                        is_selected,
+                                                        is_focused_row,
+                                                        is_cut,
+                                                    ) in visible_rows
+                                                    {
                                                         if let Some(entry) = entries_clone.get(ix) {
-                                                            let loc =
-                                                                entry_location(&current, entry);
-                                                            let is_selected =
-                                                                selection.contains(&loc);
-                                                            let is_focused_row = list_focused
-                                                                && focused_location.as_ref()
-                                                                    == Some(&loc);
-                                                            let is_cut = cut_sources.contains(&loc);
                                                             let vis = this.compute_item_visuals(
                                                                 ix,
                                                                 entry,
@@ -2287,38 +2513,31 @@ impl Render for ListView {
                                                                 is_focused_row,
                                                                 is_cut,
                                                                 is_remote,
-                                                                &special_folders,
+                                                                base_icon_size,
                                                                 scroll_top_entry,
                                                                 now,
                                                                 reduced,
                                                                 &theme_for_rows,
-                                                                &icon_prefs,
+                                                                &icon_prefs_for_rows,
+                                                                &icon_resolver,
                                                             );
                                                             if view_mode == ViewMode::Details {
                                                                 items.push(
                                                                     this.render_details_row(
                                                                         ix,
                                                                         entry,
-                                                                        &loc,
+                                                                        loc,
                                                                         is_selected,
                                                                         vis,
                                                                         &theme_for_rows,
                                                                         &row_fonts,
-                                                                        &icon_prefs,
-                                                                        &icon_resolver,
                                                                         cx,
                                                                     ),
                                                                 );
                                                             } else {
                                                                 items.push(
                                                                     this.render_compact_row(
-                                                                        ix,
-                                                                        entry,
-                                                                        &loc,
-                                                                        vis,
-                                                                        &icon_prefs,
-                                                                        &icon_resolver,
-                                                                        cx,
+                                                                        ix, entry, loc, vis, cx,
                                                                     ),
                                                                 );
                                                             }
@@ -2326,54 +2545,49 @@ impl Render for ListView {
                                                     }
                                                 }
                                                 ViewMode::Grid => {
+                                                    let mut meta_iter = visible_rows.into_iter();
                                                     for row_ix in range {
                                                         let start = row_ix * cols;
                                                         let end = (start + cols).min(entry_count);
-                                                        let mut row_tiles = Vec::with_capacity(
-                                                            end.saturating_sub(start),
-                                                        );
-                                                        for ix in start..end {
-                                                            if let Some(entry) =
-                                                                entries_clone.get(ix)
+                                                        let count = end.saturating_sub(start);
+                                                        let mut row_tiles =
+                                                            Vec::with_capacity(count);
+                                                        for _ in 0..count {
+                                                            if let Some((
+                                                                ix,
+                                                                loc,
+                                                                is_selected,
+                                                                is_focused_row,
+                                                                is_cut,
+                                                            )) = meta_iter.next()
                                                             {
-                                                                let loc =
-                                                                    entry_location(&current, entry);
-                                                                let is_selected =
-                                                                    selection.contains(&loc);
-                                                                let is_focused_row = list_focused
-                                                                    && focused_location.as_ref()
-                                                                        == Some(&loc);
-                                                                let is_cut =
-                                                                    cut_sources.contains(&loc);
-                                                                let vis = this
-                                                                    .compute_item_visuals(
-                                                                        ix,
-                                                                        entry,
-                                                                        &loc,
-                                                                        is_selected,
-                                                                        is_focused_row,
-                                                                        is_cut,
-                                                                        is_remote,
-                                                                        &special_folders,
-                                                                        scroll_top_entry,
-                                                                        now,
-                                                                        reduced,
-                                                                        &theme_for_rows,
-                                                                        &icon_prefs,
+                                                                if let Some(entry) =
+                                                                    entries_clone.get(ix)
+                                                                {
+                                                                    let vis = this
+                                                                        .compute_item_visuals(
+                                                                            ix,
+                                                                            entry,
+                                                                            &loc,
+                                                                            is_selected,
+                                                                            is_focused_row,
+                                                                            is_cut,
+                                                                            is_remote,
+                                                                            base_icon_size,
+                                                                            scroll_top_entry,
+                                                                            now,
+                                                                            reduced,
+                                                                            &theme_for_rows,
+                                                                            &icon_prefs_for_rows,
+                                                                            &icon_resolver,
+                                                                        );
+                                                                    row_tiles.push(
+                                                                        this.render_grid_tile(
+                                                                            ix, entry, loc, vis,
+                                                                            &row_fonts, window, cx,
+                                                                        ),
                                                                     );
-                                                                row_tiles.push(
-                                                                    this.render_grid_tile(
-                                                                        ix,
-                                                                        entry,
-                                                                        &loc,
-                                                                        vis,
-                                                                        &row_fonts,
-                                                                        &icon_prefs,
-                                                                        &icon_resolver,
-                                                                        window,
-                                                                        cx,
-                                                                    ),
-                                                                );
+                                                                }
                                                             }
                                                         }
                                                         items.push(
@@ -2392,6 +2606,7 @@ impl Render for ListView {
                                                     }
                                                 }
                                             }
+                                            this.flush_icon_probes(cx);
                                             if !this.requested_frame_in_render
                                                 && request_frame_if_active(
                                                     this.motion.has_active(now, reduced),
@@ -2442,45 +2657,15 @@ impl Render for ListView {
                                 },
                             ),
                     )
-                    .child(
-                        // Scrollbar track & thumb
-                        div()
-                            .w(SCROLLBAR_WIDTH)
-                            .h_full()
-                            .border_l_1()
-                            .border_color(theme.border)
-                            .relative()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(Self::on_scrollbar_mouse_down),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(Self::on_scrollbar_mouse_up),
-                            )
-                            .on_mouse_up_out(
-                                MouseButton::Left,
-                                cx.listener(Self::on_scrollbar_mouse_up),
-                            )
-                            .on_mouse_move(cx.listener(Self::on_scrollbar_mouse_move))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .h(relative(self.scrollbar_state.thumb_ratio()))
-                                    .top(relative(
-                                        self.scrollbar_state.scroll_ratio()
-                                            * (1.0 - self.scrollbar_state.thumb_ratio()),
-                                    ))
-                                    .rounded_sm()
-                                    .bg(if self.scrollbar_state.is_dragging {
-                                        theme.text_muted
-                                    } else {
-                                        theme.border_strong
-                                    })
-                                    .hover(|s| s.bg(theme.text_muted))
-                                    .cursor(CursorStyle::Arrow),
-                            ),
-                    ),
+                    .child(uniform_list_scrollbar(
+                        self.scroll_handle.clone(),
+                        Rc::clone(&self.scrollbar_drag),
+                        self.row_height,
+                        list_item_count,
+                        fallback_visible,
+                        SCROLLBAR_WIDTH,
+                        &theme,
+                    )),
             );
 
         self.prune_list_motion(now, reduced);

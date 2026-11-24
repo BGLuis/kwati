@@ -4,15 +4,17 @@
 //! restore selected items (reporting destination conflicts without overwriting), and
 //! offers Empty Trash behind a destructive confirmation dialog.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, relative, transparent_black, uniform_list, Context, CursorStyle, Entity,
-    EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, ScrollStrategy, UniformListScrollHandle, Window,
+    div, prelude::*, px, transparent_black, uniform_list, Context, CursorStyle, Entity,
+    EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
+    ScrollStrategy, UniformListScrollHandle, Window,
 };
 use kwati_core::{SortDirection, TrashItem};
 
@@ -25,8 +27,9 @@ use crate::actions::operations::{
 };
 use crate::components::interactive::focus_ring_color;
 use crate::components::{
-    animated_icon_sized, icon_for_entry, resolve_icon_color, resolved_icon, Ellipsize, IconMotion,
-    IconName, ScrollbarState, SpecialFolders,
+    animated_icon_sized, icon_for_entry, resolve_icon_color, resolved_icon,
+    uniform_list_scroll_metrics, uniform_list_scrollbar, Ellipsize, IconMotion, IconName,
+    ScrollbarDrag, ScrollbarState, SpecialFolders,
 };
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
@@ -67,6 +70,7 @@ pub struct TrashView {
     pub focus_handle: FocusHandle,
     pub scroll_handle: UniformListScrollHandle,
     pub scrollbar_state: ScrollbarState,
+    pub scrollbar_drag: Rc<RefCell<ScrollbarDrag>>,
     hovered_id: Option<OsString>,
     pressed_id: Option<OsString>,
     hovered_header: Option<u8>,
@@ -92,6 +96,7 @@ impl TrashView {
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             scrollbar_state: ScrollbarState::default(),
+            scrollbar_drag: Rc::new(RefCell::new(ScrollbarDrag::default())),
             hovered_id: None,
             pressed_id: None,
             hovered_header: None,
@@ -293,82 +298,6 @@ impl TrashView {
         });
         cx.notify();
     }
-
-    fn on_scrollbar_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.scrollbar_state.can_scroll() {
-            return;
-        }
-        self.scrollbar_state.is_dragging = true;
-        self.scrollbar_state.drag_start_y = event.position.y;
-        self.scrollbar_state.drag_start_offset = self.scrollbar_state.current_offset;
-
-        let track_height = px(600.);
-        let ratio = (event.position.y / track_height).clamp(0.0, 1.0);
-        let max_offset = self
-            .scrollbar_state
-            .total_items
-            .saturating_sub(self.scrollbar_state.visible_items);
-        let target = ((ratio * max_offset as f32).round() as usize).min(max_offset);
-        self.scrollbar_state.current_offset = target;
-
-        if target >= max_offset {
-            self.scroll_to_bottom();
-        } else {
-            self.scroll_handle
-                .scroll_to_item_strict(target, ScrollStrategy::Top);
-        }
-        cx.notify();
-    }
-
-    fn on_scrollbar_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.scrollbar_state.is_dragging = false;
-        cx.notify();
-    }
-
-    fn on_scrollbar_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.scrollbar_state.is_dragging || !self.scrollbar_state.can_scroll() {
-            return;
-        }
-        let track_height = px(600.);
-        let thumb_ratio = self.scrollbar_state.thumb_ratio();
-        let usable_track = track_height * (1.0 - thumb_ratio);
-        if usable_track <= px(0.) {
-            return;
-        }
-        let delta_y = event.position.y - self.scrollbar_state.drag_start_y;
-        let delta_ratio = delta_y / usable_track;
-        let max_offset = self
-            .scrollbar_state
-            .total_items
-            .saturating_sub(self.scrollbar_state.visible_items);
-        let delta_offset = (delta_ratio * max_offset as f32).round() as isize;
-        let new_offset = (self.scrollbar_state.drag_start_offset as isize + delta_offset)
-            .clamp(0, max_offset as isize) as usize;
-        self.scrollbar_state.current_offset = new_offset;
-
-        if new_offset >= max_offset {
-            self.scroll_to_bottom();
-        } else {
-            self.scroll_handle
-                .scroll_to_item_strict(new_offset, ScrollStrategy::Top);
-        }
-        cx.notify();
-    }
 }
 
 impl Render for TrashView {
@@ -376,13 +305,6 @@ impl Render for TrashView {
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
         let now = Instant::now();
-        let current_top = self
-            .scroll_handle
-            .0
-            .borrow()
-            .base_handle
-            .logical_scroll_top()
-            .0;
 
         let (
             items,
@@ -417,9 +339,14 @@ impl Render for TrashView {
 
         let item_count = items.len();
         let selected_count = selection.len();
-        let visible_items = 25;
-        self.scrollbar_state
-            .set_metrics(item_count, visible_items, current_top);
+        let scroll_metrics =
+            uniform_list_scroll_metrics(&self.scroll_handle, size::ROW, item_count, 25);
+        self.scrollbar_state.set_metrics(
+            item_count,
+            scroll_metrics.visible_items,
+            scroll_metrics.current_top,
+        );
+        self.scrollbar_state.is_dragging = self.scrollbar_drag.borrow().is_dragging;
 
         let view_focused = self.focus_handle.is_focused(window);
         let can_restore = selected_count > 0 && !trash_loading && !self.pending_restore;
@@ -546,46 +473,59 @@ impl Render for TrashView {
                                                 item.original_parent.to_string_lossy().into_owned();
                                             let deleted_str = format_modified(item.deleted_at());
 
-                                            let hover_t = this.motion.step_scalar(
-                                                TrashMotionKey::Hover(id.clone()),
-                                                0.0,
-                                                if is_hovered { 1.0 } else { 0.0 },
-                                                INSTANT,
-                                                Curve::EaseOut,
-                                                MotionKind::OpacityOrColor,
-                                                now,
-                                                reduced,
-                                            );
-                                            let press_t = this.motion.step_scalar(
-                                                TrashMotionKey::Press(id.clone()),
-                                                0.0,
-                                                if is_pressed { 1.0 } else { 0.0 },
-                                                INSTANT,
-                                                Curve::Spring,
-                                                MotionKind::MovementOrScale,
-                                                now,
-                                                reduced,
-                                            );
-                                            let select_t = this.motion.step_scalar(
-                                                TrashMotionKey::SelectBg(id.clone()),
-                                                0.0,
-                                                if is_selected { 1.0 } else { 0.0 },
-                                                INSTANT,
-                                                Curve::EaseOut,
-                                                MotionKind::OpacityOrColor,
-                                                now,
-                                                reduced,
-                                            );
-                                            let focus_t = this.motion.step_scalar(
-                                                TrashMotionKey::FocusRing(id.clone()),
-                                                0.0,
-                                                if is_focused_row { 1.0 } else { 0.0 },
-                                                INSTANT,
-                                                Curve::Spring,
-                                                MotionKind::OpacityOrColor,
-                                                now,
-                                                reduced,
-                                            );
+                                            let has_scalars = this.motion.has_scalars();
+                                            let hover_t = if is_hovered || has_scalars {
+                                                this.motion.step_scalar_or_zero(
+                                                    TrashMotionKey::Hover(id.clone()),
+                                                    if is_hovered { 1.0 } else { 0.0 },
+                                                    INSTANT,
+                                                    Curve::EaseOut,
+                                                    MotionKind::OpacityOrColor,
+                                                    now,
+                                                    reduced,
+                                                )
+                                            } else {
+                                                0.0
+                                            };
+                                            let press_t = if is_pressed || has_scalars {
+                                                this.motion.step_scalar_or_zero(
+                                                    TrashMotionKey::Press(id.clone()),
+                                                    if is_pressed { 1.0 } else { 0.0 },
+                                                    INSTANT,
+                                                    Curve::Spring,
+                                                    MotionKind::MovementOrScale,
+                                                    now,
+                                                    reduced,
+                                                )
+                                            } else {
+                                                0.0
+                                            };
+                                            let select_t = if is_selected || has_scalars {
+                                                this.motion.step_scalar_or_zero(
+                                                    TrashMotionKey::SelectBg(id.clone()),
+                                                    if is_selected { 1.0 } else { 0.0 },
+                                                    INSTANT,
+                                                    Curve::EaseOut,
+                                                    MotionKind::OpacityOrColor,
+                                                    now,
+                                                    reduced,
+                                                )
+                                            } else {
+                                                0.0
+                                            };
+                                            let focus_t = if is_focused_row || has_scalars {
+                                                this.motion.step_scalar_or_zero(
+                                                    TrashMotionKey::FocusRing(id.clone()),
+                                                    if is_focused_row { 1.0 } else { 0.0 },
+                                                    INSTANT,
+                                                    Curve::Spring,
+                                                    MotionKind::OpacityOrColor,
+                                                    now,
+                                                    reduced,
+                                                )
+                                            } else {
+                                                0.0
+                                            };
 
                                             let base_hover =
                                                 color_lerp(transparent_black(), row_hover, hover_t);
@@ -746,41 +686,15 @@ impl Render for TrashView {
                         .size_full(),
                     ),
                 )
-                .child(
-                    div()
-                        .w(SCROLLBAR_WIDTH)
-                        .h_full()
-                        .border_l_1()
-                        .border_color(theme.border)
-                        .relative()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(Self::on_scrollbar_mouse_down),
-                        )
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::on_scrollbar_mouse_up))
-                        .on_mouse_up_out(
-                            MouseButton::Left,
-                            cx.listener(Self::on_scrollbar_mouse_up),
-                        )
-                        .on_mouse_move(cx.listener(Self::on_scrollbar_mouse_move))
-                        .child(
-                            div()
-                                .w_full()
-                                .h(relative(self.scrollbar_state.thumb_ratio()))
-                                .top(relative(
-                                    self.scrollbar_state.scroll_ratio()
-                                        * (1.0 - self.scrollbar_state.thumb_ratio()),
-                                ))
-                                .rounded_sm()
-                                .bg(if self.scrollbar_state.is_dragging {
-                                    theme.text_muted
-                                } else {
-                                    theme.border_strong
-                                })
-                                .hover(|s| s.bg(theme.text_muted))
-                                .cursor(CursorStyle::Arrow),
-                        ),
-                )
+                .child(uniform_list_scrollbar(
+                    self.scroll_handle.clone(),
+                    Rc::clone(&self.scrollbar_drag),
+                    size::ROW,
+                    item_count,
+                    25,
+                    SCROLLBAR_WIDTH,
+                    &theme,
+                ))
                 .into_any_element()
         };
 

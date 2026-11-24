@@ -966,6 +966,9 @@ impl AppState {
     }
 
     pub fn selected_trash_items(&self) -> Vec<TrashItem> {
+        if self.trash_selection.is_empty() {
+            return Vec::new();
+        }
         self.trash_items
             .iter()
             .filter(|item| self.trash_selection.contains(&item.id))
@@ -974,6 +977,9 @@ impl AppState {
     }
 
     pub fn selected_trash_index(&self) -> Option<usize> {
+        if self.trash_selection.is_empty() {
+            return None;
+        }
         self.trash_items
             .iter()
             .position(|item| self.trash_selection.contains(&item.id))
@@ -1827,6 +1833,9 @@ impl AppState {
     /// Returns selected entries in listing order, working correctly for both local and remote
     /// locations (`Selection::selected_in_order` constructs local locations and misses remote ones).
     pub fn selected_entries(&self) -> Vec<&Entry> {
+        if self.selection.is_empty() {
+            return Vec::new();
+        }
         self.entries
             .iter()
             .filter(|e| self.selection.contains(&self.location_of(e)))
@@ -1835,6 +1844,9 @@ impl AppState {
 
     /// Returns the `Location` of each selected entry in listing order.
     pub fn selected_locations(&self) -> Vec<Location> {
+        if self.selection.is_empty() {
+            return Vec::new();
+        }
         self.entries
             .iter()
             .filter(|e| self.selection.contains(&self.location_of(e)))
@@ -1951,6 +1963,9 @@ impl AppState {
 
     /// Returns the index of the first selected entry in the listed entries, if any.
     pub fn selected_index(&self) -> Option<usize> {
+        if self.selection.is_empty() {
+            return None;
+        }
         self.entries
             .iter()
             .position(|e| self.selection.contains(&self.location_of(e)))

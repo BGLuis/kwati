@@ -437,6 +437,34 @@ impl<K: Eq + Hash + Clone> MotionTracker<K> {
         entry.value_at(now, reduced)
     }
 
+    /// Returns `true` when any scalar transition is currently stored.
+    pub fn has_scalars(&self) -> bool {
+        !self.scalars.is_empty()
+    }
+
+    /// Updates a transition toward `target`, skipping allocation/insertion when `target` is
+    /// already `0.0` and no transition is tracked for `key`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_scalar_or_zero(
+        &mut self,
+        key: K,
+        target: f32,
+        duration: Duration,
+        curve: Curve,
+        kind: MotionKind,
+        now: Instant,
+        reduced: bool,
+    ) -> f32 {
+        if target.abs() <= 1e-4 {
+            if let Some(entry) = self.scalars.get_mut(&key) {
+                entry.retarget(0.0, duration, curve, kind, now, reduced);
+                return entry.value_at(now, reduced);
+            }
+            return 0.0;
+        }
+        self.step_scalar(key, 0.0, target, duration, curve, kind, now, reduced)
+    }
+
     /// Reads the current scalar without creating an entry, defaulting to `default`.
     pub fn scalar_or(&self, key: &K, default: f32, now: Instant, reduced: bool) -> f32 {
         self.scalars

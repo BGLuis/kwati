@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use gpui::{
     point, px, size, AppContext as _, Entity, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent,
-    Pixels, Point, TestAppContext, VisualTestContext,
+    Pixels, Point, ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext,
 };
 use kwati_core::{
     Entry, Location, MotionPreference, Settings, SortColumn, SortDirection, ViewMode,
@@ -624,6 +624,114 @@ fn grid_two_line_labels_fit_within_tile_width_and_ellipsize_on_overflow(cx: &mut
         assert!(l2.ends_with('…'), "expected ellipsis on line 2, got {l2:?}");
     })
     .unwrap();
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[gpui::test]
+fn scrollbar_follows_scroll_and_supports_track_click_and_drag(cx: &mut TestAppContext) {
+    let dir = fixture("scrollbar_sync", 120);
+    let (main, cx) = open_window(cx, &dir);
+
+    let (list_bounds, track_bounds, initial_offset, initial_ratio) =
+        main.read_with(cx, |main, cx| {
+            let list = main.list.read(cx);
+            (
+                list.scroll_handle.0.borrow().base_handle.bounds(),
+                list.scrollbar_drag.borrow().track_bounds,
+                list.scrollbar_state.current_offset,
+                list.scrollbar_state.scroll_ratio(),
+            )
+        });
+    assert!(track_bounds.size.height > px(0.));
+    assert_eq!(initial_offset, 0);
+    assert_eq!(initial_ratio, 0.0);
+
+    // 1. Mouse wheel scroll down -> scrollbar_state follows page scroll
+    let list_center = list_bounds.center();
+    cx.simulate_mouse_move(list_center, None, Modifiers::none());
+    cx.simulate_event(ScrollWheelEvent {
+        position: list_center,
+        delta: ScrollDelta::Pixels(point(px(0.), px(-420.))),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+
+    let (wheel_scroll_y, wheel_offset, wheel_ratio) = main.read_with(cx, |main, cx| {
+        let list = main.list.read(cx);
+        (
+            list.scroll_handle.0.borrow().base_handle.offset().y,
+            list.scrollbar_state.current_offset,
+            list.scrollbar_state.scroll_ratio(),
+        )
+    });
+    assert!(wheel_scroll_y < px(0.), "wheel should scroll list down");
+    assert!(
+        wheel_offset > 0 && wheel_ratio > 0.0,
+        "scrollbar must follow wheel scroll: offset={wheel_offset}, ratio={wheel_ratio}"
+    );
+
+    // 2. Keyboard End / Home -> scrollbar_state follows keyboard scroll
+    cx.simulate_keystrokes("end");
+    cx.run_until_parked();
+    let end_ratio = main.read_with(cx, |main, cx| {
+        main.list.read(cx).scrollbar_state.scroll_ratio()
+    });
+    assert!(
+        end_ratio > 0.9,
+        "scrollbar must reach near bottom on End key, got {end_ratio}"
+    );
+
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    let home_offset = main.read_with(cx, |main, cx| {
+        main.list.read(cx).scrollbar_state.current_offset
+    });
+    assert_eq!(home_offset, 0, "scrollbar must return to top on Home key");
+
+    // 3. Dragging the thumb down while cursor moves horizontally outside the 10px track
+    let track_x = track_bounds.center().x;
+    let thumb_grab = point(track_x, track_bounds.top() + px(8.));
+    cx.simulate_mouse_move(thumb_grab, None, Modifiers::none());
+    cx.simulate_mouse_down(thumb_grab, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        point(track_x - px(48.), track_bounds.top() + px(180.)),
+        Some(MouseButton::Left),
+        Modifiers::none(),
+    );
+    cx.simulate_mouse_up(
+        point(track_x - px(48.), track_bounds.top() + px(180.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    cx.run_until_parked();
+
+    let (drag_scroll_y, drag_offset, still_dragging) = main.read_with(cx, |main, cx| {
+        let list = main.list.read(cx);
+        (
+            list.scroll_handle.0.borrow().base_handle.offset().y,
+            list.scrollbar_state.current_offset,
+            list.scrollbar_drag.borrow().is_dragging,
+        )
+    });
+    assert!(drag_scroll_y < px(0.), "thumb drag must scroll list down");
+    assert!(drag_offset > 0, "scrollbar offset must update on drag");
+    assert!(!still_dragging, "mouse up must end scrollbar drag");
+
+    // 4. Clicking on the lower track jumps near the bottom
+    let lower_track = point(track_x, track_bounds.bottom() - px(24.));
+    cx.simulate_mouse_move(lower_track, None, Modifiers::none());
+    cx.simulate_mouse_down(lower_track, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(lower_track, MouseButton::Left, Modifiers::none());
+    cx.run_until_parked();
+
+    let jump_ratio = main.read_with(cx, |main, cx| {
+        main.list.read(cx).scrollbar_state.scroll_ratio()
+    });
+    assert!(
+        jump_ratio > 0.7,
+        "clicking lower track must jump near bottom, got {jump_ratio}"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
