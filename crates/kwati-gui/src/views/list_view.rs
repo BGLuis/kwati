@@ -12,9 +12,9 @@ use std::time::Instant;
 
 use gpui::{
     div, font, point, prelude::*, px, transparent_black, uniform_list, ClickEvent, Context,
-    CursorStyle, Div, Entity, EventEmitter, FocusHandle, Focusable, Font, Hsla, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollStrategy,
-    SharedString, Stateful, TextRun, UniformListScrollHandle, Window,
+    CursorStyle, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, Font, Hsla,
+    KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, ScrollStrategy, SharedString, Stateful, TextRun, UniformListScrollHandle, Window,
 };
 use kwati_core::{
     Entry, IconPreferences, IconResolver, Location, ResolvedIcon, SortColumn, SortDirection,
@@ -40,6 +40,10 @@ use crate::motion::{
 use crate::state::{entry_location, AppState, EntryChangeOrigin, NavigationDirection};
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole, BODY_SIZE};
+use crate::views::drag_drop::{
+    is_copy_modifier, resolve_drop_operation, validate_external_drop, validate_internal_drop,
+    DropOperation, DropRejection,
+};
 
 /// Formats a file size in human-readable units (B, KB, MB, GB, TB).
 pub fn format_size(bytes: Option<u64>, is_dir: bool) -> String {
@@ -150,9 +154,16 @@ struct ReorderOffset {
 }
 
 /// Events emitted by [`ListView`] to [`super::MainView`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ListViewEvent {
-    OpenContextMenu { position: Point<Pixels> },
+    OpenContextMenu {
+        position: Point<Pixels>,
+    },
+    DropTransfer {
+        sources: Vec<Location>,
+        dest_dir: Location,
+        operation: DropOperation,
+    },
 }
 
 /// View rendering directory entries in Details, Compact List, or Grid mode with a draggable scrollbar.
@@ -166,6 +177,7 @@ pub struct ListView {
     grid_columns: usize,
     last_view_mode: ViewMode,
     rubber_band: Option<RubberBand>,
+    dragging_locations: HashSet<Location>,
     hovered_location: Option<Location>,
     pressed_location: Option<Location>,
     hovered_header: Option<u8>,
@@ -233,6 +245,7 @@ impl ListView {
             grid_columns: DEFAULT_GRID_COLUMNS,
             last_view_mode: initial_mode,
             rubber_band: None,
+            dragging_locations: HashSet::new(),
             hovered_location: None,
             pressed_location: None,
             hovered_header: None,
@@ -1147,8 +1160,9 @@ struct DragEntriesPreview {
 }
 
 impl Render for DragEntriesPreview {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
+        let copy_mode = is_copy_modifier(window.modifiers());
         let color = if self.icon.is_folder() {
             resolve_icon_color(self.icon.key_name(), &self.icon_prefs, &theme)
         } else {
@@ -1182,6 +1196,17 @@ impl Render for DragEntriesPreview {
                 color,
             ))
             .child(self.label.clone())
+            .when(copy_mode, |preview| {
+                preview.child(
+                    div()
+                        .px(space::S4)
+                        .rounded(radius::CONTROL)
+                        .bg(theme.accent)
+                        .text_label()
+                        .text_color(theme.on_accent)
+                        .child("Copy"),
+                )
+            })
     }
 }
 
@@ -1319,6 +1344,7 @@ impl ListView {
         is_selected: bool,
         is_focused_row: bool,
         is_cut: bool,
+        is_dragged: bool,
         is_remote: bool,
         base_icon_size: Pixels,
         scroll_top_entry: usize,
@@ -1471,6 +1497,9 @@ impl ListView {
         };
 
         item_opacity *= lerp_f32(1.0, 0.5, cut_t);
+        if is_dragged {
+            item_opacity *= 0.5;
+        }
 
         let base_hover = color_lerp(transparent_black(), theme.surface_raised, hover_t);
         let mut bg: Hsla = color_lerp(base_hover, theme.selection, select_t);
@@ -1568,17 +1597,82 @@ impl ListView {
         }
     }
 
+    pub fn handle_entries_drop(
+        &mut self,
+        dragged: &DragEntries,
+        dest_dir: Location,
+        modifiers: Modifiers,
+        report_already_in_folder: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mounts = self.app_state.read(cx).volume_mounts.clone();
+        let sources = dragged.locations();
+        let op = resolve_drop_operation(&sources, &dest_dir, modifiers, &mounts);
+        match validate_internal_drop(dragged, &dest_dir, op) {
+            Ok(()) => {
+                cx.emit(ListViewEvent::DropTransfer {
+                    sources,
+                    dest_dir,
+                    operation: op,
+                });
+            }
+            Err(DropRejection::AlreadyInFolder) if !report_already_in_folder => {}
+            Err(reason) => {
+                if let Some(msg) = reason.status_message() {
+                    self.app_state.update(cx, |state, _| state.set_status(msg));
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Copies external OS files dropped from another app into `dest_dir`, refusing dropping
+    /// a folder into itself or one of its subfolders.
+    pub fn handle_external_paths_drop(
+        &mut self,
+        paths: &[PathBuf],
+        dest_dir: Location,
+        cx: &mut Context<Self>,
+    ) {
+        match validate_external_drop(paths, &dest_dir) {
+            Ok(()) => {
+                let sources = paths.iter().cloned().map(Location::Local).collect();
+                cx.emit(ListViewEvent::DropTransfer {
+                    sources,
+                    dest_dir,
+                    operation: DropOperation::Copy,
+                });
+            }
+            Err(reason) => {
+                if let Some(msg) = reason.status_message() {
+                    self.app_state.update(cx, |state, _| state.set_status(msg));
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn is_pointer_over_dir(&self, position: Point<Pixels>, cx: &gpui::App) -> bool {
+        let state = self.app_state.read(cx);
+        self.entry_index_at(position, state.entries.len(), state.view_mode)
+            .and_then(|ix| state.entries.get(ix))
+            .is_some_and(Entry::is_dir)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn attach_entry_interactions(
         &self,
         el: Stateful<Div>,
         ix: usize,
         loc: Location,
+        is_dir: bool,
         drag_entries: DragEntries,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let loc_hover = loc.clone();
         let loc_press = loc.clone();
-        let loc_click = loc;
+        let loc_click = loc.clone();
+        let list_handle = cx.entity().downgrade();
         let (icon_prefs, icon_resolver) = {
             let state = self.app_state.read(cx);
             (
@@ -1587,77 +1681,127 @@ impl ListView {
             )
         };
 
-        el.on_hover(cx.listener(move |this, hovered, _, cx| {
-            if *hovered {
-                this.hovered_location = Some(loc_hover.clone());
-                cx.notify();
-            } else if this.hovered_location.as_ref() == Some(&loc_hover) {
-                this.hovered_location = None;
-                this.pressed_location = None;
-                cx.notify();
-            }
-        }))
-        .on_drag(drag_entries, move |dragged, _, _, cx| {
-            let label = match dragged.items.as_slice() {
-                [only] => only.name.clone(),
-                [first, ..] => format!("{} (+{})", first.name, dragged.items.len() - 1),
-                [] => String::new(),
-            };
-            let icon = dragged
-                .items
-                .first()
-                .map(|i| i.icon)
-                .unwrap_or(IconName::File);
-            cx.new(|_| DragEntriesPreview {
-                label,
-                icon,
-                icon_prefs: icon_prefs.clone(),
-                icon_resolver: icon_resolver.clone(),
+        let el = el
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                if *hovered {
+                    this.hovered_location = Some(loc_hover.clone());
+                    cx.notify();
+                } else if this.hovered_location.as_ref() == Some(&loc_hover) {
+                    this.hovered_location = None;
+                    this.pressed_location = None;
+                    cx.notify();
+                }
+            }))
+            .on_drag(drag_entries, move |dragged, _, _, cx| {
+                let _ = list_handle.update(cx, |this, cx| {
+                    this.dragging_locations = dragged.locations().into_iter().collect();
+                    cx.notify();
+                });
+                let label = match dragged.items.as_slice() {
+                    [only] => only.name.clone(),
+                    [first, ..] => format!("{} (+{})", first.name, dragged.items.len() - 1),
+                    [] => String::new(),
+                };
+                let icon = dragged
+                    .items
+                    .first()
+                    .map(|i| i.icon)
+                    .unwrap_or(IconName::File);
+                cx.new(|_| DragEntriesPreview {
+                    label,
+                    icon,
+                    icon_prefs: icon_prefs.clone(),
+                    icon_resolver: icon_resolver.clone(),
+                })
             })
-        })
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                this.pressed_location = Some(loc_press.clone());
-                this.on_entry_click_at(ix, event, window, cx);
-            }),
-        )
-        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-            if let ClickEvent::Mouse(mouse) = event {
-                if !mouse.down.modifiers.shift && !mouse.down.modifiers.secondary() {
-                    this.app_state.update(cx, |state, cx| {
-                        if state.selection.len() > 1 && state.selection.contains(&loc_click) {
-                            state.selection.select_only(loc_click.clone());
-                            cx.notify();
-                        }
-                    });
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.pressed_location = Some(loc_press.clone());
+                    this.on_entry_click_at(ix, event, window, cx);
+                }),
+            )
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if let ClickEvent::Mouse(mouse) = event {
+                    if !mouse.down.modifiers.shift && !mouse.down.modifiers.secondary() {
+                        this.app_state.update(cx, |state, cx| {
+                            if state.selection.len() > 1 && state.selection.contains(&loc_click) {
+                                state.selection.select_only(loc_click.clone());
+                                cx.notify();
+                            }
+                        });
+                    }
                 }
-            }
-        }))
-        .on_mouse_up(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                if this.pressed_location.is_some() {
-                    this.pressed_location = None;
-                    cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if this.pressed_location.is_some() {
+                        this.pressed_location = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if this.pressed_location.is_some() {
+                        this.pressed_location = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.on_entry_right_click_at(ix, event, window, cx);
+                }),
+            );
+
+        if is_dir {
+            let app_state_drag = self.app_state.clone();
+            let dest_drag = loc.clone();
+            let dest_drop = loc.clone();
+            let dest_ext_drag = loc.clone();
+            let dest_ext_drop = loc;
+            el.drag_over::<DragEntries>(move |style, dragged, window, cx| {
+                let mounts = app_state_drag.read(cx).volume_mounts.clone();
+                let op = resolve_drop_operation(
+                    &dragged.locations(),
+                    &dest_drag,
+                    window.modifiers(),
+                    &mounts,
+                );
+                if validate_internal_drop(dragged, &dest_drag, op).is_ok() {
+                    let theme = Theme::get(cx);
+                    style
+                        .bg(theme.surface_raised)
+                        .border_1()
+                        .border_color(theme.accent)
+                } else {
+                    style
                 }
-            }),
-        )
-        .on_mouse_up_out(
-            MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                if this.pressed_location.is_some() {
-                    this.pressed_location = None;
-                    cx.notify();
+            })
+            .on_drop(cx.listener(move |this, dragged: &DragEntries, window, cx| {
+                this.handle_entries_drop(dragged, dest_drop.clone(), window.modifiers(), true, cx);
+            }))
+            .drag_over::<ExternalPaths>(move |style, paths, _, cx| {
+                if validate_external_drop(paths.paths(), &dest_ext_drag).is_ok() {
+                    let theme = Theme::get(cx);
+                    style
+                        .bg(theme.surface_raised)
+                        .border_1()
+                        .border_color(theme.accent)
+                } else {
+                    style
                 }
-            }),
-        )
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                this.on_entry_right_click_at(ix, event, window, cx);
-            }),
-        )
+            })
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                this.handle_external_paths_drop(paths.paths(), dest_ext_drop.clone(), cx);
+            }))
+        } else {
+            el
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1701,7 +1845,7 @@ impl ListView {
             .text_body()
             .text_color(vis.text_col);
 
-        self.attach_entry_interactions(base, ix, loc, drag_entries, cx)
+        self.attach_entry_interactions(base, ix, loc, entry.is_dir(), drag_entries, cx)
             .child(
                 div()
                     .flex_1()
@@ -1769,7 +1913,7 @@ impl ListView {
             .text_body()
             .text_color(vis.text_col);
 
-        self.attach_entry_interactions(base, ix, loc, drag_entries, cx)
+        self.attach_entry_interactions(base, ix, loc, entry.is_dir(), drag_entries, cx)
             .child(render_resolved_icon(
                 &vis.resolved_icon,
                 vis.glyph,
@@ -1819,7 +1963,7 @@ impl ListView {
             .text_body()
             .text_color(vis.text_col);
 
-        self.attach_entry_interactions(base, ix, loc, drag_entries, cx)
+        self.attach_entry_interactions(base, ix, loc, entry.is_dir(), drag_entries, cx)
             .child(
                 div()
                     .size(GRID_ICON_SIZE)
@@ -2055,6 +2199,10 @@ impl ListView {
 
 impl Render for ListView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !cx.has_active_drag() && !self.dragging_locations.is_empty() {
+            self.dragging_locations.clear();
+        }
+        let has_active_drag = cx.has_active_drag();
         let theme = Theme::get(cx);
         let fonts = Fonts::get(cx);
         let now = Instant::now();
@@ -2331,6 +2479,10 @@ impl Render for ListView {
         };
 
         let theme_for_rows = theme;
+        let list_entity_drag = cx.entity();
+        let list_entity_ext_drag = cx.entity();
+        let app_state_list_drag = self.app_state.clone();
+        let app_state_list_ext_drag = self.app_state.clone();
         let scroll_top_entry = if view_mode == ViewMode::Grid {
             current_top * cols
         } else {
@@ -2563,9 +2715,65 @@ impl Render for ListView {
                     .overflow_hidden()
                     .child(
                         div()
+                            .id("list-drop-zone")
+                            .debug_selector(|| "list-drop-zone".into())
                             .relative()
                             .flex_1()
                             .h_full()
+                            .drag_over::<DragEntries>(move |style, dragged, window, cx| {
+                                if list_entity_drag
+                                    .read(cx)
+                                    .is_pointer_over_dir(window.mouse_position(), cx)
+                                {
+                                    return style;
+                                }
+                                let (dest, mounts) = {
+                                    let state = app_state_list_drag.read(cx);
+                                    (state.current_location.clone(), state.volume_mounts.clone())
+                                };
+                                let op = resolve_drop_operation(
+                                    &dragged.locations(),
+                                    &dest,
+                                    window.modifiers(),
+                                    &mounts,
+                                );
+                                if validate_internal_drop(dragged, &dest, op).is_ok() {
+                                    let theme = Theme::get(cx);
+                                    style.border_1().border_color(theme.accent)
+                                } else {
+                                    style
+                                }
+                            })
+                            .on_drop(cx.listener(|this, dragged: &DragEntries, window, cx| {
+                                let dest = this.app_state.read(cx).current_location.clone();
+                                this.handle_entries_drop(
+                                    dragged,
+                                    dest,
+                                    window.modifiers(),
+                                    false,
+                                    cx,
+                                );
+                            }))
+                            .drag_over::<ExternalPaths>(move |style, paths, window, cx| {
+                                if list_entity_ext_drag
+                                    .read(cx)
+                                    .is_pointer_over_dir(window.mouse_position(), cx)
+                                {
+                                    return style;
+                                }
+                                let dest =
+                                    app_state_list_ext_drag.read(cx).current_location.clone();
+                                if validate_external_drop(paths.paths(), &dest).is_ok() {
+                                    let theme = Theme::get(cx);
+                                    style.border_1().border_color(theme.accent)
+                                } else {
+                                    style
+                                }
+                            })
+                            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                                let dest = this.app_state.read(cx).current_location.clone();
+                                this.handle_external_paths_drop(paths.paths(), dest, cx);
+                            }))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_list_mouse_down))
                             .on_mouse_down(
                                 MouseButton::Right,
@@ -2670,6 +2878,10 @@ impl Render for ListView {
                                                     ) in visible_rows
                                                     {
                                                         if let Some(entry) = entries_clone.get(ix) {
+                                                            let is_dragged = has_active_drag
+                                                                && this
+                                                                    .dragging_locations
+                                                                    .contains(&loc);
                                                             let vis = this.compute_item_visuals(
                                                                 ix,
                                                                 entry,
@@ -2677,6 +2889,7 @@ impl Render for ListView {
                                                                 is_selected,
                                                                 is_focused_row,
                                                                 is_cut,
+                                                                is_dragged,
                                                                 is_remote,
                                                                 base_icon_size,
                                                                 scroll_top_entry,
@@ -2729,6 +2942,10 @@ impl Render for ListView {
                                                                 if let Some(entry) =
                                                                     entries_clone.get(ix)
                                                                 {
+                                                                    let is_dragged = has_active_drag
+                                                                        && this
+                                                                            .dragging_locations
+                                                                            .contains(&loc);
                                                                     let vis = this
                                                                         .compute_item_visuals(
                                                                             ix,
@@ -2737,6 +2954,7 @@ impl Render for ListView {
                                                                             is_selected,
                                                                             is_focused_row,
                                                                             is_cut,
+                                                                            is_dragged,
                                                                             is_remote,
                                                                             base_icon_size,
                                                                             scroll_top_entry,

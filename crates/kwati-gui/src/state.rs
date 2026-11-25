@@ -296,6 +296,8 @@ pub struct AppState {
     pub view_mode: ViewMode,
     pub panels: PanelLayout,
     pub dir_watcher: Option<DirWatcher>,
+    pub volume_mounts: Arc<Vec<PathBuf>>,
+    volume_mounts_locked: bool,
     pub remote_cache: Arc<RemoteFileCache>,
     remote_stream_server: Arc<OnceLock<Result<RemoteStreamServer, String>>>,
     remote_edit_watchers: HashMap<Location, RemoteEditWatcher>,
@@ -374,6 +376,8 @@ impl AppState {
             view_mode: resolved.view_mode,
             panels: PanelLayout::default(),
             dir_watcher: None,
+            volume_mounts: Arc::new(Vec::new()),
+            volume_mounts_locked: false,
             remote_cache: Arc::new(RemoteFileCache::new()),
             remote_stream_server: Arc::new(OnceLock::new()),
             remote_edit_watchers: HashMap::new(),
@@ -846,6 +850,27 @@ impl AppState {
     #[doc(hidden)]
     pub fn set_remote_edit_debounce_for_test(&mut self, debounce: Duration) {
         self.remote_edit_debounce = debounce;
+    }
+
+    /// Updates cached local volume mount points from a background refresh unless locked by tests.
+    pub fn set_volume_mounts(&mut self, mounts: Vec<PathBuf>) {
+        if self.volume_mounts_locked {
+            return;
+        }
+        if *self.volume_mounts != mounts {
+            self.volume_mounts = Arc::new(mounts);
+        }
+    }
+
+    /// Returns cached local volume mount points used for same- vs cross-volume drop decisions.
+    pub fn volume_mounts(&self) -> &[PathBuf] {
+        &self.volume_mounts
+    }
+
+    #[doc(hidden)]
+    pub fn set_volume_mounts_for_test(&mut self, mounts: Vec<PathBuf>) {
+        self.volume_mounts_locked = true;
+        self.volume_mounts = Arc::new(mounts);
     }
 
     /// Returns a reference to the first currently selected entry, if any.

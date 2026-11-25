@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     div, prelude::*, px, transparent_black, AnyElement, Context, Div, Entity, EventEmitter,
-    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Stateful,
-    StyleRefinement, Subscription, Task, Window,
+    ExternalPaths, FontWeight, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Pixels, Point,
+    Stateful, StyleRefinement, Subscription, Task, Window,
 };
 use kwati_core::{
     device_volumes, is_trash_browsing_supported, network_mounts, ConnectionState, IconPreferences,
@@ -31,6 +31,10 @@ use crate::remote::protocol_label;
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, TextRole};
+use crate::views::drag_drop::{
+    collect_volume_mounts, resolve_drop_operation, validate_external_drop, validate_internal_drop,
+    DropOperation,
+};
 use crate::views::list_view::DragEntries;
 
 /// Formats byte quantities into human-readable strings (B, KB, MB, GB, TB).
@@ -404,9 +408,10 @@ impl Render for DragPlacePreview {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarViewEvent {
-    MoveEntries {
+    DropTransfer {
         sources: Vec<Location>,
         dest_dir: Location,
+        operation: DropOperation,
     },
     TrashEntries(Vec<Location>),
     OpenPlaceContextMenu {
@@ -418,30 +423,52 @@ pub enum SidebarViewEvent {
 
 impl EventEmitter<SidebarViewEvent> for SidebarView {}
 
-fn can_move_entries_to(dragged: &DragEntries, dest_path: &Path) -> bool {
-    if dragged.items.is_empty() {
-        return false;
+fn style_drag_over_local_dir(
+    style: StyleRefinement,
+    dragged: &DragEntries,
+    dest: &Path,
+    modifiers: Modifiers,
+    mounts: &[PathBuf],
+    theme: &Theme,
+) -> StyleRefinement {
+    let dest_loc = Location::Local(dest.to_path_buf());
+    let op = resolve_drop_operation(&dragged.locations(), &dest_loc, modifiers, mounts);
+    if validate_internal_drop(dragged, &dest_loc, op).is_ok() {
+        style
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.accent)
+    } else {
+        style
     }
-    let dest_loc = Location::Local(dest_path.to_path_buf());
-    for item in &dragged.items {
-        if let Location::Local(src) = &item.location {
-            if src == dest_path || (item.is_dir && dest_path.starts_with(src)) {
-                return false;
-            }
-        }
-    }
-    !dragged
-        .items
-        .iter()
-        .all(|item| item.location.parent().as_ref() == Some(&dest_loc))
 }
 
+fn style_drag_over_external_local_dir(
+    style: StyleRefinement,
+    paths: &ExternalPaths,
+    dest: &Path,
+    theme: &Theme,
+) -> StyleRefinement {
+    let dest_loc = Location::Local(dest.to_path_buf());
+    if validate_external_drop(paths.paths(), &dest_loc).is_ok() {
+        style
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.accent)
+    } else {
+        style
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn style_drag_over_place_entry(
     style: StyleRefinement,
     dragged: &DragEntries,
     is_trash: bool,
     is_missing: bool,
     dest_path: Option<&Path>,
+    modifiers: Modifiers,
+    mounts: &[PathBuf],
     theme: &Theme,
 ) -> StyleRefinement {
     if is_trash {
@@ -454,12 +481,7 @@ fn style_drag_over_place_entry(
         return style;
     }
     if let Some(dest) = dest_path {
-        if can_move_entries_to(dragged, dest) {
-            return style
-                .bg(theme.surface)
-                .border_1()
-                .border_color(theme.accent);
-        }
+        return style_drag_over_local_dir(style, dragged, dest, modifiers, mounts, theme);
     }
     style
 }
@@ -530,11 +552,15 @@ impl SidebarView {
             cx.notify();
         });
         let device_poll = cx.spawn(async move |this, cx| loop {
-            let (volumes, network) = cx
+            let (volumes, network, mounts) = cx
                 .background_executor()
-                .spawn(async { (device_volumes(), network_mounts()) })
+                .spawn(async { (device_volumes(), network_mounts(), collect_volume_mounts()) })
                 .await;
-            let listed = this.update(cx, |this, cx| this.set_devices(volumes, network, cx));
+            let listed = this.update(cx, |this, cx| {
+                this.app_state
+                    .update(cx, |state, _| state.set_volume_mounts(mounts));
+                this.set_devices(volumes, network, cx);
+            });
             if listed.is_err() {
                 break;
             }
@@ -578,7 +604,17 @@ impl SidebarView {
 
     /// Lists drives and shares now instead of waiting for the next poll.
     pub fn refresh_devices(&mut self, cx: &mut Context<Self>) {
-        self.refresh_devices_with(|| (device_volumes(), network_mounts()), cx);
+        self.device_refresh = Some(cx.spawn(async move |this, cx| {
+            let (volumes, network, mounts) = cx
+                .background_executor()
+                .spawn(async { (device_volumes(), network_mounts(), collect_volume_mounts()) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.app_state
+                    .update(cx, |state, _| state.set_volume_mounts(mounts));
+                this.set_devices(volumes, network, cx);
+            });
+        }));
     }
 
     pub fn refresh_devices_with(
@@ -756,12 +792,71 @@ impl SidebarView {
         }
     }
 
+    fn handle_local_dir_entries_drop(
+        &mut self,
+        dragged: &DragEntries,
+        dest: &Path,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let dest_loc = Location::Local(dest.to_path_buf());
+        let mounts = self.app_state.read(cx).volume_mounts.clone();
+        let sources = dragged.locations();
+        let op = resolve_drop_operation(&sources, &dest_loc, modifiers, &mounts);
+        match validate_internal_drop(dragged, &dest_loc, op) {
+            Ok(()) => {
+                cx.emit(SidebarViewEvent::DropTransfer {
+                    sources,
+                    dest_dir: dest_loc,
+                    operation: op,
+                });
+            }
+            Err(reason) => {
+                if let Some(msg) = reason.status_message() {
+                    self.app_state.update(cx, |state, _| {
+                        state.set_status(msg);
+                    });
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Copies external OS files dropped onto a sidebar directory target into `dest_path`.
+    pub fn handle_external_paths_drop(
+        &mut self,
+        paths: &[PathBuf],
+        dest_path: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        let dest_loc = Location::Local(dest_path.to_path_buf());
+        match validate_external_drop(paths, &dest_loc) {
+            Ok(()) => {
+                let sources = paths.iter().cloned().map(Location::Local).collect();
+                cx.emit(SidebarViewEvent::DropTransfer {
+                    sources,
+                    dest_dir: dest_loc,
+                    operation: DropOperation::Copy,
+                });
+            }
+            Err(reason) => {
+                if let Some(msg) = reason.status_message() {
+                    self.app_state.update(cx, |state, _| {
+                        state.set_status(msg);
+                    });
+                    cx.notify();
+                }
+            }
+        }
+    }
+
     fn handle_place_entries_drop(
         &mut self,
         dragged: &DragEntries,
         is_trash: bool,
         is_missing: bool,
         dest_path: Option<&Path>,
+        modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) {
         if is_trash {
@@ -775,16 +870,7 @@ impl SidebarView {
             return;
         }
         if let Some(dest) = dest_path {
-            if can_move_entries_to(dragged, dest) {
-                cx.emit(SidebarViewEvent::MoveEntries {
-                    sources: dragged.locations(),
-                    dest_dir: Location::Local(dest.to_path_buf()),
-                });
-            } else {
-                self.app_state.update(cx, |state, _| {
-                    state.set_status("Os itens já estão nesta pasta.");
-                });
-            }
+            self.handle_local_dir_entries_drop(dragged, dest, modifiers, cx);
         }
     }
 
@@ -1048,9 +1134,15 @@ impl SidebarView {
         let eject_id = vol.id.clone();
 
         let free_space = (vol.is_mounted && vol.total_bytes > 0).then(|| vol.capacity_summary());
+        let app_state_drag = self.app_state.clone();
+        let path_drag_over = path.clone();
+        let path_drop = path.clone();
+        let path_ext_over = path.clone();
+        let path_ext_drop = path.clone();
 
         div()
             .id(("drive-row", ix))
+            .debug_selector(move || format!("drive-row-{ix}"))
             .min_h(size::SIDEBAR_ROW)
             .py(space::S2)
             .px(space::S8)
@@ -1188,7 +1280,29 @@ impl SidebarView {
                 )
             })
             .when(vol.is_mounted, |s| {
-                s.on_mouse_down(
+                s.drag_over::<DragEntries>(move |style, dragged, window, cx| {
+                    let theme = Theme::get(cx);
+                    let mounts = app_state_drag.read(cx).volume_mounts.clone();
+                    style_drag_over_local_dir(
+                        style,
+                        dragged,
+                        &path_drag_over,
+                        window.modifiers(),
+                        &mounts,
+                        &theme,
+                    )
+                })
+                .on_drop(cx.listener(move |this, dragged: &DragEntries, window, cx| {
+                    this.handle_local_dir_entries_drop(dragged, &path_drop, window.modifiers(), cx);
+                }))
+                .drag_over::<ExternalPaths>(move |style, paths, _, cx| {
+                    let theme = Theme::get(cx);
+                    style_drag_over_external_local_dir(style, paths, &path_ext_over, &theme)
+                })
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                    this.handle_external_paths_drop(paths.paths(), &path_ext_drop, cx);
+                }))
+                .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
                         this.set_press(row_key, true, cx);
@@ -1247,6 +1361,9 @@ impl SidebarView {
                 let path_opt = place.path().map(Path::to_path_buf);
                 let path_for_drag_over = path_opt.clone();
                 let path_for_drop = path_opt.clone();
+                let path_for_ext_over = path_opt.clone();
+                let path_for_ext_drop = path_opt.clone();
+                let app_state_place_drag = self.app_state.clone();
                 let is_active = if is_trash {
                     trash_active
                 } else {
@@ -1339,26 +1456,45 @@ impl SidebarView {
                             let _ = this.reorder_place_in_state(dragged.index, ix, cx);
                         }
                     }))
-                    .drag_over::<DragEntries>(move |style, dragged, _, cx| {
+                    .drag_over::<DragEntries>(move |style, dragged, window, cx| {
                         let theme = Theme::get(cx);
+                        let mounts = app_state_place_drag.read(cx).volume_mounts.clone();
                         style_drag_over_place_entry(
                             style,
                             dragged,
                             is_trash,
                             is_missing,
                             path_for_drag_over.as_deref(),
+                            window.modifiers(),
+                            &mounts,
                             &theme,
                         )
                     })
-                    .on_drop(cx.listener(move |this, dragged: &DragEntries, _, cx| {
+                    .on_drop(cx.listener(move |this, dragged: &DragEntries, window, cx| {
                         this.handle_place_entries_drop(
                             dragged,
                             is_trash,
                             is_missing,
                             path_for_drop.as_deref(),
+                            window.modifiers(),
                             cx,
                         );
                     }))
+                    .when(!is_trash && !is_missing, |el| {
+                        el.drag_over::<ExternalPaths>(move |style, paths, _, cx| {
+                            if let Some(dest) = path_for_ext_over.as_deref() {
+                                let theme = Theme::get(cx);
+                                style_drag_over_external_local_dir(style, paths, dest, &theme)
+                            } else {
+                                style
+                            }
+                        })
+                        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                            if let Some(dest) = path_for_ext_drop.as_deref() {
+                                this.handle_external_paths_drop(paths.paths(), dest, cx);
+                            }
+                        }))
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -1413,6 +1549,11 @@ impl SidebarView {
                 let key = SidebarKey::Drive(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let path = vol.mount_point.clone();
+                let path_drag_over = path.clone();
+                let path_drop = path.clone();
+                let path_ext_over = path.clone();
+                let path_ext_drop = path.clone();
+                let app_state_drive_drag = self.app_state.clone();
                 let is_mounted = vol.is_mounted;
                 let is_active = !trash_active
                     && matches!(&current_loc, Location::Local(p) if p == &vol.mount_point);
@@ -1453,7 +1594,34 @@ impl SidebarView {
                         this.set_hover(key, *hovered, cx);
                     }))
                     .when(is_mounted, |s| {
-                        s.on_mouse_down(
+                        s.drag_over::<DragEntries>(move |style, dragged, window, cx| {
+                            let theme = Theme::get(cx);
+                            let mounts = app_state_drive_drag.read(cx).volume_mounts.clone();
+                            style_drag_over_local_dir(
+                                style,
+                                dragged,
+                                &path_drag_over,
+                                window.modifiers(),
+                                &mounts,
+                                &theme,
+                            )
+                        })
+                        .on_drop(cx.listener(move |this, dragged: &DragEntries, window, cx| {
+                            this.handle_local_dir_entries_drop(
+                                dragged,
+                                &path_drop,
+                                window.modifiers(),
+                                cx,
+                            );
+                        }))
+                        .drag_over::<ExternalPaths>(move |style, paths, _, cx| {
+                            let theme = Theme::get(cx);
+                            style_drag_over_external_local_dir(style, paths, &path_ext_over, &theme)
+                        })
+                        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                            this.handle_external_paths_drop(paths.paths(), &path_ext_drop, cx);
+                        }))
+                        .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
                                 this.set_press(key, true, cx);
@@ -1485,6 +1653,11 @@ impl SidebarView {
                 let key = SidebarKey::NetworkShare(ix);
                 let (hover_t, press_t) = self.step_row_factors(key, now, reduced);
                 let path = share.mount_point.clone();
+                let path_drag_over = path.clone();
+                let path_drop = path.clone();
+                let path_ext_over = path.clone();
+                let path_ext_drop = path.clone();
+                let app_state_share_drag = self.app_state.clone();
                 let is_active = !trash_active
                     && matches!(&current_loc, Location::Local(p) if p == &share.mount_point);
                 let row_bg = if is_active {
@@ -1510,6 +1683,33 @@ impl SidebarView {
                     .tooltip(Tooltip::text(share.name.clone()))
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
                         this.set_hover(key, *hovered, cx);
+                    }))
+                    .drag_over::<DragEntries>(move |style, dragged, window, cx| {
+                        let theme = Theme::get(cx);
+                        let mounts = app_state_share_drag.read(cx).volume_mounts.clone();
+                        style_drag_over_local_dir(
+                            style,
+                            dragged,
+                            &path_drag_over,
+                            window.modifiers(),
+                            &mounts,
+                            &theme,
+                        )
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DragEntries, window, cx| {
+                        this.handle_local_dir_entries_drop(
+                            dragged,
+                            &path_drop,
+                            window.modifiers(),
+                            cx,
+                        );
+                    }))
+                    .drag_over::<ExternalPaths>(move |style, paths, _, cx| {
+                        let theme = Theme::get(cx);
+                        style_drag_over_external_local_dir(style, paths, &path_ext_over, &theme)
+                    })
+                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                        this.handle_external_paths_drop(paths.paths(), &path_ext_drop, cx);
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1763,6 +1963,9 @@ impl Render for SidebarView {
                 let path_opt = place.path().map(Path::to_path_buf);
                 let path_for_drag_over = path_opt.clone();
                 let path_for_drop = path_opt.clone();
+                let path_for_ext_over = path_opt.clone();
+                let path_for_ext_drop = path_opt.clone();
+                let app_state_place_drag = self.app_state.clone();
 
                 if !is_trash && editing_place == Some(ix) {
                     return div()
@@ -1879,26 +2082,45 @@ impl Render for SidebarView {
                             let _ = this.reorder_place_in_state(dragged.index, ix, cx);
                         }
                     }))
-                    .drag_over::<DragEntries>(move |style, dragged, _, cx| {
+                    .drag_over::<DragEntries>(move |style, dragged, window, cx| {
                         let theme = Theme::get(cx);
+                        let mounts = app_state_place_drag.read(cx).volume_mounts.clone();
                         style_drag_over_place_entry(
                             style,
                             dragged,
                             is_trash,
                             is_missing,
                             path_for_drag_over.as_deref(),
+                            window.modifiers(),
+                            &mounts,
                             &theme,
                         )
                     })
-                    .on_drop(cx.listener(move |this, dragged: &DragEntries, _, cx| {
+                    .on_drop(cx.listener(move |this, dragged: &DragEntries, window, cx| {
                         this.handle_place_entries_drop(
                             dragged,
                             is_trash,
                             is_missing,
                             path_for_drop.as_deref(),
+                            window.modifiers(),
                             cx,
                         );
                     }))
+                    .when(!is_trash && !is_missing, |el| {
+                        el.drag_over::<ExternalPaths>(move |style, paths, _, cx| {
+                            if let Some(dest) = path_for_ext_over.as_deref() {
+                                let theme = Theme::get(cx);
+                                style_drag_over_external_local_dir(style, paths, dest, &theme)
+                            } else {
+                                style
+                            }
+                        })
+                        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                            if let Some(dest) = path_for_ext_drop.as_deref() {
+                                this.handle_external_paths_drop(paths.paths(), dest, cx);
+                            }
+                        }))
+                    })
                     .child(
                         div()
                             .flex()
@@ -2134,10 +2356,47 @@ impl Render for SidebarView {
                 let capacity_text = vol.capacity_summary();
                 let used_pct = vol.used_percentage();
                 let p_nav = vol.mount_point.clone();
+                let p_drag_over = p_nav.clone();
+                let p_drop = p_nav.clone();
+                let p_ext_over = p_nav.clone();
+                let p_ext_drop = p_nav.clone();
+                let app_state_card_drag = self.app_state.clone();
                 let is_active = !trash_active && current_loc.path() == vol.mount_point;
 
                 div()
+                    .id(("drive-card", ix))
                     .on_mouse_down(MouseButton::Right, cx.listener(Self::toggle_drive_details))
+                    .when(is_mounted, |card| {
+                        card.drag_over::<DragEntries>(move |style, dragged, window, cx| {
+                            let theme = Theme::get(cx);
+                            let mounts = app_state_card_drag.read(cx).volume_mounts.clone();
+                            style_drag_over_local_dir(
+                                style,
+                                dragged,
+                                &p_drag_over,
+                                window.modifiers(),
+                                &mounts,
+                                &theme,
+                            )
+                        })
+                        .on_drop(cx.listener(move |this, dragged: &DragEntries, window, cx| {
+                            this.handle_local_dir_entries_drop(
+                                dragged,
+                                &p_drop,
+                                window.modifiers(),
+                                cx,
+                            );
+                        }))
+                        .drag_over::<ExternalPaths>(move |style, paths, _, cx| {
+                            let theme = Theme::get(cx);
+                            style_drag_over_external_local_dir(style, paths, &p_ext_over, &theme)
+                        })
+                        .on_drop(cx.listener(
+                            move |this, paths: &ExternalPaths, _, cx| {
+                                this.handle_external_paths_drop(paths.paths(), &p_ext_drop, cx);
+                            },
+                        ))
+                    })
                     .p_2()
                     .rounded_md()
                     .bg(if is_active {
@@ -2287,6 +2546,11 @@ impl Render for SidebarView {
                     lerp_f32(1.0, PRESS_SCALE, press_t)
                 };
                 let path = share.mount_point.clone();
+                let path_drag_over = path.clone();
+                let path_drop = path.clone();
+                let path_ext_over = path.clone();
+                let path_ext_drop = path.clone();
+                let app_state_net_drag = self.app_state.clone();
 
                 div()
                     .id(("network-share", ix))
@@ -2305,6 +2569,33 @@ impl Render for SidebarView {
                     ))
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
                         this.set_hover(key, *hovered, cx);
+                    }))
+                    .drag_over::<DragEntries>(move |style, dragged, window, cx| {
+                        let theme = Theme::get(cx);
+                        let mounts = app_state_net_drag.read(cx).volume_mounts.clone();
+                        style_drag_over_local_dir(
+                            style,
+                            dragged,
+                            &path_drag_over,
+                            window.modifiers(),
+                            &mounts,
+                            &theme,
+                        )
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DragEntries, window, cx| {
+                        this.handle_local_dir_entries_drop(
+                            dragged,
+                            &path_drop,
+                            window.modifiers(),
+                            cx,
+                        );
+                    }))
+                    .drag_over::<ExternalPaths>(move |style, paths, _, cx| {
+                        let theme = Theme::get(cx);
+                        style_drag_over_external_local_dir(style, paths, &path_ext_over, &theme)
+                    })
+                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                        this.handle_external_paths_drop(paths.paths(), &path_ext_drop, cx);
                     }))
                     .child(resolved_icon(
                         IconName::FolderNetwork,
