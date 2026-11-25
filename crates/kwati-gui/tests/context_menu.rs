@@ -453,6 +453,20 @@ fn menu_item_bounds(cx: &mut VisualTestContext, selector: &str) -> Point<Pixels>
         .center()
 }
 
+#[cfg(windows)]
+fn mark_hidden(path: &Path) {
+    // Windows hides by file attribute, not by a leading dot.
+    let status = std::process::Command::new("attrib")
+        .arg("+h")
+        .arg(path)
+        .status()
+        .expect("attrib command failed");
+    assert!(status.success(), "attrib +h must succeed");
+}
+
+#[cfg(not(windows))]
+fn mark_hidden(_path: &Path) {}
+
 #[gpui::test]
 fn empty_space_context_menu_submenus_apply_per_folder_and_persist(cx: &mut TestAppContext) {
     let root = fixture("per_folder");
@@ -463,9 +477,13 @@ fn empty_space_context_menu_submenus_apply_per_folder_and_persist(cx: &mut TestA
     fs::create_dir_all(&dir_b).unwrap();
     fs::write(dir_a.join("small.txt"), "1").unwrap();
     fs::write(dir_a.join("large.txt"), "1234567890").unwrap();
-    fs::write(dir_a.join(".secret_a"), "hidden").unwrap();
+    let secret_a = dir_a.join(".secret_a");
+    fs::write(&secret_a, "hidden").unwrap();
+    mark_hidden(&secret_a);
     fs::write(dir_b.join("only_b.txt"), "b").unwrap();
-    fs::write(dir_b.join(".secret_b"), "hidden").unwrap();
+    let secret_b = dir_b.join(".secret_b");
+    fs::write(&secret_b, "hidden").unwrap();
+    mark_hidden(&secret_b);
     let settings_file = root.join("settings.toml");
 
     let (main, cx) = open_window(cx, &dir_a);
