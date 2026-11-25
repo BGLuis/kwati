@@ -1,5 +1,6 @@
 pub mod context_menu;
 pub mod dialogs;
+pub mod drag_drop;
 pub mod header_view;
 pub mod jobs_view;
 pub mod list_view;
@@ -15,6 +16,7 @@ pub use context_menu::{
     ContextMenuAction, ContextMenuEntry, ContextMenuEvent, ContextMenuView, FolderMenuState,
 };
 pub use dialogs::{DialogKind, DialogsView};
+pub use drag_drop::{DropOperation, DropRejection};
 pub use header_view::HeaderView;
 pub use jobs_view::JobsView;
 pub use list_view::{ListView, ListViewEvent};
@@ -177,31 +179,32 @@ impl MainView {
         })
         .detach();
 
-        cx.subscribe_in(&list, window, |this, _, event, window, cx| {
-            let ListViewEvent::OpenContextMenu { position } = *event;
-            if !this.any_blocking_modal_open(cx) {
-                this.context_menu
-                    .update(cx, |menu, cx| menu.open_at(position, window, cx));
-                cx.notify();
+        cx.subscribe_in(&list, window, |this, _, event, window, cx| match event {
+            ListViewEvent::OpenContextMenu { position } => {
+                if !this.any_blocking_modal_open(cx) {
+                    this.context_menu
+                        .update(cx, |menu, cx| menu.open_at(*position, window, cx));
+                    cx.notify();
+                }
+            }
+            ListViewEvent::DropTransfer {
+                sources,
+                dest_dir,
+                operation,
+            } => {
+                this.execute_drop_transfer(sources.clone(), dest_dir.clone(), *operation, cx);
             }
         })
         .detach();
 
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
             match event {
-                SidebarViewEvent::MoveEntries { sources, dest_dir } => {
-                    let sources = sources.clone();
-                    let dest_dir = dest_dir.clone();
-                    let in_place = sources
-                        .iter()
-                        .all(|src| src.parent().as_ref() == Some(&dest_dir));
-                    if in_place {
-                        this.set_status("The items are already in this folder", cx);
-                    } else {
-                        this.dialogs.update(cx, |dialogs, cx| {
-                            dialogs.begin_paste(sources, dest_dir, true, cx);
-                        });
-                    }
+                SidebarViewEvent::DropTransfer {
+                    sources,
+                    dest_dir,
+                    operation,
+                } => {
+                    this.execute_drop_transfer(sources.clone(), dest_dir.clone(), *operation, cx);
                 }
                 SidebarViewEvent::TrashEntries(locations) => {
                     let locations = locations.clone();
@@ -428,17 +431,35 @@ impl MainView {
             return;
         };
         let dest_dir = self.current_location(cx);
-        let in_place = clipboard
-            .sources
+        let operation = if clipboard.is_cut {
+            DropOperation::Move
+        } else {
+            DropOperation::Copy
+        };
+        self.execute_drop_transfer(clipboard.sources, dest_dir, operation, cx);
+    }
+
+    fn execute_drop_transfer(
+        &mut self,
+        sources: Vec<Location>,
+        dest_dir: Location,
+        operation: DropOperation,
+        cx: &mut Context<Self>,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        let is_cut = operation.is_move();
+        let in_place = sources
             .iter()
             .all(|src| src.parent().as_ref() == Some(&dest_dir));
-        if clipboard.is_cut && in_place {
+        if is_cut && in_place {
             self.set_status("The items are already in this folder", cx);
             return;
         }
 
         self.dialogs.update(cx, |dialogs, cx| {
-            dialogs.begin_paste(clipboard.sources, dest_dir, clipboard.is_cut, cx);
+            dialogs.begin_paste(sources, dest_dir, is_cut, cx);
         });
         cx.notify();
     }
