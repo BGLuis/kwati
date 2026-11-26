@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
 use crate::places::{default_place_entries, ensure_trash_present, Bookmark, PlaceEntry};
+use crate::thumbnail::{
+    default_thumbnail_extensions, parse_thumbnail_extensions, split_thumbnail_extensions,
+};
 use crate::{Location, SortColumn, SortDirection, SortOrder};
 
 pub const CURRENT_VERSION: u32 = 1;
@@ -28,6 +31,10 @@ pub const MAX_REMOTE_SEARCH_DEPTH: u32 = 64;
 pub const DEFAULT_REMOTE_SEARCH_PARALLEL: u32 = 2;
 pub const MIN_REMOTE_SEARCH_PARALLEL: u32 = 1;
 pub const MAX_REMOTE_SEARCH_PARALLEL: u32 = 32;
+pub const DEFAULT_THUMBNAILS_ENABLED: bool = true;
+pub const DEFAULT_THUMBNAIL_MAX_FILE_SIZE_MB: u32 = 20;
+pub const MIN_THUMBNAIL_MAX_FILE_SIZE_MB: u32 = 1;
+pub const MAX_THUMBNAIL_MAX_FILE_SIZE_MB: u32 = 1024;
 
 /// A value in the settings file that was ignored in favour of its default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +126,14 @@ pub struct Settings {
     /// Listing requests a remote search may have in flight at once; at least 1.
     pub remote_search_parallel: u32,
     pub motion_preference: MotionPreference,
+    /// Grid tiles show a picture of the file instead of its icon (see `thumbnail::wants_thumbnail`).
+    pub thumbnails_enabled: bool,
+    /// Lower-case extensions, without the dot, that get a thumbnail; each one is supported.
+    pub thumbnail_extensions: Vec<String>,
+    /// Files larger than this are never decoded or downloaded for a thumbnail.
+    pub thumbnail_max_file_size_mb: u32,
+    /// Remote files are downloaded to the preview cache to build their thumbnail.
+    pub thumbnail_remote_enabled: bool,
     pub bookmarks: Vec<Bookmark>,
     pub places: Option<Vec<PlaceEntry>>,
     /// Keys this version does not know, kept so a newer version's file survives a save.
@@ -144,6 +159,10 @@ impl Default for Settings {
             remote_search_depth: DEFAULT_REMOTE_SEARCH_DEPTH,
             remote_search_parallel: DEFAULT_REMOTE_SEARCH_PARALLEL,
             motion_preference: MotionPreference::default(),
+            thumbnails_enabled: DEFAULT_THUMBNAILS_ENABLED,
+            thumbnail_extensions: default_thumbnail_extensions(),
+            thumbnail_max_file_size_mb: DEFAULT_THUMBNAIL_MAX_FILE_SIZE_MB,
+            thumbnail_remote_enabled: false,
             bookmarks: Vec::new(),
             places: None,
             unknown: Table::new(),
@@ -228,6 +247,37 @@ fn take_bounded_u32_or_default(
     } else {
         parsed
     }
+}
+
+/// Keeps the supported extensions of a list and reports the rest, so one unknown entry does not
+/// discard the user's whole choice.
+fn take_thumbnail_extensions_or_default(
+    table: &mut Table,
+    default: Vec<String>,
+    warnings: &mut Vec<SettingsWarning>,
+) -> Vec<String> {
+    const KEY: &str = "thumbnail_extensions";
+    let Some(value) = table.remove(KEY) else {
+        return default;
+    };
+    let raw: Vec<String> = match value.try_into() {
+        Ok(raw) => raw,
+        Err(err) => {
+            warnings.push(SettingsWarning {
+                key: KEY,
+                message: err.to_string(),
+            });
+            return default;
+        }
+    };
+    let (supported, unsupported) = split_thumbnail_extensions(raw.iter().map(String::as_str));
+    if !unsupported.is_empty() {
+        warnings.push(SettingsWarning {
+            key: KEY,
+            message: format!("unsupported extensions ignored: {}", unsupported.join(", ")),
+        });
+    }
+    supported
 }
 
 fn parse_sort_column(raw: &str) -> Option<SortColumn> {
@@ -727,6 +777,23 @@ impl Settings {
         }
     }
 
+    /// Sets the largest file size, in MiB, that gets a thumbnail (`1..=1024`).
+    pub fn set_thumbnail_max_file_size_mb(&mut self, mb: u32) -> Result<(), &'static str> {
+        if !(MIN_THUMBNAIL_MAX_FILE_SIZE_MB..=MAX_THUMBNAIL_MAX_FILE_SIZE_MB).contains(&mb) {
+            Err("thumbnail size limit must be between 1 and 1024 MB")
+        } else {
+            self.thumbnail_max_file_size_mb = mb;
+            Ok(())
+        }
+    }
+
+    /// Replaces the thumbnail extensions with a comma- or space-separated list such as
+    /// `"png, .JPG pdf"`. Fails without changing anything, naming the unsupported entries.
+    pub fn set_thumbnail_extensions(&mut self, raw: &str) -> Result<(), Vec<String>> {
+        self.thumbnail_extensions = parse_thumbnail_extensions(raw)?;
+        Ok(())
+    }
+
     /// Validates all numeric bounds in `self`.
     pub fn validate(&self) -> Result<(), &'static str> {
         if !(MIN_REFRESH_INTERVAL_SECS..=MAX_REFRESH_INTERVAL_SECS)
@@ -750,6 +817,11 @@ impl Settings {
             .contains(&self.remote_search_parallel)
         {
             return Err("remote search parallel requests must be between 1 and 32");
+        }
+        if !(MIN_THUMBNAIL_MAX_FILE_SIZE_MB..=MAX_THUMBNAIL_MAX_FILE_SIZE_MB)
+            .contains(&self.thumbnail_max_file_size_mb)
+        {
+            return Err("thumbnail size limit must be between 1 and 1024 MB");
         }
         Ok(())
     }
@@ -855,6 +927,31 @@ impl Settings {
         let motion_preference = take_motion_preference_or_default(
             &mut table,
             defaults.motion_preference,
+            &mut warnings,
+        );
+        let thumbnails_enabled = take_bool_or_default(
+            &mut table,
+            "thumbnails_enabled",
+            defaults.thumbnails_enabled,
+            &mut warnings,
+        );
+        let thumbnail_extensions = take_thumbnail_extensions_or_default(
+            &mut table,
+            defaults.thumbnail_extensions.clone(),
+            &mut warnings,
+        );
+        let thumbnail_max_file_size_mb = take_bounded_u32_or_default(
+            &mut table,
+            "thumbnail_max_file_size_mb",
+            MIN_THUMBNAIL_MAX_FILE_SIZE_MB,
+            MAX_THUMBNAIL_MAX_FILE_SIZE_MB,
+            defaults.thumbnail_max_file_size_mb,
+            &mut warnings,
+        );
+        let thumbnail_remote_enabled = take_bool_or_default(
+            &mut table,
+            "thumbnail_remote_enabled",
+            defaults.thumbnail_remote_enabled,
             &mut warnings,
         );
 
@@ -983,6 +1080,10 @@ impl Settings {
             remote_search_depth,
             remote_search_parallel,
             motion_preference,
+            thumbnails_enabled,
+            thumbnail_extensions,
+            thumbnail_max_file_size_mb,
+            thumbnail_remote_enabled,
             bookmarks,
             places,
             unknown: table,
@@ -1364,6 +1465,27 @@ impl Settings {
             "motion_preference".into(),
             Value::String(motion_preference_str(self.motion_preference).into()),
         );
+        table.insert(
+            "thumbnails_enabled".into(),
+            Value::Boolean(self.thumbnails_enabled),
+        );
+        table.insert(
+            "thumbnail_extensions".into(),
+            Value::Array(
+                self.thumbnail_extensions
+                    .iter()
+                    .map(|ext| Value::String(ext.clone()))
+                    .collect(),
+            ),
+        );
+        table.insert(
+            "thumbnail_max_file_size_mb".into(),
+            Value::Integer(self.thumbnail_max_file_size_mb.into()),
+        );
+        table.insert(
+            "thumbnail_remote_enabled".into(),
+            Value::Boolean(self.thumbnail_remote_enabled),
+        );
         let bookmark_tables: Vec<Value> = self
             .bookmarks
             .iter()
@@ -1502,6 +1624,67 @@ mod tests {
             "0 would search nothing or never send a request"
         );
         assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn settings_thumbnails_round_trip_and_fallbacks() {
+        let dir = TestDir::new("settings_thumbnails");
+        let path = dir.path.join("settings.toml");
+        let defaults = Settings::default();
+        assert!(defaults.thumbnails_enabled);
+        assert!(
+            !defaults.thumbnail_remote_enabled,
+            "remote thumbnails download whole files, so they are opt-in"
+        );
+        assert!(defaults.thumbnail_extensions.iter().any(|e| e == "pdf"));
+
+        let mut settings = defaults;
+        settings.thumbnails_enabled = false;
+        settings.thumbnail_remote_enabled = true;
+        settings.set_thumbnail_extensions("PNG, .jpg png").unwrap();
+        settings.set_thumbnail_max_file_size_mb(64).unwrap();
+        settings.save_to(&path).unwrap();
+        let (saved, warnings) = Settings::load_from(&path).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(saved, settings);
+        assert_eq!(saved.thumbnail_extensions, ["png", "jpg"]);
+
+        fs::write(
+            &path,
+            "thumbnail_extensions = [\"png\", \"heic\", \"pdf\"]\nthumbnail_max_file_size_mb = 0\n",
+        )
+        .unwrap();
+        let (loaded, warnings) = Settings::load_from(&path).unwrap();
+        assert_eq!(
+            loaded.thumbnail_extensions,
+            ["png", "pdf"],
+            "an unsupported entry is dropped without discarding the rest of the list"
+        );
+        assert_eq!(
+            loaded.thumbnail_max_file_size_mb,
+            DEFAULT_THUMBNAIL_MAX_FILE_SIZE_MB
+        );
+        let keys: Vec<_> = warnings.iter().map(|w| w.key).collect();
+        assert_eq!(keys, ["thumbnail_extensions", "thumbnail_max_file_size_mb"]);
+    }
+
+    #[test]
+    fn settings_thumbnail_setters_reject_invalid_input_unchanged() {
+        let mut s = Settings::default();
+        assert_eq!(
+            s.set_thumbnail_extensions("png, heic, docx"),
+            Err(vec!["heic".to_string(), "docx".to_string()])
+        );
+        assert_eq!(
+            s.thumbnail_extensions,
+            Settings::default().thumbnail_extensions
+        );
+        assert!(s.set_thumbnail_max_file_size_mb(0).is_err());
+        assert!(s.set_thumbnail_max_file_size_mb(1025).is_err());
+        assert_eq!(
+            s.thumbnail_max_file_size_mb,
+            DEFAULT_THUMBNAIL_MAX_FILE_SIZE_MB
+        );
     }
 
     #[test]

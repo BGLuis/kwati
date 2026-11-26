@@ -20,6 +20,7 @@ mod settings;
 mod sftp;
 mod smb;
 mod stream;
+pub mod thumbnail;
 mod transfer;
 mod trash;
 pub mod undo;

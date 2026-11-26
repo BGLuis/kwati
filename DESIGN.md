@@ -90,6 +90,10 @@ everywhere; no all-caps labels.
 - Icons take the colour of their text (`text` or `text-muted`).
 - Folder icons use `accent`; this is the only coloured file-type icon.
 - File types are told apart by icon shape, not by colour.
+- In the grid, images, SVGs, and PDFs show a thumbnail of their content in the
+  icon slot, at the icon's size. The type icon stays while the thumbnail loads
+  and whenever it cannot be built. Which types, the size limit, and remote
+  files are set in the "Miniaturas" section of Settings.
 - State icons (connected, error, warning) use the matching state colour and
   always sit next to a label.
 

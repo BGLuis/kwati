@@ -4,6 +4,7 @@ pub mod icon;
 pub mod interactive;
 pub mod scrollbar;
 pub mod text_input;
+pub mod thumbnails;
 pub mod tooltip;
 
 pub use ellipsize::Ellipsize;

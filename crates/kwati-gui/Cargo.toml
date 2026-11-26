@@ -16,6 +16,7 @@ dirs = "7.0.0"
 gpui = "=0.2.2"
 futures = "0.3"
 unicode-segmentation = "1.13"
+image = "0.25.10"
 
 [dev-dependencies]
 gpui = { version = "=0.2.2", features = ["test-support"] }

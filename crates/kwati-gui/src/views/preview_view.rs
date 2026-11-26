@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -343,15 +344,9 @@ pub fn generate_remote_preview_for(
         let kind = if size > MAX_IMAGE_PREVIEW_BYTES {
             PreviewKind::Unavailable("Image too large to preview".into())
         } else {
-            let preview_path = cache.preview_path_for(location);
-            let cached_hit = fs::metadata(&preview_path).is_ok_and(|m| m.len() == size);
-            if cached_hit {
-                PreviewKind::Image(preview_path)
-            } else {
-                match download_preview_file(backend, location, &preview_path) {
-                    Ok(()) => PreviewKind::Image(preview_path),
-                    Err(_) => PreviewKind::Binary { name, size },
-                }
+            match fetch_remote_preview_copy(backend, location, cache, size) {
+                Ok(preview_path) => PreviewKind::Image(preview_path),
+                Err(_) => PreviewKind::Binary { name, size },
             }
         };
         return (
@@ -402,23 +397,46 @@ pub fn generate_remote_preview_for(
     }
 }
 
+/// The local copy of a remote file in the preview cache, downloaded unless a copy of the same
+/// size is already there. Shared by the preview pane and grid thumbnails.
+pub(crate) fn fetch_remote_preview_copy(
+    backend: &dyn Backend,
+    location: &Location,
+    cache: &RemoteFileCache,
+    size: u64,
+) -> std::io::Result<PathBuf> {
+    let preview_path = cache.preview_path_for(location);
+    if !fs::metadata(&preview_path).is_ok_and(|m| m.len() == size) {
+        download_preview_file(backend, location, &preview_path)?;
+    }
+    Ok(preview_path)
+}
+
 fn download_preview_file(
     backend: &dyn Backend,
     location: &Location,
     dest: &Path,
 ) -> std::io::Result<()> {
+    static DOWNLOAD_ID: AtomicU64 = AtomicU64::new(0);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = dest.with_extension("kwati-preview-part");
+    // The preview pane and a grid thumbnail can fetch the same file at once; separate partial
+    // files keep the two downloads from writing into each other.
+    let tmp = dest.with_extension(format!(
+        "kwati-preview-part-{}",
+        DOWNLOAD_ID.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut reader = backend
         .open_read(location)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut file = fs::File::create(&tmp)?;
-    std::io::copy(&mut reader, &mut file)?;
-    drop(file);
-    fs::rename(&tmp, dest)?;
-    Ok(())
+    let result = fs::File::create(&tmp)
+        .and_then(|mut file| std::io::copy(&mut reader, &mut file))
+        .and_then(|_| fs::rename(&tmp, dest));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub struct PreviewView {

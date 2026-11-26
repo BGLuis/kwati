@@ -105,6 +105,63 @@ fn settings_view_applies_and_persists_changes(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn settings_view_thumbnail_options_validate_and_persist(cx: &mut TestAppContext) {
+    let dir = temp_dir("settings_thumbnails");
+    let settings_file = dir.join("settings.toml");
+    let state = cx.new(|_| {
+        AppState::new(Location::Local(dir.clone())).with_settings_path(Some(settings_file.clone()))
+    });
+    let view = cx.new(|cx| SettingsView::new(state.clone(), cx));
+
+    view.update(cx, |view, cx| {
+        view.toggle_bool_setting(SettingKey::ThumbnailsEnabled, cx)
+            .unwrap();
+        view.toggle_bool_setting(SettingKey::ThumbnailRemoteEnabled, cx)
+            .unwrap();
+        view.set_text_input(SettingKey::ThumbnailExtensions, "PNG, .pdf", cx)
+            .unwrap();
+        view.set_numeric_input(SettingKey::ThumbnailMaxFileSizeMb, "64", cx)
+            .unwrap();
+
+        let err = view
+            .set_text_input(SettingKey::ThumbnailExtensions, "png, heic", cx)
+            .unwrap_err();
+        assert!(
+            err.contains("heic"),
+            "the message names what is unsupported: {err}"
+        );
+        assert!(view.field_error(SettingKey::ThumbnailExtensions).is_some());
+        assert!(view
+            .set_numeric_input(SettingKey::ThumbnailMaxFileSizeMb, "0", cx)
+            .is_err());
+    });
+
+    let (disk, warnings) = Settings::load_from(&settings_file).unwrap();
+    assert!(warnings.is_empty());
+    assert!(!disk.thumbnails_enabled);
+    assert!(disk.thumbnail_remote_enabled);
+    assert_eq!(
+        disk.thumbnail_extensions,
+        ["png", "pdf"],
+        "rejected input leaves the last valid list saved"
+    );
+    assert_eq!(disk.thumbnail_max_file_size_mb, 64);
+
+    view.update(cx, |view, cx| {
+        view.reset_to_defaults(cx).unwrap();
+        let shown = view
+            .input_entity(SettingKey::ThumbnailExtensions)
+            .unwrap()
+            .read(cx)
+            .text()
+            .to_string();
+        assert_eq!(shown, Settings::default().thumbnail_extensions.join(", "));
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui::test]
 fn settings_view_rejects_out_of_range_inline_and_preserves_saved(cx: &mut TestAppContext) {
     let dir = temp_dir("settings_reject");
     let settings_file = dir.join("settings.toml");
