@@ -1,15 +1,21 @@
 //! Context menu for entries and empty space (#55).
 
+use std::borrow::Cow;
+use std::ffi::OsString;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use gpui::{
     point, px, size, AppContext as _, Entity, Modifiers, MouseButton, Pixels, Point,
     TestAppContext, VisualTestContext,
 };
 use kwati_core::{
-    FolderSettingsScope, Location, Settings, SortColumn, SortDirection, SortOrder, ViewMode,
+    AuthMethod, Backend, BackendError, Confirmed, ConnectionProfile, Entry, EntryMeta,
+    FolderSettingsScope, Listing, Location, Protocol, ReconnectingBackend, RetryPolicy, Settings,
+    SortColumn, SortDirection, SortOrder, ViewMode,
 };
 use kwati_gui::actions::operations::{clear_clipboard, execute_rename};
 use kwati_gui::actions::register_keybindings;
@@ -94,8 +100,7 @@ fn selected_names(main: &Entity<MainView>, cx: &mut VisualTestContext) -> Vec<St
     main.read_with(cx, |main, cx| {
         let state = main.app_state.read(cx);
         state
-            .selection
-            .selected_in_order(&state.entries)
+            .selected_entries()
             .into_iter()
             .map(|entry| entry.name().to_string_lossy().into_owned())
             .collect()
@@ -116,14 +121,14 @@ fn menu_actions(main: &Entity<MainView>, cx: &mut VisualTestContext) -> Vec<Cont
     })
 }
 
-fn menu_submenu_labels(main: &Entity<MainView>, cx: &mut VisualTestContext) -> Vec<&'static str> {
+fn menu_submenu_labels(main: &Entity<MainView>, cx: &mut VisualTestContext) -> Vec<String> {
     main.read_with(cx, |main, cx| {
         main.context_menu
             .read(cx)
             .entries()
             .iter()
             .filter_map(|e| match e {
-                ContextMenuEntry::Submenu { label, .. } => Some(*label),
+                ContextMenuEntry::Submenu { label, .. } => Some(label.to_string()),
                 _ => None,
             })
             .collect()
@@ -141,7 +146,7 @@ fn submenu_entries_for(
             .entries()
             .iter()
             .find_map(|e| match e {
-                ContextMenuEntry::Submenu { label, items } if *label == submenu_label => {
+                ContextMenuEntry::Submenu { label, items } if label == submenu_label => {
                     Some(items.clone())
                 }
                 _ => None,
@@ -256,17 +261,17 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
                     label,
                     enabled,
                     ..
-                } => Some((*label, *enabled)),
+                } => Some((label.to_string(), *enabled)),
                 _ => None,
             })
     });
-    assert_eq!(undo_item, Some(("Undo", false)));
+    assert_eq!(undo_item, Some(("Undo".to_string(), false)));
     assert_eq!(menu_submenu_labels(&main, cx), ["View", "Sort by"]);
 
     let view_items = submenu_entries_for(&main, cx, "View");
     assert!(view_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::SetViewMode(ViewMode::Details),
-        label: "Details",
+        label: Cow::Borrowed("Details"),
         shortcut: Some("Ctrl+1"),
         enabled: true,
         destructive: false,
@@ -274,7 +279,7 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     }));
     assert!(view_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::SetViewMode(ViewMode::Grid),
-        label: "Grid",
+        label: Cow::Borrowed("Grid"),
         shortcut: Some("Ctrl+2"),
         enabled: true,
         destructive: false,
@@ -282,7 +287,7 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     }));
     assert!(view_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::ToggleSidebar,
-        label: "Show Sidebar",
+        label: Cow::Borrowed("Show Sidebar"),
         shortcut: Some("F9"),
         enabled: true,
         destructive: false,
@@ -290,7 +295,7 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     }));
     assert!(view_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::TogglePreview,
-        label: "Show Preview",
+        label: Cow::Borrowed("Show Preview"),
         shortcut: Some("Alt+P"),
         enabled: true,
         destructive: false,
@@ -300,7 +305,7 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     let sort_items = submenu_entries_for(&main, cx, "Sort by");
     assert!(sort_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::SetSortColumn(SortColumn::Name),
-        label: "Name",
+        label: Cow::Borrowed("Name"),
         shortcut: None,
         enabled: true,
         destructive: false,
@@ -308,7 +313,7 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     }));
     assert!(sort_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::SetSortColumn(SortColumn::Created),
-        label: "Created",
+        label: Cow::Borrowed("Created"),
         shortcut: None,
         enabled: true,
         destructive: false,
@@ -316,7 +321,7 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     }));
     assert!(sort_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::SetSortColumn(SortColumn::Accessed),
-        label: "Accessed",
+        label: Cow::Borrowed("Accessed"),
         shortcut: None,
         enabled: true,
         destructive: false,
@@ -324,7 +329,7 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     }));
     assert!(sort_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::SetSortColumn(SortColumn::Type),
-        label: "Type",
+        label: Cow::Borrowed("Type"),
         shortcut: None,
         enabled: true,
         destructive: false,
@@ -332,7 +337,7 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     }));
     assert!(sort_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::SetSortDirection(SortDirection::Ascending),
-        label: "A to Z",
+        label: Cow::Borrowed("A to Z"),
         shortcut: None,
         enabled: true,
         destructive: false,
@@ -340,7 +345,7 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     }));
     assert!(sort_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::ToggleFoldersFirst,
-        label: "Folders First",
+        label: Cow::Borrowed("Folders First"),
         shortcut: None,
         enabled: true,
         destructive: false,
@@ -348,7 +353,7 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
     }));
     assert!(sort_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::ToggleHiddenLast,
-        label: "Hidden Files Last",
+        label: Cow::Borrowed("Hidden Files Last"),
         shortcut: None,
         enabled: true,
         destructive: false,
@@ -557,7 +562,7 @@ fn empty_space_context_menu_submenus_apply_per_folder_and_persist(cx: &mut TestA
     let sort_items = submenu_entries_for(&main, cx, "Sort by");
     assert!(sort_items.contains(&ContextMenuEntry::Item {
         action: ContextMenuAction::SetSortDirection(SortDirection::Descending),
-        label: "Largest first",
+        label: Cow::Borrowed("Largest first"),
         shortcut: None,
         enabled: true,
         destructive: false,
@@ -748,11 +753,11 @@ fn empty_space_context_menu_undo_names_operation_and_restores_rename(cx: &mut Te
                     label,
                     enabled,
                     ..
-                } => Some((*label, *enabled)),
+                } => Some((label.to_string(), *enabled)),
                 _ => None,
             })
     });
-    assert_eq!(undo_item, Some(("Undo rename", true)));
+    assert_eq!(undo_item, Some(("Undo rename".to_string(), true)));
 
     // Navigate down from New Folder to Undo rename and press Enter.
     cx.simulate_keystrokes("down enter");
@@ -765,6 +770,409 @@ fn empty_space_context_menu_undo_names_operation_and_restores_rename(cx: &mut Te
         main.app_state.read(cx).status_message.clone()
     });
     assert_eq!(status.as_deref(), Some("Undid rename of 'alpha.txt'"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "linux")]
+fn xdg_env_lock() -> MutexGuard<'static, ()> {
+    static XDG_ENV_LOCK: Mutex<()> = Mutex::new(());
+    XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(target_os = "linux")]
+struct XdgEnvGuard {
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+#[cfg(target_os = "linux")]
+impl XdgEnvGuard {
+    fn isolate(data_home: &Path, config_home: &Path, sys_data: &Path, sys_config: &Path) -> Self {
+        let vars = [
+            ("XDG_DATA_HOME", data_home.as_os_str()),
+            ("XDG_CONFIG_HOME", config_home.as_os_str()),
+            ("XDG_DATA_DIRS", sys_data.as_os_str()),
+            ("XDG_CONFIG_DIRS", sys_config.as_os_str()),
+            ("XDG_CURRENT_DESKTOP", std::ffi::OsStr::new("")),
+        ];
+        let mut saved = Vec::with_capacity(vars.len());
+        for (key, val) in vars {
+            saved.push((key, std::env::var_os(key)));
+            std::env::set_var(key, val);
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for XdgEnvGuard {
+    fn drop(&mut self) {
+        for (key, prev) in self.saved.drain(..).rev() {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_executable_script(path: &Path, marker: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let script = format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", marker.display());
+    fs::write(path, script).unwrap();
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+#[derive(Clone)]
+struct StubRemoteBackend {
+    entries: Vec<Entry>,
+}
+
+impl Backend for StubRemoteBackend {
+    fn list(&self, _location: &Location) -> Result<Listing, BackendError> {
+        Ok(Listing::new(self.entries.clone()))
+    }
+
+    fn stat(&self, _location: &Location) -> Result<EntryMeta, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    fn open_read(&self, _location: &Location) -> Result<Box<dyn Read + Send>, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    fn open_write(&self, _location: &Location) -> Result<Box<dyn Write + Send>, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    fn rename(&self, _from: &Location, _to: &Location) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    fn delete_permanently(
+        &self,
+        _location: &Location,
+        _confirmed: Confirmed,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+}
+
+#[gpui::test]
+#[cfg(target_os = "linux")]
+fn single_local_file_has_open_with_submenu_while_dir_and_multi_do_not(cx: &mut TestAppContext) {
+    let _xdg_lock = xdg_env_lock();
+    let _clipboard = clipboard();
+    let root = fixture("open_with_submenu");
+    let data_home = root.join("xdg_data");
+    let config_home = root.join("xdg_config");
+    let sys_data = root.join("sys_data");
+    let sys_config = root.join("sys_config");
+    fs::create_dir_all(data_home.join("mime")).unwrap();
+    fs::create_dir_all(data_home.join("applications")).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&sys_data).unwrap();
+    fs::create_dir_all(&sys_config).unwrap();
+    let _env = XdgEnvGuard::isolate(&data_home, &config_home, &sys_data, &sys_config);
+
+    fs::write(
+        data_home.join("mime/globs2"),
+        "50:application/x-kwatictx:*.kwatictx\n",
+    )
+    .unwrap();
+    fs::write(
+        data_home.join("applications/alpha.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Alpha Editor\nExec=/bin/true %f\nMimeType=application/x-kwatictx;\n",
+    )
+    .unwrap();
+    fs::write(
+        data_home.join("applications/zulu-def.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Zulu Viewer\nExec=/bin/true %f\nNoDisplay=true\nMimeType=application/x-kwatictx;\n",
+    )
+    .unwrap();
+    fs::write(
+        data_home.join("applications/hidden-other.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Hidden Other\nExec=/bin/true %f\nNoDisplay=true\nMimeType=application/x-kwatictx;\n",
+    )
+    .unwrap();
+    fs::write(
+        config_home.join("mimeapps.list"),
+        "[Default Applications]\napplication/x-kwatictx=zulu-def.desktop;\n",
+    )
+    .unwrap();
+
+    fs::write(root.join("note.kwatictx"), "note").unwrap();
+    fs::write(root.join("plain.unknown_kwati_999"), "raw").unwrap();
+
+    let (main, cx) = open_window(cx, &root);
+
+    // 1. Single local file with registered apps: "Open With" submenu has default first, non-default,
+    // separator, and "Other application...", excluding non-default NoDisplay=true entries.
+    let note_ix = row_of(&main, cx, "note.kwatictx");
+    let note_pos = row_center(&main, cx, note_ix);
+    right_click(cx, note_pos);
+    assert_eq!(menu_submenu_labels(&main, cx), ["Open With"]);
+    assert_eq!(
+        submenu_entries_for(&main, cx, "Open With"),
+        vec![
+            ContextMenuEntry::Item {
+                action: ContextMenuAction::OpenWithApp(0),
+                label: Cow::Owned("Zulu Viewer (Default)".to_string()),
+                shortcut: None,
+                enabled: true,
+                destructive: false,
+                checked: false,
+            },
+            ContextMenuEntry::Item {
+                action: ContextMenuAction::OpenWithApp(1),
+                label: Cow::Owned("Alpha Editor".to_string()),
+                shortcut: None,
+                enabled: true,
+                destructive: false,
+                checked: false,
+            },
+            ContextMenuEntry::Separator,
+            ContextMenuEntry::Item {
+                action: ContextMenuAction::OpenWithOther,
+                label: Cow::Borrowed("Other application..."),
+                shortcut: None,
+                enabled: true,
+                destructive: false,
+                checked: false,
+            },
+        ]
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // 2. Single local file with no registered apps: only "Other application..." (no separator).
+    let unknown_ix = row_of(&main, cx, "plain.unknown_kwati_999");
+    let unknown_pos = row_center(&main, cx, unknown_ix);
+    right_click(cx, unknown_pos);
+    assert_eq!(menu_submenu_labels(&main, cx), ["Open With"]);
+    assert_eq!(
+        submenu_entries_for(&main, cx, "Open With"),
+        vec![ContextMenuEntry::Item {
+            action: ContextMenuAction::OpenWithOther,
+            label: Cow::Borrowed("Other application..."),
+            shortcut: None,
+            enabled: true,
+            destructive: false,
+            checked: false,
+        }]
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // 3. Single local directory does NOT include "Open With".
+    let sub_ix = row_of(&main, cx, "sub");
+    let sub_pos = row_center(&main, cx, sub_ix);
+    right_click(cx, sub_pos);
+    assert!(menu_submenu_labels(&main, cx).is_empty());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // 4. Multi-selection does NOT include "Open With".
+    let alpha_ix = row_of(&main, cx, "alpha.txt");
+    let bravo_ix = row_of(&main, cx, "bravo.txt");
+    let alpha_pos = row_center(&main, cx, alpha_ix);
+    let bravo_pos = row_center(&main, cx, bravo_ix);
+    left_click(cx, alpha_pos, Modifiers::none());
+    left_click(cx, bravo_pos, Modifiers::secondary_key());
+    right_click(cx, bravo_pos);
+    assert!(menu_submenu_labels(&main, cx).is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[gpui::test]
+fn remote_file_context_menu_does_not_include_open_with(cx: &mut TestAppContext) {
+    let _clipboard = clipboard();
+    cx.update(|cx| {
+        register_keybindings(cx);
+        register_text_input_keybindings(cx);
+    });
+
+    let profile_id = "nas-ctx-test";
+    let remote_dir = Location::Remote {
+        profile_id: profile_id.to_owned(),
+        path: PathBuf::from("/share"),
+    };
+    let remote_file = Entry::new(
+        "remote.txt".into(),
+        PathBuf::from("/share/remote.txt"),
+        false,
+    )
+    .with_size(12);
+    let backend = StubRemoteBackend {
+        entries: vec![remote_file],
+    };
+
+    let (main, cx) = cx.add_window_view(|window, cx| {
+        let state = cx.new(|cx| {
+            let mut st = AppState::new(remote_dir.clone());
+            st.attach(cx);
+            let profile = ConnectionProfile {
+                id: profile_id.to_owned(),
+                name: "NAS".to_owned(),
+                protocol: Protocol::Smb,
+                host: "nas.local".to_owned(),
+                port: 445,
+                user: "luis".to_owned(),
+                start_path: "/share".to_owned(),
+                auth: AuthMethod::Password,
+                private_key_path: None,
+                allow_insecure: false,
+            };
+            let _ = st.remote.save_profile(profile, None);
+            let reconnecting = ReconnectingBackend::new(
+                move || Ok(Box::new(backend.clone())),
+                RetryPolicy::new(Duration::from_millis(1), 1),
+            )
+            .unwrap();
+            st.remote.add_connection(profile_id, reconnecting);
+            st.reload_entries();
+            st
+        });
+        MainView::new(state, window, cx)
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        cx.run_until_parked();
+        let loaded = main.read_with(cx, |main, cx| !main.app_state.read(cx).entries.is_empty());
+        if loaded {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cx.simulate_resize(size(px(1024.), px(720.)));
+    cx.run_until_parked();
+
+    let row_ix = row_of(&main, cx, "remote.txt");
+    main.update(cx, |main, cx| {
+        main.app_state.update(cx, |state, cx| {
+            state.select_index(row_ix);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-f10");
+    cx.run_until_parked();
+    assert!(is_menu_open(&main, cx));
+    assert_eq!(selected_names(&main, cx), ["remote.txt"]);
+    assert_eq!(
+        menu_actions(&main, cx),
+        [
+            ContextMenuAction::Open,
+            ContextMenuAction::Rename,
+            ContextMenuAction::Copy,
+            ContextMenuAction::Cut,
+            ContextMenuAction::Paste,
+            ContextMenuAction::Remove,
+        ]
+    );
+    assert!(menu_submenu_labels(&main, cx).is_empty());
+}
+
+#[gpui::test]
+#[cfg(target_os = "linux")]
+fn open_with_submenu_launches_desktop_script_and_reports_missing_executable(
+    cx: &mut TestAppContext,
+) {
+    let _xdg_lock = xdg_env_lock();
+    let _clipboard = clipboard();
+    let root = fixture("open_with_launch");
+    let data_home = root.join("xdg_data");
+    let config_home = root.join("xdg_config");
+    let sys_data = root.join("sys_data");
+    let sys_config = root.join("sys_config");
+    fs::create_dir_all(data_home.join("mime")).unwrap();
+    fs::create_dir_all(data_home.join("applications")).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&sys_data).unwrap();
+    fs::create_dir_all(&sys_config).unwrap();
+    let _env = XdgEnvGuard::isolate(&data_home, &config_home, &sys_data, &sys_config);
+
+    let marker = root.join("launched_arg.txt");
+    let script = root.join("open_script.sh");
+    write_executable_script(&script, &marker);
+
+    fs::write(
+        data_home.join("mime/globs2"),
+        "50:application/x-kwatirun:*.kwatirun\n",
+    )
+    .unwrap();
+    fs::write(
+        data_home.join("applications/good.desktop"),
+        format!(
+            "[Desktop Entry]\nType=Application\nName=Good Runner\nExec={} %f\nMimeType=application/x-kwatirun;\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        data_home.join("applications/broken.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Broken Runner\nExec=/nonexistent/kwati/missing_exec_999 %f\nMimeType=application/x-kwatirun;\n",
+    )
+    .unwrap();
+    fs::write(
+        config_home.join("mimeapps.list"),
+        "[Default Applications]\napplication/x-kwatirun=good.desktop;\n",
+    )
+    .unwrap();
+
+    let target = root.join("sample.kwatirun");
+    fs::write(&target, "payload").unwrap();
+
+    let (main, cx) = open_window(cx, &root);
+    let ix = row_of(&main, cx, "sample.kwatirun");
+    let target_pos = row_center(&main, cx, ix);
+
+    // Launch valid .desktop script via "Open With" submenu (index 2: Open, Rename, Open With).
+    right_click(cx, target_pos);
+    let open_with_row = menu_item_bounds(cx, "context-menu-item-2");
+    cx.simulate_mouse_move(open_with_row, None, Modifiers::none());
+    cx.run_until_parked();
+    let good_subitem = menu_item_bounds(cx, "context-menu-subitem-0");
+    left_click(cx, good_subitem, Modifiers::none());
+
+    // Wait briefly for the spawned script to write the marker file.
+    let mut recorded = String::new();
+    for _ in 0..100 {
+        if let Ok(content) = fs::read_to_string(&marker) {
+            if !content.is_empty() {
+                recorded = content;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(recorded, target.display().to_string());
+
+    // Launch broken .desktop entry and verify error surfaces in state.status_message.
+    right_click(cx, target_pos);
+    let open_with_row = menu_item_bounds(cx, "context-menu-item-2");
+    cx.simulate_mouse_move(open_with_row, None, Modifiers::none());
+    cx.run_until_parked();
+    let broken_subitem = menu_item_bounds(cx, "context-menu-subitem-1");
+    left_click(cx, broken_subitem, Modifiers::none());
+    cx.run_until_parked();
+
+    let status = main.read_with(cx, |main, cx| {
+        main.app_state.read(cx).status_message.clone()
+    });
+    let status = status.expect("expected error in status_message");
+    assert!(
+        status.contains("Broken Runner") && status.contains("not found"),
+        "unexpected status message: {status}"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

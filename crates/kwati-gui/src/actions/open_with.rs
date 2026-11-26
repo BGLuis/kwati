@@ -13,19 +13,25 @@ actions!(open_with, [OpenWithDefault, OpenWithPicker]);
 /// Metadata for an application that can open a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppInfo {
+    pub id: String,
     pub name: String,
     pub executable: String,
     pub is_default: bool,
     pub icon_name: Option<String>,
+    pub no_display: bool,
+    pub terminal: bool,
 }
 
 impl AppInfo {
     pub fn new(name: impl Into<String>, executable: impl Into<String>, is_default: bool) -> Self {
         Self {
+            id: String::new(),
             name: name.into(),
             executable: executable.into(),
             is_default,
             icon_name: None,
+            no_display: false,
+            terminal: false,
         }
     }
 
@@ -33,9 +39,36 @@ impl AppInfo {
         self.icon_name = Some(icon.into());
         self
     }
+
+    fn to_core(&self) -> kwati_core::AppInfo {
+        kwati_core::AppInfo {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            executable: self.executable.clone(),
+            icon: self.icon_name.clone(),
+            is_default: self.is_default,
+            no_display: self.no_display,
+            terminal: self.terminal,
+        }
+    }
+}
+
+impl From<kwati_core::AppInfo> for AppInfo {
+    fn from(app: kwati_core::AppInfo) -> Self {
+        Self {
+            id: app.id,
+            name: app.name,
+            executable: app.executable,
+            is_default: app.is_default,
+            icon_name: app.icon,
+            no_display: app.no_display,
+            terminal: app.terminal,
+        }
+    }
 }
 
 /// Scans standard XDG application directories.
+#[cfg(target_os = "linux")]
 fn xdg_application_dirs() -> Vec<PathBuf> {
     let mut search_dirs = Vec::new();
 
@@ -57,39 +90,11 @@ fn xdg_application_dirs() -> Vec<PathBuf> {
     search_dirs
 }
 
-/// Scans standard XDG application directories and parsed `.desktop` files.
-fn scan_desktop_applications(ext: &str) -> Vec<AppInfo> {
-    let mut found_apps = Vec::new();
-
-    for dir in xdg_application_dirs() {
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("desktop") {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Some(app) = parse_desktop_file(&content, ext) {
-                        if !found_apps.iter().any(|a: &AppInfo| a.name == app.name) {
-                            found_apps.push(app);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    found_apps
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedDesktopEntry {
     name: String,
     exec: String,
     icon: Option<String>,
-    mimes: Vec<String>,
 }
 
 fn read_desktop_entry(content: &str) -> Option<ParsedDesktopEntry> {
@@ -97,7 +102,6 @@ fn read_desktop_entry(content: &str) -> Option<ParsedDesktopEntry> {
     let mut name = None;
     let mut exec = None;
     let mut icon = None;
-    let mut mimes = Vec::new();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -115,14 +119,6 @@ fn read_desktop_entry(content: &str) -> Option<ParsedDesktopEntry> {
                 "Name" if name.is_none() => name = Some(val.trim().to_string()),
                 "Exec" if exec.is_none() => exec = Some(val.trim().to_string()),
                 "Icon" if icon.is_none() => icon = Some(val.trim().to_string()),
-                "MimeType" => {
-                    for m in val.split(';') {
-                        let m_trim = m.trim();
-                        if !m_trim.is_empty() {
-                            mimes.push(m_trim.to_string());
-                        }
-                    }
-                }
                 "NoDisplay" if val.trim().eq_ignore_ascii_case("true") => return None,
                 "Hidden" if val.trim().eq_ignore_ascii_case("true") => return None,
                 _ => {}
@@ -134,46 +130,7 @@ fn read_desktop_entry(content: &str) -> Option<ParsedDesktopEntry> {
         name: name?,
         exec: exec?,
         icon,
-        mimes,
     })
-}
-
-/// Parses a `.desktop` file to determine if it handles the given file extension.
-fn parse_desktop_file(content: &str, target_ext: &str) -> Option<AppInfo> {
-    let entry = read_desktop_entry(content)?;
-
-    // Check MIME association or extension relevance
-    let is_match = match target_ext {
-        "png" => entry
-            .mimes
-            .iter()
-            .any(|m| m.contains("png") || m == "image/*"),
-        "jpg" | "jpeg" => entry
-            .mimes
-            .iter()
-            .any(|m| m.contains("jpeg") || m == "image/*"),
-        "svg" => entry
-            .mimes
-            .iter()
-            .any(|m| m.contains("svg") || m == "image/*"),
-        "txt" => entry
-            .mimes
-            .iter()
-            .any(|m| m.contains("plain") || m == "text/*"),
-        "pdf" => entry.mimes.iter().any(|m| m.contains("pdf")),
-        _ => false,
-    };
-
-    if is_match {
-        Some(AppInfo {
-            name: entry.name,
-            executable: entry.exec,
-            is_default: false,
-            icon_name: entry.icon,
-        })
-    } else {
-        None
-    }
 }
 
 /// Finds the default application capable of opening an HTTP stream URL directly for `path`,
@@ -233,10 +190,13 @@ pub fn stream_launcher_from_desktop_id(
         return None;
     }
     Some(AppInfo {
+        id: desktop_id.to_string(),
         name: entry.name,
         executable: entry.exec,
         is_default: true,
         icon_name: entry.icon,
+        no_display: false,
+        terminal: false,
     })
 }
 
@@ -289,102 +249,54 @@ fn split_exec_tokens(exec: &str) -> Vec<String> {
 
 /// Lists all applications capable of opening the given file, ordered with the default application first.
 pub fn applications_for(path: &Path) -> Vec<AppInfo> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
+    kwati_core::applications_for(path)
+        .into_iter()
+        .map(AppInfo::from)
+        .collect()
+}
 
-    let mut apps = scan_desktop_applications(&ext);
-
-    // Fallbacks based on file extension
-    match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" => {
-            if !apps.iter().any(|a| a.name.contains("Image Viewer")) {
-                apps.push(AppInfo::new("Image Viewer", "eog", true).with_icon("image-viewer"));
-            }
-            if !apps.iter().any(|a| a.name.contains("GIMP")) {
-                apps.push(
-                    AppInfo::new("GNU Image Manipulation Program", "gimp", false).with_icon("gimp"),
-                );
-            }
-            if !apps.iter().any(|a| a.name.contains("Firefox")) {
-                apps.push(
-                    AppInfo::new("Firefox Web Browser", "firefox", false).with_icon("firefox"),
-                );
-            }
-            if !apps.iter().any(|a| a.name.contains("Feh")) {
-                apps.push(AppInfo::new("Feh Image Viewer", "feh", false).with_icon("feh"));
-            }
-        }
-        "txt" | "rs" | "md" | "toml" | "json" | "js" | "py" | "c" | "cpp" | "sh" => {
-            if !apps.iter().any(|a| a.name.contains("Text Editor")) {
-                apps.push(AppInfo::new("Text Editor", "gedit", true).with_icon("text-editor"));
-            }
-            if !apps.iter().any(|a| a.name.contains("Visual Studio Code")) {
-                apps.push(AppInfo::new("Visual Studio Code", "code", false).with_icon("vscode"));
-            }
-            if !apps.iter().any(|a| a.name.contains("Nano")) {
-                apps.push(AppInfo::new("GNU Nano", "nano", false).with_icon("terminal"));
-            }
-        }
-        "pdf" => {
-            if !apps.iter().any(|a| a.name.contains("Document Viewer")) {
-                apps.push(
-                    AppInfo::new("Document Viewer", "evince", true).with_icon("document-viewer"),
-                );
-            }
-            if !apps.iter().any(|a| a.name.contains("Firefox")) {
-                apps.push(
-                    AppInfo::new("Firefox Web Browser", "firefox", false).with_icon("firefox"),
-                );
-            }
-        }
-        _ => {
-            if apps.is_empty() {
-                apps.push(AppInfo::new("Default Application", "xdg-open", true));
-            }
+/// Filters discovered applications for UI menus, keeping hidden (`NoDisplay=true`) entries
+/// only when they are the configured default, and ensuring the default application comes first.
+pub fn filter_menu_applications(apps: impl IntoIterator<Item = AppInfo>) -> Vec<AppInfo> {
+    let mut filtered: Vec<AppInfo> = apps
+        .into_iter()
+        .filter(|app| app.is_default || !app.no_display)
+        .collect();
+    if let Some(default_ix) = filtered.iter().position(|app| app.is_default) {
+        if default_ix != 0 {
+            let default_app = filtered.remove(default_ix);
+            filtered.insert(0, default_app);
         }
     }
+    filtered
+}
 
-    // Ensure default application is first in the list
-    if let Some(default_idx) = apps.iter().position(|a| a.is_default) {
-        if default_idx != 0 {
-            let default_app = apps.remove(default_idx);
-            apps.insert(0, default_app);
-        }
-    } else if let Some(first) = apps.first_mut() {
-        first.is_default = true;
-    }
-
-    apps
+/// Lists applications suitable for display in UI "Open With" menus and dialogs for `path`.
+pub fn menu_applications_for(path: &Path) -> Vec<AppInfo> {
+    filter_menu_applications(applications_for(path))
 }
 
 /// Checks if an executable exists either as a path or in PATH.
 pub fn which_in_path(bin: &str) -> bool {
-    let path = Path::new(bin);
-    if path.is_file() {
-        return true;
-    }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(bin);
-            if candidate.is_file() {
-                return true;
-            }
-            #[cfg(windows)]
-            if candidate.with_extension("exe").is_file() {
-                return true;
-            }
-        }
-    }
-    false
+    kwati_core::which_in_path(bin)
 }
 
-/// Launches a file with the selected application.
+/// Launches a file or HTTP stream URL with the selected application.
 ///
 /// Returns an error if the executable does not exist or fails to spawn.
 pub fn launch_application(app: &AppInfo, path: &Path) -> std::io::Result<()> {
+    // kwati_core::open_with expands %u/%U to file:// URIs for local paths, so HTTP stream URLs
+    // must pass through without file:// rewriting.
+    if path
+        .to_str()
+        .is_some_and(|s| s.starts_with("http://") || s.starts_with("https://"))
+    {
+        return launch_stream_url(app, path);
+    }
+    kwati_core::open_with(&app.to_core(), &[path])
+}
+
+fn launch_stream_url(app: &AppInfo, url: &Path) -> std::io::Result<()> {
     let exec = app.executable.trim();
     if exec.is_empty() {
         return Err(std::io::Error::new(
@@ -403,22 +315,22 @@ pub fn launch_application(app: &AppInfo, path: &Path) -> std::io::Result<()> {
     if !which_in_path(bin_name) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Application executable '{}' not found", bin_name),
+            format!("Application executable '{bin_name}' not found"),
         ));
     }
 
     let mut cmd = std::process::Command::new(bin_name);
-    let mut path_added = false;
+    let mut url_added = false;
     for arg in parts.iter().skip(1) {
         if arg == "%f" || arg == "%F" || arg == "%u" || arg == "%U" {
-            cmd.arg(path);
-            path_added = true;
+            cmd.arg(url);
+            url_added = true;
         } else if !arg.starts_with('%') {
             cmd.arg(arg);
         }
     }
-    if !path_added {
-        cmd.arg(path);
+    if !url_added {
+        cmd.arg(url);
     }
 
     crate::actions::spawn_detached(&mut cmd)
@@ -426,36 +338,5 @@ pub fn launch_application(app: &AppInfo, path: &Path) -> std::io::Result<()> {
 
 /// Launches a file with a custom command line or executable path.
 pub fn launch_custom_command(command_line: &str, path: &Path) -> std::io::Result<()> {
-    let trimmed = command_line.trim();
-    if trimmed.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "custom command cannot be empty",
-        ));
-    }
-
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    let bin = parts[0];
-    if !which_in_path(bin) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Executable '{}' not found", bin),
-        ));
-    }
-
-    let mut cmd = std::process::Command::new(bin);
-    let mut path_added = false;
-    for &part in &parts[1..] {
-        if part == "%f" || part == "%F" || part == "%u" || part == "%U" {
-            cmd.arg(path);
-            path_added = true;
-        } else if !part.starts_with('%') {
-            cmd.arg(part);
-        }
-    }
-    if !path_added {
-        cmd.arg(path);
-    }
-
-    crate::actions::spawn_detached(&mut cmd)
+    kwati_core::open_with_executable(command_line, &[path])
 }

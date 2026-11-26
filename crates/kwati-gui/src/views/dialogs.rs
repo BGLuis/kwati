@@ -16,7 +16,7 @@ use kwati_core::{
 };
 
 use crate::actions::open_with::{
-    applications_for, launch_application, launch_custom_command, AppInfo,
+    launch_application, launch_custom_command, menu_applications_for, AppInfo,
 };
 use crate::actions::operations::{
     apply_create_folder_result, apply_delete_report, apply_empty_trash_result, apply_rename_result,
@@ -391,7 +391,8 @@ impl DialogsView {
 
     /// Opens the "Open With..." application picker dialog.
     pub fn open_open_with(&mut self, target: PathBuf, cx: &mut Context<Self>) {
-        let apps = applications_for(&target);
+        let apps = menu_applications_for(&target);
+        let selected_index = (!apps.is_empty()).then_some(0);
         self.input.update(cx, |input, cx| {
             input.set_text("", cx);
         });
@@ -399,7 +400,7 @@ impl DialogsView {
             DialogKind::OpenWith {
                 target_path: target,
                 available_apps: apps,
-                selected_index: Some(0),
+                selected_index,
                 error: None,
             },
             cx,

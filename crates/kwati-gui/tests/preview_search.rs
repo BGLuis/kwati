@@ -1,6 +1,8 @@
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use gpui::{AppContext as _, TestAppContext};
@@ -351,9 +353,45 @@ fn search_cancellation_on_directory_change() {
 }
 
 use kwati_gui::actions::open_with::{
-    applications_for, launch_application, launch_custom_command, which_in_path, AppInfo,
+    applications_for, launch_application, launch_custom_command, menu_applications_for,
+    which_in_path, AppInfo,
 };
 use kwati_gui::views::dialogs::DialogKind;
+
+static XDG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct XdgEnvGuard {
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl XdgEnvGuard {
+    fn isolate(data_home: &Path, config_home: &Path, sys_data: &Path, sys_config: &Path) -> Self {
+        let vars = [
+            ("XDG_DATA_HOME", data_home.as_os_str()),
+            ("XDG_CONFIG_HOME", config_home.as_os_str()),
+            ("XDG_DATA_DIRS", sys_data.as_os_str()),
+            ("XDG_CONFIG_DIRS", sys_config.as_os_str()),
+            ("XDG_CURRENT_DESKTOP", std::ffi::OsStr::new("")),
+        ];
+        let mut saved = Vec::with_capacity(vars.len());
+        for (key, val) in vars {
+            saved.push((key, std::env::var_os(key)));
+            std::env::set_var(key, val);
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for XdgEnvGuard {
+    fn drop(&mut self) {
+        for (key, prev) in self.saved.drain(..).rev() {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
 
 #[test]
 fn open_with_dialog_kind_state() {
@@ -383,22 +421,56 @@ fn open_with_dialog_kind_state() {
 }
 
 #[test]
-fn open_with_png_lists_image_applications_default_first() {
+#[cfg(target_os = "linux")]
+fn open_with_png_lists_image_applications_default_first_and_filters_nodisplay() {
+    let _lock = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp_dir = std::env::temp_dir().join(format!("kwati_png_apps_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let data_home = temp_dir.join("data");
+    let config_home = temp_dir.join("config");
+    let sys_data = temp_dir.join("sys_data");
+    let sys_config = temp_dir.join("sys_config");
+    fs::create_dir_all(data_home.join("applications")).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&sys_data).unwrap();
+    fs::create_dir_all(&sys_config).unwrap();
+    let _env = XdgEnvGuard::isolate(&data_home, &config_home, &sys_data, &sys_config);
+
+    // User-set default with NoDisplay=true must still be kept first in menu_applications_for.
+    fs::write(
+        data_home.join("applications/zulu-viewer.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Zulu Image Viewer\nExec=/bin/true %f\nNoDisplay=true\nMimeType=image/png;\n",
+    )
+    .unwrap();
+    fs::write(
+        data_home.join("applications/alpha-editor.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Alpha Image Editor\nExec=/bin/true %f\nMimeType=image/png;\n",
+    )
+    .unwrap();
+    fs::write(
+        data_home.join("applications/hidden-helper.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Hidden Helper\nExec=/bin/true %f\nNoDisplay=true\nMimeType=image/png;\n",
+    )
+    .unwrap();
+    fs::write(
+        config_home.join("mimeapps.list"),
+        "[Default Applications]\nimage/png=zulu-viewer.desktop;\n",
+    )
+    .unwrap();
+
     let png_path = PathBuf::from("picture.png");
-    let apps = applications_for(&png_path);
+    let all_apps = applications_for(&png_path);
+    assert_eq!(all_apps.len(), 3);
 
-    assert!(!apps.is_empty());
-    // Default application must be first
+    let apps = menu_applications_for(&png_path);
+    assert_eq!(apps.len(), 2);
+    assert_eq!(apps[0].name, "Zulu Image Viewer");
     assert!(apps[0].is_default);
-    // Should include image-specific application
-    let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
-    assert!(names
-        .iter()
-        .any(|n| n.contains("Image") || n.contains("Viewer")));
+    assert_eq!(apps[1].name, "Alpha Image Editor");
+    assert!(!apps[1].is_default);
+    assert!(!apps.iter().any(|a| a.name == "Hidden Helper"));
 
-    // At least one non-default application is present
-    let non_default = apps.iter().find(|a| !a.is_default);
-    assert!(non_default.is_some());
+    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
@@ -452,29 +524,28 @@ fn which_in_path_finds_standard_utilities() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn open_with_desktop_file_discovery_in_xdg_data_home() {
-    let temp_dir = std::env::temp_dir().join("kwati_xdg_test");
+    let _lock = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp_dir = std::env::temp_dir().join(format!("kwati_xdg_test_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     let apps_dir = temp_dir.join("applications");
+    let config_home = temp_dir.join("config");
+    let sys_data = temp_dir.join("sys_data");
+    let sys_config = temp_dir.join("sys_config");
     fs::create_dir_all(&apps_dir).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&sys_data).unwrap();
+    fs::create_dir_all(&sys_config).unwrap();
 
     let desktop_content = "[Desktop Entry]\nType=Application\nName=CustomPhotoEditor\nExec=custom-editor %f\nMimeType=image/png;\n";
     let desktop_path = apps_dir.join("custom-photo.desktop");
     fs::write(&desktop_path, desktop_content).unwrap();
 
-    // Temporarily point XDG_DATA_HOME to temp_dir
-    let old_xdg = std::env::var_os("XDG_DATA_HOME");
-    std::env::set_var("XDG_DATA_HOME", &temp_dir);
+    let _env = XdgEnvGuard::isolate(&temp_dir, &config_home, &sys_data, &sys_config);
 
     let apps = applications_for(&PathBuf::from("sample.png"));
     let found = apps.iter().any(|a| a.name == "CustomPhotoEditor");
-
-    // Restore env var
-    if let Some(old) = old_xdg {
-        std::env::set_var("XDG_DATA_HOME", old);
-    } else {
-        std::env::remove_var("XDG_DATA_HOME");
-    }
 
     assert!(
         found,
