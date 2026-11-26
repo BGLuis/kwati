@@ -11,14 +11,16 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use gpui::{
-    div, font, point, prelude::*, px, transparent_black, uniform_list, ClickEvent, Context,
+    div, font, img, point, prelude::*, px, transparent_black, uniform_list, ClickEvent, Context,
     CursorStyle, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, Font, Hsla,
-    KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, ScrollStrategy, SharedString, Stateful, TextRun, UniformListScrollHandle, Window,
+    KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    Pixels, Point, RenderImage, ScrollStrategy, SharedString, Stateful, TextRun,
+    UniformListScrollHandle, Window,
 };
+use kwati_core::thumbnail::{generate_thumbnail, wants_thumbnail};
 use kwati_core::{
-    Entry, IconPreferences, IconResolver, Location, ResolvedIcon, SortColumn, SortDirection,
-    ViewMode,
+    Backend, Entry, IconPreferences, IconResolver, Location, RemoteFileCache, ResolvedIcon,
+    SortColumn, SortDirection, ViewMode,
 };
 
 use crate::actions::navigation::{
@@ -27,6 +29,9 @@ use crate::actions::navigation::{
 };
 use crate::actions::operations::cut_location_set;
 use crate::components::interactive::focus_ring_color;
+use crate::components::thumbnails::{
+    render_image_from_rgba, ThumbnailCache, ThumbnailJob, ThumbnailKey,
+};
 use crate::components::{
     fast_icon_for_entry, icon_for_entry, probe_entry_icon, render_resolved_icon,
     resolve_icon_color, uniform_list_scroll_metrics, uniform_list_scrollbar, Ellipsize, IconMotion,
@@ -45,6 +50,7 @@ use crate::views::drag_drop::{
     validate_external_drop, validate_external_drop_fast, validate_internal_drop,
     validate_internal_drop_fast, DropOperation, DropRejection,
 };
+use crate::views::preview_view::fetch_remote_preview_copy;
 
 /// Formats a file size in human-readable units (B, KB, MB, GB, TB).
 pub fn format_size(bytes: Option<u64>, is_dir: bool) -> String {
@@ -209,6 +215,7 @@ pub struct ListView {
     resolved_icon_cache: HashMap<(IconName, u16), ResolvedIcon>,
     base_icon_color_cache: HashMap<IconName, Hsla>,
     cached_icon_prefs: IconPreferences,
+    thumbnails: ThumbnailCache,
     cached_theme: Option<Theme>,
     cached_grid_font: Option<SharedString>,
     requested_frame_in_render: bool,
@@ -277,6 +284,7 @@ impl ListView {
             resolved_icon_cache: HashMap::new(),
             base_icon_color_cache: HashMap::new(),
             cached_icon_prefs: initial_icon_prefs,
+            thumbnails: ThumbnailCache::default(),
             cached_theme: None,
             cached_grid_font: None,
             requested_frame_in_render: false,
@@ -288,6 +296,11 @@ impl ListView {
     /// Active column count when rendering in [`ViewMode::Grid`].
     pub fn grid_columns(&self) -> usize {
         self.grid_columns
+    }
+
+    /// Grid thumbnails decoded and held in memory.
+    pub fn ready_thumbnail_count(&self) -> usize {
+        self.thumbnails.ready_count()
     }
 
     pub fn animation_frame_requests(&self) -> usize {
@@ -1131,6 +1144,23 @@ pub fn grid_columns_for_width(width: Pixels) -> usize {
     (((usable + GRID_GAP) / (GRID_TILE_WIDTH + GRID_GAP)).floor() as usize).max(1)
 }
 
+/// Reads the file (downloading a remote one to the preview cache first) and renders its picture.
+fn build_thumbnail(
+    job: &ThumbnailJob,
+    remote: Option<(Arc<dyn Backend>, Arc<RemoteFileCache>)>,
+    max_px: u32,
+) -> std::io::Result<image::RgbaImage> {
+    let location = &job.key.location;
+    let local_path = match remote {
+        Some((backend, cache)) => {
+            let size = job.key.size.unwrap_or_default();
+            fetch_remote_preview_copy(&*backend, location, &cache, size)?
+        }
+        None => location.path().to_path_buf(),
+    };
+    generate_thumbnail(&local_path, max_px)
+}
+
 fn base_row_height(mode: ViewMode) -> Pixels {
     match mode {
         ViewMode::Details => size::ROW,
@@ -1434,6 +1464,64 @@ impl ListView {
             });
         })
         .detach();
+    }
+
+    /// The grid picture for `entry` when it is ready; queues it the first time it is shown.
+    fn grid_thumbnail(
+        &mut self,
+        entry: &Entry,
+        loc: &Location,
+        is_remote: bool,
+        cx: &gpui::App,
+    ) -> Option<Arc<RenderImage>> {
+        let settings = &self.app_state.read(cx).settings;
+        if entry.is_dir() || !wants_thumbnail(settings, &entry.path, entry.size, is_remote) {
+            return None;
+        }
+        self.thumbnails
+            .get_or_request(&ThumbnailKey::for_entry(loc.clone(), entry))
+    }
+
+    fn flush_thumbnails(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for image in self.thumbnails.take_evicted() {
+            let _ = window.drop_image(image);
+        }
+        let jobs = self.thumbnails.start_jobs();
+        if jobs.is_empty() {
+            return;
+        }
+        let max_px = self.thumbnails.max_px();
+        for job in jobs {
+            let remote = match &job.key.location {
+                Location::Local(_) => None,
+                Location::Remote { .. } => {
+                    let state = self.app_state.read(cx);
+                    match state.backend_for(&job.key.location) {
+                        Some(backend) => Some((backend, state.remote_cache.clone())),
+                        None => {
+                            self.thumbnails.finish(&job, None);
+                            continue;
+                        }
+                    }
+                }
+            };
+            cx.spawn(async move |this, cx| {
+                let work = job.clone();
+                let image = cx
+                    .background_executor()
+                    .spawn(async move {
+                        build_thumbnail(&work, remote, max_px)
+                            .ok()
+                            .map(render_image_from_rgba)
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.thumbnails.finish(&job, image);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     fn cached_row_text(
@@ -2090,6 +2178,7 @@ impl ListView {
         loc: Location,
         drag_entries: Option<DragEntries>,
         vis: ItemVisuals,
+        thumbnail: Option<Arc<RenderImage>>,
         fonts: &Fonts,
         window: &Window,
         cx: &mut Context<Self>,
@@ -2128,13 +2217,19 @@ impl ListView {
                     .items_center()
                     .justify_center()
                     .flex_none()
-                    .child(render_resolved_icon(
-                        &vis.resolved_icon,
-                        vis.glyph,
-                        vis.icon_motion,
-                        GRID_ICON_SIZE * vis.icon_scale,
-                        vis.glyph_col,
-                    )),
+                    .child(match thumbnail {
+                        Some(image) => img(image)
+                            .size(GRID_ICON_SIZE * vis.icon_scale)
+                            .object_fit(ObjectFit::Contain)
+                            .into_any_element(),
+                        None => render_resolved_icon(
+                            &vis.resolved_icon,
+                            vis.glyph,
+                            vis.icon_motion,
+                            GRID_ICON_SIZE * vis.icon_scale,
+                            vis.glyph_col,
+                        ),
+                    }),
             )
             .child(
                 div()
@@ -2425,6 +2520,8 @@ impl Render for ListView {
                 self.resolved_icon_cache.clear();
                 self.base_icon_color_cache.clear();
             }
+            let thumbnail_px = (GRID_ICON_SIZE / px(1.) * window.scale_factor()).round() as u32;
+            self.thumbnails.sync_settings(&state.settings, thumbnail_px);
             (
                 state.entries.clone(),
                 state.current_location.clone(),
@@ -3169,6 +3266,11 @@ impl Render for ListView {
                                                                                 ),
                                                                             )
                                                                         };
+                                                                    let thumbnail = this
+                                                                        .grid_thumbnail(
+                                                                            entry, &loc, is_remote,
+                                                                            cx,
+                                                                        );
                                                                     row_tiles.push(
                                                                         this.render_grid_tile(
                                                                             ix,
@@ -3176,6 +3278,7 @@ impl Render for ListView {
                                                                             loc,
                                                                             drag_entries,
                                                                             vis,
+                                                                            thumbnail,
                                                                             &row_fonts,
                                                                             window,
                                                                             cx,
@@ -3201,6 +3304,7 @@ impl Render for ListView {
                                                 }
                                             }
                                             this.flush_icon_probes(cx);
+                                            this.flush_thumbnails(window, cx);
                                             if !this.requested_frame_in_render
                                                 && request_frame_if_active(
                                                     this.motion.has_active(now, reduced),

@@ -8,6 +8,7 @@ use gpui::{
     div, prelude::*, px, AnyElement, Context, Entity, FocusHandle, KeyDownEvent, MouseButton,
     PathPromptOptions, Subscription, Task, Window,
 };
+use kwati_core::thumbnail::SUPPORTED_THUMBNAIL_EXTENSIONS;
 use kwati_core::{
     list_installed_themes, FolderSettingsScope, IconGroup, IconSource, MotionPreference, Settings,
     SortColumn, SortDirection, ViewMode, ICON_TYPE_SPECS,
@@ -30,6 +31,7 @@ use crate::tokens::{radius, size, space, Fonts, TextRole};
 pub enum SettingsSectionId {
     General,
     Icons,
+    Thumbnails,
     NetworkMounts,
     Remote,
 }
@@ -52,6 +54,10 @@ pub enum SettingKey {
     RemotePollIntervalSecs,
     RemoteSearchDepth,
     RemoteSearchParallel,
+    ThumbnailsEnabled,
+    ThumbnailExtensions,
+    ThumbnailMaxFileSizeMb,
+    ThumbnailRemoteEnabled,
 }
 
 /// Control variant rendered for a [`SettingRowSpec`].
@@ -68,6 +74,7 @@ pub enum SettingControlKind {
         max: u32,
         unit: &'static str,
     },
+    Text,
 }
 
 /// Declarative definition of a settings row.
@@ -83,6 +90,7 @@ pub struct SettingRowSpec {
 pub const SETTINGS_SECTIONS: &[(SettingsSectionId, &str)] = &[
     (SettingsSectionId::General, "Geral"),
     (SettingsSectionId::Icons, "Ícones"),
+    (SettingsSectionId::Thumbnails, "Miniaturas"),
     (SettingsSectionId::NetworkMounts, "Montagens de rede"),
     (SettingsSectionId::Remote, "Remoto"),
 ];
@@ -150,6 +158,38 @@ pub const SETTINGS_ROWS: &[SettingRowSpec] = &[
         label: "Animações e movimento",
         description: "Controla movimento e escalas; o modo reduzido mantém apenas cor e opacidade.",
         kind: SettingControlKind::MotionPreference,
+    },
+    SettingRowSpec {
+        key: SettingKey::ThumbnailsEnabled,
+        section: SettingsSectionId::Thumbnails,
+        label: "Mostrar miniaturas na grade",
+        description: "Troca o ícone de imagens e PDFs por uma prévia do conteúdo no modo grade.",
+        kind: SettingControlKind::Toggle,
+    },
+    SettingRowSpec {
+        key: SettingKey::ThumbnailExtensions,
+        section: SettingsSectionId::Thumbnails,
+        label: "Tipos com miniatura",
+        description: "Extensões separadas por vírgula (ex.: png, jpg, svg, pdf).",
+        kind: SettingControlKind::Text,
+    },
+    SettingRowSpec {
+        key: SettingKey::ThumbnailMaxFileSizeMb,
+        section: SettingsSectionId::Thumbnails,
+        label: "Tamanho máximo do arquivo",
+        description: "Arquivos maiores mantêm o ícone (1–1024).",
+        kind: SettingControlKind::Number {
+            min: 1,
+            max: 1024,
+            unit: "MB",
+        },
+    },
+    SettingRowSpec {
+        key: SettingKey::ThumbnailRemoteEnabled,
+        section: SettingsSectionId::Thumbnails,
+        label: "Miniaturas em locais remotos",
+        description: "Baixa os arquivos remotos até o tamanho máximo para gerar a miniatura.",
+        kind: SettingControlKind::Toggle,
     },
     SettingRowSpec {
         key: SettingKey::ListTimeoutSecs,
@@ -221,7 +261,10 @@ const NUMERIC_KEYS: &[SettingKey] = &[
     SettingKey::RemotePollIntervalSecs,
     SettingKey::RemoteSearchDepth,
     SettingKey::RemoteSearchParallel,
+    SettingKey::ThumbnailMaxFileSizeMb,
 ];
+
+const TEXT_KEYS: &[SettingKey] = &[SettingKey::ThumbnailExtensions];
 
 fn numeric_value(settings: &Settings, key: SettingKey) -> Option<u32> {
     match key {
@@ -230,7 +273,16 @@ fn numeric_value(settings: &Settings, key: SettingKey) -> Option<u32> {
         SettingKey::RemotePollIntervalSecs => Some(settings.remote_poll_interval_secs),
         SettingKey::RemoteSearchDepth => Some(settings.remote_search_depth),
         SettingKey::RemoteSearchParallel => Some(settings.remote_search_parallel),
+        SettingKey::ThumbnailMaxFileSizeMb => Some(settings.thumbnail_max_file_size_mb),
         _ => None,
+    }
+}
+
+/// The text a settings input shows for `key`, numeric or free text.
+fn input_text(settings: &Settings, key: SettingKey) -> Option<String> {
+    match key {
+        SettingKey::ThumbnailExtensions => Some(settings.thumbnail_extensions.join(", ")),
+        _ => numeric_value(settings, key).map(|v| v.to_string()),
     }
 }
 
@@ -316,8 +368,8 @@ impl SettingsView {
         let mut last_input_texts = HashMap::new();
         let mut subscriptions = Vec::new();
 
-        for &key in NUMERIC_KEYS {
-            let val = numeric_value(&initial, key).unwrap_or(1).to_string();
+        for &key in NUMERIC_KEYS.iter().chain(TEXT_KEYS) {
+            let val = input_text(&initial, key).unwrap_or_default();
             last_input_texts.insert(key, val.clone());
             let input = cx.new(|cx| {
                 let mut field = TextInput::with_placeholder("", cx);
@@ -333,7 +385,7 @@ impl SettingsView {
                     return;
                 }
                 this.last_input_texts.insert(key, text.clone());
-                let _ = this.apply_numeric_text(key, &text, cx);
+                let _ = this.apply_input_text(key, &text, cx);
             });
             inputs.insert(key, input);
             subscriptions.push(sub);
@@ -478,10 +530,8 @@ impl SettingsView {
     pub fn sync_inputs_from_state(&mut self, cx: &mut Context<Self>) {
         let settings = self.app_state.read(cx).settings.clone();
         self.is_syncing = true;
-        for &key in NUMERIC_KEYS {
-            if let (Some(input), Some(val)) = (self.inputs.get(&key), numeric_value(&settings, key))
-            {
-                let text = val.to_string();
+        for &key in NUMERIC_KEYS.iter().chain(TEXT_KEYS) {
+            if let (Some(input), Some(text)) = (self.inputs.get(&key), input_text(&settings, key)) {
                 self.last_input_texts.insert(key, text.clone());
                 input.update(cx, |field, cx| {
                     if field.text() != text {
@@ -507,6 +557,46 @@ impl SettingsView {
             self.is_syncing = false;
         }
         self.apply_numeric_text(key, raw, cx)
+    }
+
+    /// Updates a free-text input and validates/persists it immediately.
+    pub fn set_text_input(
+        &mut self,
+        key: SettingKey,
+        raw: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.last_input_texts.insert(key, raw.to_string());
+        if let Some(input) = self.inputs.get(&key) {
+            self.is_syncing = true;
+            input.update(cx, |field, cx| field.set_text(raw.to_string(), cx));
+            self.is_syncing = false;
+        }
+        self.apply_input_text(key, raw, cx)
+    }
+
+    fn apply_input_text(
+        &mut self,
+        key: SettingKey,
+        raw: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if !TEXT_KEYS.contains(&key) {
+            return self.apply_numeric_text(key, raw, cx);
+        }
+        let result = self.app_state.update(cx, |state, _| match key {
+            SettingKey::ThumbnailExtensions => state.update_settings(|s| {
+                s.set_thumbnail_extensions(raw).map_err(|unsupported| {
+                    format!(
+                        "Sem suporte a miniatura: {}. Use: {}.",
+                        unsupported.join(", "),
+                        SUPPORTED_THUMBNAIL_EXTENSIONS.join(", ")
+                    )
+                })
+            }),
+            _ => Ok(()),
+        });
+        self.record_input_result(key, result, cx)
     }
 
     fn apply_numeric_text(
@@ -552,9 +642,21 @@ impl SettingsView {
                 let depth = state.settings.remote_search_depth;
                 state.set_remote_search_limits(depth, parsed)
             }
+            SettingKey::ThumbnailMaxFileSizeMb => state.update_settings(|s| {
+                s.set_thumbnail_max_file_size_mb(parsed)
+                    .map_err(str::to_owned)
+            }),
             _ => Ok(()),
         });
+        self.record_input_result(key, result, cx)
+    }
 
+    fn record_input_result(
+        &mut self,
+        key: SettingKey,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         match result {
             Ok(()) => {
                 self.errors.remove(&key);
@@ -614,6 +716,14 @@ impl SettingsView {
                 let interval = state.settings.remote_poll_interval_secs;
                 state.set_remote_poll(next, interval)
             }
+            SettingKey::ThumbnailsEnabled => state.update_settings(|s| {
+                s.thumbnails_enabled = !s.thumbnails_enabled;
+                Ok(())
+            }),
+            SettingKey::ThumbnailRemoteEnabled => state.update_settings(|s| {
+                s.thumbnail_remote_enabled = !s.thumbnail_remote_enabled;
+                Ok(())
+            }),
             _ => Err("Configuração booleana inválida.".into()),
         });
         match &res {
@@ -1013,6 +1123,8 @@ impl SettingsView {
                     SettingKey::FoldersFirst => settings.folders_first,
                     SettingKey::HiddenLast => settings.hidden_last,
                     SettingKey::RemotePollEnabled => settings.remote_poll_enabled,
+                    SettingKey::ThumbnailsEnabled => settings.thumbnails_enabled,
+                    SettingKey::ThumbnailRemoteEnabled => settings.thumbnail_remote_enabled,
                     _ => false,
                 };
                 let key = spec.key;
@@ -1285,6 +1397,12 @@ impl SettingsView {
                     .gap(space::S8)
                     .children(input.map(|field| div().w(px(76.)).text_data(&fonts).child(field)))
                     .child(div().text_label().text_color(theme.text_muted).child(unit))
+                    .into_any_element()
+            }
+            SettingControlKind::Text => {
+                let input = self.inputs.get(&spec.key).cloned();
+                div()
+                    .children(input.map(|field| div().w(px(220.)).text_data(&fonts).child(field)))
                     .into_any_element()
             }
         };
