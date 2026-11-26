@@ -1,6 +1,7 @@
 use kwati_core::{
-    copy_between, move_between, Backend, BackendError, Confirmed, ConflictPolicy, CopyOptions,
-    CopyOutcome, Entry, EntryKind, EntryMeta, Listing, LocalBackend, Location, Progress,
+    copy_between, is_trash_browsing_supported, list_trash, move_between, purge_trash_items,
+    Backend, BackendError, Confirmed, ConflictPolicy, CopyOptions, CopyOutcome, Entry, EntryKind,
+    EntryMeta, Listing, LocalBackend, Location, Progress, TrashItem,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,6 +10,21 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+fn normalize_test_dir(raw: PathBuf) -> PathBuf {
+    let canon = raw.canonicalize().unwrap_or(raw);
+    #[cfg(windows)]
+    {
+        let s = canon.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    canon
+}
 
 struct TestDir {
     path: PathBuf,
@@ -19,16 +35,30 @@ impl TestDir {
         use std::sync::atomic::AtomicUsize;
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path =
+        let raw =
             std::env::temp_dir().join(format!("kwati_test_{}_{}_{}", name, std::process::id(), id));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("failed to create test dir");
+        let _ = fs::remove_dir_all(&raw);
+        fs::create_dir_all(&raw).expect("failed to create test dir");
+        // trash::delete canonicalizes parent directories (and strips \\?\ on Windows), so match
+        // the exact form stored in the system trash.
+        let path = normalize_test_dir(raw);
         Self { path }
     }
 }
 
 impl Drop for TestDir {
     fn drop(&mut self) {
+        if is_trash_browsing_supported() {
+            if let Ok(items) = list_trash() {
+                let leftovers: Vec<TrashItem> = items
+                    .into_iter()
+                    .filter(|item| item.original_parent == self.path)
+                    .collect();
+                if !leftovers.is_empty() {
+                    let _ = purge_trash_items(&leftovers, Confirmed::user_confirmed());
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&self.path);
     }
 }
