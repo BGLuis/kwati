@@ -12,10 +12,10 @@ use gpui::actions;
 use kwati_core::{
     copy_between, move_between, move_entry, purge_trash_items, restore_conflict,
     restore_trash_items, Backend, BackendError, Confirmed, ConflictPolicy, CopyOptions,
-    CopyOutcome, EntryKind, LocalBackend, Location, Progress, TrashItem,
+    CopyOutcome, EntryKind, LocalBackend, Location, Progress, TrashItem, UndoAction, UndoStack,
 };
 
-use crate::state::{AppState, JobKind, JobStatus, UndoOperation};
+use crate::state::{AppState, JobKind, JobStatus};
 
 actions!(
     operations,
@@ -518,16 +518,17 @@ fn finish_transfer(
         }
 
         if !report.undo_to.is_empty() {
-            state.undo_stack.push(if transfer.is_move() {
-                UndoOperation::Move {
-                    from: report.undo_from,
-                    to: report.undo_to,
-                }
+            let pairs: Vec<(PathBuf, PathBuf)> = report
+                .undo_from
+                .iter()
+                .cloned()
+                .zip(report.undo_to.iter().cloned())
+                .collect();
+            if transfer.is_move() {
+                let _ = state.undo_stack.record_move(&pairs);
             } else {
-                UndoOperation::Copy {
-                    destinations: report.undo_to,
-                }
-            });
+                let _ = state.undo_stack.record_copy(&pairs);
+            }
         }
 
         state.reload_entries();
@@ -703,10 +704,9 @@ pub fn rename_location_on_backend(
 /// Applies the result of a completed rename to `state` (undo stack if local, reload, selection, status).
 pub fn apply_rename_result(state: &mut AppState, source: &Location, target: &Location) {
     if let (Location::Local(from), Location::Local(to)) = (source, target) {
-        state.undo_stack.push(UndoOperation::Rename {
-            from: from.clone(),
-            to: to.clone(),
-        });
+        if from != to {
+            let _ = state.undo_stack.record_rename(from, to);
+        }
     }
 
     if source.parent().as_ref() == Some(&state.current_location) {
@@ -769,9 +769,7 @@ pub fn create_folder_on_backend(
 /// Applies the result of a completed folder creation to `state`.
 pub fn apply_create_folder_result(state: &mut AppState, parent: &Location, target: &Location) {
     if let Location::Local(path) = target {
-        state
-            .undo_stack
-            .push(UndoOperation::CreateDir { path: path.clone() });
+        state.undo_stack.record_create_dir(path);
     }
 
     if parent == &state.current_location {
@@ -864,9 +862,7 @@ pub fn apply_trash_report(state: &mut AppState, report: TrashReport) -> TrashOut
             })
             .collect();
         if !local_paths.is_empty() {
-            state.undo_stack.push(UndoOperation::Trash {
-                original_paths: local_paths,
-            });
+            state.undo_stack.record_trash(&local_paths);
         }
         state.mark_recent_deletions(report.trashed.iter().cloned());
         for loc in &report.trashed {
@@ -962,6 +958,7 @@ pub fn delete_locations_permanently_with_backends(
 /// Applies a [`DeleteReport`] to `state`, updating selection, listing, and status.
 pub fn apply_delete_report(state: &mut AppState, report: DeleteReport) -> Result<usize, String> {
     if !report.deleted.is_empty() {
+        state.undo_stack.record_permanent_delete();
         state.mark_recent_deletions(report.deleted.iter().cloned());
         for loc in &report.deleted {
             state.selection.deselect(loc);
@@ -1126,147 +1123,153 @@ pub fn apply_empty_trash_result(
     }
 }
 
-/// Undoes the last reversible local file operation from the undo stack.
-/// Supports Rename, CreateDir, Copy, Move, and handles refusal when preconditions fail.
-pub fn execute_undo(state: &mut AppState) -> Result<String, String> {
-    let Some(op) = state.undo_stack.pop() else {
-        let msg = "Nothing to undo".to_string();
-        state.set_status(&msg);
-        return Err(msg);
-    };
+/// Executes the top operation of `stack` off the UI thread, returning the updated stack and outcome.
+pub fn run_undo_step(mut stack: UndoStack) -> (UndoStack, io::Result<UndoAction>) {
+    let outcome = stack.undo();
+    (stack, outcome)
+}
 
-    let local = LocalBackend::new();
+fn format_undo_error(err: &io::Error) -> String {
+    let raw = err.to_string();
+    if raw == "nothing to undo" {
+        "Nothing to undo".to_string()
+    } else {
+        raw
+    }
+}
 
-    match op {
-        UndoOperation::Rename { from, to } => {
-            let from_name = from
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
+fn apply_undone_action(state: &mut AppState, action: &UndoAction) -> String {
+    match action {
+        UndoAction::Rename { from, to, .. } => {
             let from_loc = Location::Local(from.clone());
             let to_loc = Location::Local(to.clone());
-
-            if !backend_exists(&local, &to_loc).unwrap_or(false) {
-                let refusal = format!(
-                    "Cannot undo rename: '{}' no longer exists",
-                    to.file_name().unwrap_or_default().to_string_lossy()
-                );
-                state.set_status(&refusal);
-                return Err(refusal);
+            state.selection.deselect(&to_loc);
+            if from
+                .parent()
+                .is_some_and(|p| state.current_location == Location::Local(p.to_path_buf()))
+            {
+                state.mark_highlighted_insert(from_loc.clone());
             }
-
-            if backend_exists(&local, &from_loc).unwrap_or(false) {
-                let refusal = format!(
-                    "Cannot undo rename: original name '{}' already exists",
-                    from_name
-                );
-                state.set_status(&refusal);
-                return Err(refusal);
-            }
-
-            if let Err(err) = local.rename(&to_loc, &from_loc) {
-                let refusal = format!("Failed to undo rename: {}", describe_backend_error(&err));
-                state.set_status(&refusal);
-                return Err(refusal);
-            }
-
             state.reload_entries();
             state.select_location(from_loc);
 
-            let msg = format!("Undid rename of '{}'", from_name);
-            state.set_status(&msg);
-            Ok(msg)
-        }
-        UndoOperation::CreateDir { path } => {
-            let name = path
+            let from_name = from
                 .file_name()
-                .map(|n| n.to_string_lossy().to_string())
+                .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let msg = format!("Undid rename of '{from_name}'");
+            state.set_completion_status(&msg);
+            msg
+        }
+        UndoAction::CreateDir { path } => {
             let loc = Location::Local(path.clone());
-
-            if !backend_exists(&local, &loc).unwrap_or(false) {
-                let refusal = format!("Cannot undo folder creation: '{}' no longer exists", name);
-                state.set_status(&refusal);
-                return Err(refusal);
-            }
-
-            // Use remove_dir so undo safely refuses if the user added files inside the folder.
-            if let Err(err) = std::fs::remove_dir(&path) {
-                let refusal = format!("Cannot undo folder creation: {}", err);
-                state.set_status(&refusal);
-                return Err(refusal);
-            }
-
             state.selection.deselect(&loc);
             state.reload_entries();
 
-            let msg = format!("Undid create folder '{}'", name);
-            state.set_status(&msg);
-            Ok(msg)
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let msg = format!("Undid create folder '{name}'");
+            state.set_completion_status(&msg);
+            msg
         }
-        UndoOperation::Copy { destinations } => {
-            for dest in &destinations {
-                let loc = Location::Local(dest.clone());
-                if backend_exists(&local, &loc).unwrap_or(false) {
-                    // Removing copy destinations created by the reversible copy operation.
-                    let _ = local.delete_permanently(&loc, Confirmed::user_confirmed());
-                    state.selection.deselect(&loc);
-                }
+        UndoAction::Copy { entries } => {
+            for entry in entries {
+                state
+                    .selection
+                    .deselect(&Location::Local(entry.destination_path.clone()));
             }
-
             state.reload_entries();
 
             let msg = "Undid copy operation".to_string();
-            state.set_status(&msg);
-            Ok(msg)
+            state.set_completion_status(&msg);
+            msg
         }
-        UndoOperation::Move { from, to } => {
-            for (f, t) in from.iter().zip(to.iter()) {
-                let f_loc = Location::Local(f.clone());
-                let t_loc = Location::Local(t.clone());
-                if !backend_exists(&local, &t_loc).unwrap_or(false) {
-                    let refusal = format!("Cannot undo move: '{}' no longer exists", t.display());
-                    state.set_status(&refusal);
-                    return Err(refusal);
-                }
-                if backend_exists(&local, &f_loc).unwrap_or(false) {
-                    let refusal = format!(
-                        "Cannot undo move: destination '{}' already exists",
-                        f.display()
-                    );
-                    state.set_status(&refusal);
-                    return Err(refusal);
-                }
+        UndoAction::Move { entries } => {
+            for entry in entries {
+                state
+                    .selection
+                    .deselect(&Location::Local(entry.current_path.clone()));
             }
-
-            for (f, t) in from.iter().zip(to.iter()) {
-                let f_loc = Location::Local(f.clone());
-                let t_loc = Location::Local(t.clone());
-                if f.parent() == t.parent() {
-                    let _ = local.rename(&t_loc, &f_loc);
-                } else if let Some(parent) = f.parent() {
-                    let cancel_flag = Arc::new(AtomicBool::new(false));
-                    let options = CopyOptions::new(ConflictPolicy::Replace, cancel_flag);
-                    let mut dummy = |_: Progress| {};
-                    let _ = move_entry(t, parent, &options, &mut dummy);
-                }
-            }
-
             state.reload_entries();
-
-            if let Some(first) = from.first() {
-                state.select_location(Location::Local(first.clone()));
+            if let Some(first) = entries.first() {
+                let loc = Location::Local(first.original_path.clone());
+                if first
+                    .original_path
+                    .parent()
+                    .is_some_and(|p| state.current_location == Location::Local(p.to_path_buf()))
+                {
+                    state.mark_highlighted_insert(loc.clone());
+                }
+                state.select_location(loc);
             }
 
             let msg = "Undid move operation".to_string();
-            state.set_status(&msg);
-            Ok(msg)
+            state.set_completion_status(&msg);
+            msg
         }
-        UndoOperation::Trash { original_paths: _ } => {
-            let refusal =
-                "Cannot undo trash: system trash does not support automatic restore".to_string();
-            state.set_status(&refusal);
-            Err(refusal)
+        UndoAction::Trash { targets } => {
+            state.reload_entries();
+            if let Some(first) = targets.first() {
+                let loc = Location::Local(first.original_path.clone());
+                if first
+                    .original_path
+                    .parent()
+                    .is_some_and(|p| state.current_location == Location::Local(p.to_path_buf()))
+                {
+                    state.mark_highlighted_insert(loc.clone());
+                }
+                state.select_location(loc);
+            }
+
+            let msg = if targets.len() == 1 {
+                let name = targets[0]
+                    .original_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                format!("Undid trash of '{name}'")
+            } else {
+                format!("Undid trash of {} item(s)", targets.len())
+            };
+            state.set_completion_status(&msg);
+            msg
         }
     }
+}
+
+/// Applies the result of an undo operation to `state`, updating the stack, listing, selection,
+/// and status bar message.
+pub fn apply_undo_result(
+    state: &mut AppState,
+    updated_stack: Option<UndoStack>,
+    res: io::Result<UndoAction>,
+) -> Result<String, String> {
+    match res {
+        Ok(action) => {
+            if let Some(stack) = updated_stack {
+                state.undo_stack = stack;
+            }
+            Ok(apply_undone_action(state, &action))
+        }
+        Err(err) => {
+            let reason = format_undo_error(&err);
+            state.set_status(&reason);
+            Err(reason)
+        }
+    }
+}
+
+/// Undoes the last reversible local file operation from the undo stack synchronously.
+/// Supports Rename, CreateDir, Copy, Move, and Trash, and reports refusals in `state.status_message`.
+pub fn execute_undo(state: &mut AppState) -> Result<String, String> {
+    if state.undo_stack.is_empty() {
+        let msg = "Nothing to undo".to_string();
+        state.set_status(&msg);
+        return Err(msg);
+    }
+
+    let res = state.undo_stack.undo();
+    apply_undo_result(state, None, res)
 }

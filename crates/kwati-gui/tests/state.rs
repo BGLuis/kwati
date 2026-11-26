@@ -1,7 +1,6 @@
-use kwati_core::{Entry, Location};
+use kwati_core::{Entry, Location, UndoAction, UndoStack};
 use kwati_gui::state::{
-    AppState, JobKind, JobStatus, NetworkMountStatus, PreviewData, PreviewKind, UndoOperation,
-    UndoStack,
+    AppState, JobKind, JobStatus, NetworkMountStatus, PreviewData, PreviewKind,
 };
 use kwati_gui::theme::Theme;
 use std::path::PathBuf;
@@ -74,16 +73,17 @@ fn app_state_jobs_and_preview() {
 fn undo_stack_operations() {
     let mut stack = UndoStack::new();
     assert!(stack.is_empty());
+    assert_eq!(stack.undo_label(), None);
 
-    stack.push(UndoOperation::CreateDir {
-        path: PathBuf::from("/tmp/new_dir"),
-    });
+    stack.record_create_dir("/tmp/new_dir");
     assert_eq!(stack.len(), 1);
     assert!(!stack.is_empty());
+    assert_eq!(stack.undo_label(), Some("Undo new folder"));
+    assert!(matches!(stack.peek(), Some(UndoAction::CreateDir { .. })));
 
-    let popped = stack.pop();
-    assert!(matches!(popped, Some(UndoOperation::CreateDir { .. })));
+    stack.clear();
     assert!(stack.is_empty());
+    assert_eq!(stack.undo_label(), None);
 }
 
 #[test]

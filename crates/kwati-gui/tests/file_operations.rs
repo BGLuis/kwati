@@ -3,14 +3,14 @@ use std::path::PathBuf;
 
 use kwati_core::{
     is_trash_browsing_supported, list_dir, list_trash, purge_trash_items, Confirmed,
-    ConflictPolicy, CopyOutcome, Location, TrashItem,
+    ConflictPolicy, CopyOutcome, Location, TrashItem, UndoAction,
 };
 use kwati_gui::actions::operations::{
     check_paste_conflict, clear_clipboard, copy_to_clipboard, cut_to_clipboard, execute_copy,
     execute_create_folder, execute_move, execute_permanent_delete, execute_rename, execute_trash,
     execute_undo, get_clipboard, validate_entry_name,
 };
-use kwati_gui::state::{AppState, UndoOperation};
+use kwati_gui::state::AppState;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -121,13 +121,10 @@ fn test_rename_entry_success_and_select() {
 
     // Undo stack updated
     assert_eq!(state.undo_stack.len(), 1);
-    assert_eq!(
+    assert!(matches!(
         state.undo_stack.peek(),
-        Some(&UndoOperation::Rename {
-            from: file_path,
-            to: new_path,
-        })
-    );
+        Some(UndoAction::Rename { from, to, .. }) if from == &file_path && to == &new_path
+    ));
 
     let _ = fs::remove_dir_all(test_dir);
 }
@@ -187,7 +184,7 @@ fn test_create_folder_success_and_select() {
     assert_eq!(state.undo_stack.len(), 1);
     assert_eq!(
         state.undo_stack.peek(),
-        Some(&UndoOperation::CreateDir { path: folder_path })
+        Some(&UndoAction::CreateDir { path: folder_path })
     );
 
     let _ = fs::remove_dir_all(test_dir);
@@ -239,12 +236,10 @@ fn test_trash_success_removes_entry_and_records_undo() {
             .selection
             .contains(&Location::Local(file_path.clone())));
         assert_eq!(state.undo_stack.len(), 1);
-        assert_eq!(
+        assert!(matches!(
             state.undo_stack.peek(),
-            Some(&UndoOperation::Trash {
-                original_paths: vec![file_path],
-            })
-        );
+            Some(UndoAction::Trash { targets }) if targets.len() == 1 && targets[0].original_path == file_path
+        ));
     } else {
         assert!(state.status_message.is_some());
         assert!(state.status_message.unwrap().contains("trash"));
@@ -325,12 +320,10 @@ fn test_clipboard_copy_and_paste_flow() {
 
     // Verify undo stack
     assert_eq!(state.undo_stack.len(), 1);
-    assert_eq!(
+    assert!(matches!(
         state.undo_stack.peek(),
-        Some(&UndoOperation::Copy {
-            destinations: vec![copied_file],
-        })
-    );
+        Some(UndoAction::Copy { entries }) if entries.len() == 1 && entries[0].destination_path == copied_file
+    ));
 
     let _ = fs::remove_dir_all(src_dir);
     let _ = fs::remove_dir_all(dst_dir);
@@ -491,13 +484,13 @@ fn test_cut_and_move_same_fs_completes_and_removes_source() {
 
     // Undo stack updated with Move
     assert_eq!(state.undo_stack.len(), 1);
-    assert_eq!(
+    assert!(matches!(
         state.undo_stack.peek(),
-        Some(&UndoOperation::Move {
-            from: vec![file],
-            to: vec![target_file],
-        })
-    );
+        Some(UndoAction::Move { entries })
+            if entries.len() == 1
+                && entries[0].original_path == file
+                && entries[0].current_path == target_file
+    ));
 
     let _ = fs::remove_dir_all(src_dir);
     let _ = fs::remove_dir_all(dst_dir);
@@ -681,8 +674,40 @@ fn test_undo_rename_refusal_when_destination_missing() {
     // Undo should be refused
     let res = execute_undo(&mut state);
     assert!(res.is_err());
-    assert!(res.unwrap_err().contains("no longer exists"));
-    assert!(state.status_message.unwrap().contains("no longer exists"));
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("target changed or moved since rename"),
+        "got: {err}"
+    );
+    assert_eq!(state.status_message.as_deref(), Some(err.as_str()));
+    assert_eq!(state.undo_stack.len(), 1);
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+#[test]
+fn test_undo_rename_refuses_stale_content() {
+    let test_dir = create_temp_test_dir("undo_rename_stale");
+    let original = test_dir.join("orig.txt");
+    fs::write(&original, "abcd").unwrap();
+
+    let mut state = AppState::new(Location::Local(test_dir.clone()));
+    let renamed = execute_rename(&mut state, &original, "renamed.txt").unwrap();
+
+    // Edit contents out-of-band with identical length to verify fingerprint checking.
+    fs::write(&renamed, "wxyz").unwrap();
+
+    let res = execute_undo(&mut state);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("target changed or moved since rename"),
+        "got: {err}"
+    );
+    assert_eq!(state.status_message.as_deref(), Some(err.as_str()));
+    assert!(!original.exists());
+    assert_eq!(fs::read_to_string(&renamed).unwrap(), "wxyz");
+    assert_eq!(state.undo_stack.len(), 1);
 
     let _ = fs::remove_dir_all(test_dir);
 }
@@ -702,8 +727,10 @@ fn test_undo_rename_refusal_when_original_exists() {
     // Undo should be refused
     let res = execute_undo(&mut state);
     assert!(res.is_err());
-    assert!(res.unwrap_err().contains("already exists"));
-    assert!(state.status_message.unwrap().contains("already exists"));
+    let err = res.unwrap_err();
+    assert!(err.contains("now exists"), "got: {err}");
+    assert_eq!(state.status_message.as_deref(), Some(err.as_str()));
+    assert_eq!(state.undo_stack.len(), 1);
 
     let _ = fs::remove_dir_all(test_dir);
 }
@@ -731,18 +758,18 @@ fn test_undo_copy_removes_destinations() {
     let file = src_dir.join("copied.txt");
     fs::write(&file, "copy").unwrap();
 
-    let dst_dir = create_temp_test_dir("undo_copy_dst");
-    let mut state = AppState::new(Location::Local(dst_dir.clone()));
+    let dst_dir = TrashTestDir::new("undo_copy_dst");
+    let mut state = AppState::new(Location::Local(dst_dir.path.clone()));
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let _ = execute_copy(
         &mut state,
         std::slice::from_ref(&file),
-        &dst_dir,
+        &dst_dir.path,
         ConflictPolicy::Replace,
         cancel_flag,
     );
-    let copied_target = dst_dir.join("copied.txt");
+    let copied_target = dst_dir.path.join("copied.txt");
     assert!(copied_target.exists());
 
     let res = execute_undo(&mut state);
@@ -752,7 +779,6 @@ fn test_undo_copy_removes_destinations() {
     assert!(file.exists()); // Source untouched
 
     let _ = fs::remove_dir_all(src_dir);
-    let _ = fs::remove_dir_all(dst_dir);
 }
 
 #[test]
@@ -788,21 +814,46 @@ fn test_undo_move_restores_source() {
 }
 
 #[test]
-fn test_undo_trash_refused_with_reason() {
+fn test_undo_trash_restores_or_refuses() {
+    let test_dir = TrashTestDir::new("undo_trash");
+    let doomed = test_dir.path.join("trashed.txt");
+    fs::write(&doomed, "trash contents").unwrap();
+
+    let mut state = AppState::new(Location::Local(test_dir.path.clone()));
+    execute_trash(&mut state, std::slice::from_ref(&doomed)).unwrap();
+    assert!(!doomed.exists());
+
+    let res = execute_undo(&mut state);
+
+    if is_trash_browsing_supported() {
+        assert!(res.is_ok(), "unexpected error: {:?}", res);
+        assert_eq!(fs::read_to_string(&doomed).unwrap(), "trash contents");
+        assert!(state.undo_stack.is_empty());
+    } else {
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.contains("cannot undo trash"), "got: {err}");
+        assert_eq!(state.status_message.as_deref(), Some(err.as_str()));
+        assert_eq!(state.undo_stack.len(), 1);
+    }
+}
+
+#[test]
+fn test_undo_trash_refused_when_missing_from_trash() {
     let mut state = AppState::new(Location::Local(PathBuf::from("/tmp")));
-    state.undo_stack.push(UndoOperation::Trash {
-        original_paths: vec![PathBuf::from("/tmp/trashed.txt")],
-    });
+    state.undo_stack.record_trash(&[PathBuf::from(format!(
+        "/tmp/kwati_missing_trash_{}.txt",
+        std::process::id()
+    ))]);
 
     let res = execute_undo(&mut state);
     assert!(res.is_err());
-    assert!(res
-        .unwrap_err()
-        .contains("system trash does not support automatic restore"));
-    assert!(state
-        .status_message
-        .unwrap()
-        .contains("system trash does not support automatic restore"));
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("cannot undo trash"),
+        "expected refusal message, got: {err}"
+    );
+    assert_eq!(state.status_message.as_deref(), Some(err.as_str()));
 }
 
 #[test]
