@@ -7,6 +7,7 @@ pub mod drives;
 mod ftp;
 pub mod icons;
 mod move_entry;
+pub mod open_with;
 pub mod places;
 pub mod prefetch;
 mod profiles;
@@ -43,6 +44,7 @@ pub use icons::{
     ICON_TYPE_SPECS,
 };
 pub use move_entry::{move_entry, move_entry_with};
+pub use open_with::{applications_for, open_with, open_with_executable, which_in_path, AppInfo};
 pub use places::{
     default_place_entries, ensure_trash_present, list_places, resolve_bookmarks, standard_places,
     standard_places_from, Bookmark, Place, PlaceEntry, PlaceKind, ResolvedBookmark, SidebarPlaces,

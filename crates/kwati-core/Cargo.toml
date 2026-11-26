@@ -34,8 +34,18 @@ zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-i
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 libc = "0.2.191"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
 windows-native-keyring-store = "1.1.0"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
