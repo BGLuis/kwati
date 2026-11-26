@@ -11,7 +11,7 @@ use gpui::{
 use kwati_core::{
     FolderSettingsScope, Location, Settings, SortColumn, SortDirection, SortOrder, ViewMode,
 };
-use kwati_gui::actions::operations::clear_clipboard;
+use kwati_gui::actions::operations::{clear_clipboard, execute_rename};
 use kwati_gui::actions::register_keybindings;
 use kwati_gui::components::register_text_input_keybindings;
 use kwati_gui::state::AppState;
@@ -239,11 +239,28 @@ fn right_click_empty_space_shows_folder_actions(cx: &mut TestAppContext) {
         [
             ContextMenuAction::Paste,
             ContextMenuAction::NewFolder,
+            ContextMenuAction::Undo,
             ContextMenuAction::ToggleShowHidden,
             ContextMenuAction::ApplyFolderSettingsToAll,
             ContextMenuAction::Refresh,
         ]
     );
+    let undo_item = main.read_with(cx, |main, cx| {
+        main.context_menu
+            .read(cx)
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                ContextMenuEntry::Item {
+                    action: ContextMenuAction::Undo,
+                    label,
+                    enabled,
+                    ..
+                } => Some((*label, *enabled)),
+                _ => None,
+            })
+    });
+    assert_eq!(undo_item, Some(("Undo", false)));
     assert_eq!(menu_submenu_labels(&main, cx), ["View", "Sort by"]);
 
     let view_items = submenu_entries_for(&main, cx, "View");
@@ -493,16 +510,16 @@ fn empty_space_context_menu_submenus_apply_per_folder_and_persist(cx: &mut TestA
         });
     });
 
-    // Open empty-space context menu and hover "View" submenu (entry index 3), click "Grid" (subitem 1).
+    // Open empty-space context menu and hover "View" submenu (entry index 4), click "Grid" (subitem 1).
     let empty = point(px(500.), px(400.));
     right_click(cx, empty);
     assert!(is_menu_open(&main, cx));
-    let view_row = menu_item_bounds(cx, "context-menu-item-3");
+    let view_row = menu_item_bounds(cx, "context-menu-item-4");
     cx.simulate_mouse_move(view_row, None, Modifiers::none());
     cx.run_until_parked();
     assert_eq!(
         main.read_with(cx, |m, cx| m.context_menu.read(cx).open_submenu()),
-        Some(3)
+        Some(4)
     );
     let grid_item = menu_item_bounds(cx, "context-menu-subitem-1");
     left_click(cx, grid_item, Modifiers::none());
@@ -516,8 +533,8 @@ fn empty_space_context_menu_submenus_apply_per_folder_and_persist(cx: &mut TestA
     // Open via Shift+F10 with no selection and use keyboard into "Sort by" -> "Size" -> "Descending".
     cx.simulate_keystrokes("shift-f10");
     assert!(is_menu_open(&main, cx));
-    // Items: Paste(0, disabled), New Folder(1), View(3), Sort by(4), Show Hidden(5).
-    // Initial focus is on New Folder(1). Down -> View(3), Down -> Sort by(4), Right -> Name(0), Down -> Size(1), Enter.
+    // Items: Paste(0, disabled), New Folder(1), Undo(2, disabled), View(4), Sort by(5), Show Hidden(6).
+    // Initial focus is on New Folder(1). Down -> View(4), Down -> Sort by(5), Right -> Name(0), Down -> Size(1), Enter.
     cx.simulate_keystrokes("down down right down enter");
     cx.run_until_parked();
     main.read_with(cx, |m, cx| {
@@ -525,7 +542,7 @@ fn empty_space_context_menu_submenus_apply_per_folder_and_persist(cx: &mut TestA
     });
 
     cx.simulate_keystrokes("shift-f10");
-    // Open Sort by(4) -> Down x7 -> Descending(8) -> Enter.
+    // Open Sort by(5) -> Down x7 -> Descending(8) -> Enter.
     cx.simulate_keystrokes("down down right down down down down down down down enter");
     cx.run_until_parked();
     main.read_with(cx, |m, cx| {
@@ -551,14 +568,14 @@ fn empty_space_context_menu_submenus_apply_per_folder_and_persist(cx: &mut TestA
 
     // Toggle "Folders First" off and "Hidden Files Last" on via Sort by submenu.
     right_click(cx, empty);
-    let sort_row = menu_item_bounds(cx, "context-menu-item-4");
+    let sort_row = menu_item_bounds(cx, "context-menu-item-5");
     cx.simulate_mouse_move(sort_row, None, Modifiers::none());
     cx.run_until_parked();
     let folders_first_item = menu_item_bounds(cx, "context-menu-subitem-10");
     left_click(cx, folders_first_item, Modifiers::none());
 
     right_click(cx, empty);
-    let sort_row = menu_item_bounds(cx, "context-menu-item-4");
+    let sort_row = menu_item_bounds(cx, "context-menu-item-5");
     cx.simulate_mouse_move(sort_row, None, Modifiers::none());
     cx.run_until_parked();
     let hidden_last_item = menu_item_bounds(cx, "context-menu-subitem-11");
@@ -574,7 +591,7 @@ fn empty_space_context_menu_submenus_apply_per_folder_and_persist(cx: &mut TestA
 
     // Toggle "Show Hidden Files" from context menu.
     right_click(cx, empty);
-    let hidden_row = menu_item_bounds(cx, "context-menu-item-5");
+    let hidden_row = menu_item_bounds(cx, "context-menu-item-6");
     left_click(cx, hidden_row, Modifiers::none());
     main.read_with(cx, |m, cx| {
         let s = m.app_state.read(cx);
@@ -620,9 +637,9 @@ fn empty_space_context_menu_submenus_apply_per_folder_and_persist(cx: &mut TestA
     assert_eq!(reloaded.sort_direction, SortDirection::Descending);
     assert!(reloaded.show_hidden);
 
-    // Clicking "Apply to All Folders" (index 6) in folder_a applies settings globally.
+    // Clicking "Apply to All Folders" (index 7) in folder_a applies settings globally.
     right_click(cx, empty);
-    let apply_all_row = menu_item_bounds(cx, "context-menu-item-6");
+    let apply_all_row = menu_item_bounds(cx, "context-menu-item-7");
     left_click(cx, apply_all_row, Modifiers::none());
     let (disk, warnings) = Settings::load_from(&settings_file).unwrap();
     assert!(warnings.is_empty());
@@ -674,7 +691,7 @@ fn settings_scope_all_folders_applies_context_menu_changes_globally(cx: &mut Tes
 
     let empty = point(px(500.), px(400.));
     right_click(cx, empty);
-    let view_row = menu_item_bounds(cx, "context-menu-item-3");
+    let view_row = menu_item_bounds(cx, "context-menu-item-4");
     cx.simulate_mouse_move(view_row, None, Modifiers::none());
     cx.run_until_parked();
     let compact_item = menu_item_bounds(cx, "context-menu-subitem-2");
@@ -695,6 +712,59 @@ fn settings_scope_all_folders_applies_context_menu_changes_globally(cx: &mut Tes
     main.read_with(cx, |m, cx| {
         assert_eq!(m.app_state.read(cx).view_mode, ViewMode::CompactList);
     });
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[gpui::test]
+fn empty_space_context_menu_undo_names_operation_and_restores_rename(cx: &mut TestAppContext) {
+    let root = fixture("undo_ctxmenu");
+    let _clipboard = clipboard();
+    let (main, cx) = open_window(cx, &root);
+
+    let original = root.join("alpha.txt");
+    let renamed = main.update(cx, |main, cx| {
+        main.app_state.update(cx, |state, _| {
+            execute_rename(state, &original, "alpha-renamed.txt").unwrap()
+        })
+    });
+    cx.run_until_parked();
+    assert!(renamed.exists());
+    assert!(!original.exists());
+
+    // Open empty-space context menu and verify the Undo item shows the top operation label.
+    let empty = point(px(500.), px(400.));
+    right_click(cx, empty);
+    assert!(is_menu_open(&main, cx));
+
+    let undo_item = main.read_with(cx, |main, cx| {
+        main.context_menu
+            .read(cx)
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                ContextMenuEntry::Item {
+                    action: ContextMenuAction::Undo,
+                    label,
+                    enabled,
+                    ..
+                } => Some((*label, *enabled)),
+                _ => None,
+            })
+    });
+    assert_eq!(undo_item, Some(("Undo rename", true)));
+
+    // Navigate down from New Folder to Undo rename and press Enter.
+    cx.simulate_keystrokes("down enter");
+    cx.run_until_parked();
+
+    assert!(!is_menu_open(&main, cx));
+    assert!(original.exists());
+    assert!(!renamed.exists());
+    let status = main.read_with(cx, |main, cx| {
+        main.app_state.read(cx).status_message.clone()
+    });
+    assert_eq!(status.as_deref(), Some("Undid rename of 'alpha.txt'"));
 
     let _ = fs::remove_dir_all(&root);
 }

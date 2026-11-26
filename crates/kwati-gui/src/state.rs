@@ -14,7 +14,8 @@ use kwati_core::{
     History, HostKeyUnknown, IconColor, IconConfig, IconGroup, IconResolver, IconSource,
     ListOptions, LocalBackend, Location, PlaceEntry, ReconnectingBackend, RemoteEditWatcher,
     RemoteFileCache, RemoteStreamServer, ResolvedFolderSettings, Selection, Settings,
-    SettingsWarning, SortColumn, SortDirection, SortOrder, TrashItem, ViewMode, VolumeKind,
+    SettingsWarning, SortColumn, SortDirection, SortOrder, TrashItem, UndoStack, ViewMode,
+    VolumeKind,
 };
 
 use crate::actions::remote_files::{
@@ -132,62 +133,6 @@ impl JobStatus {
             self.progress_pct =
                 ((processed as f64 / self.bytes_total as f64) * 100.0).min(100.0) as u8;
         }
-    }
-}
-
-/// Operations recorded in the undo stack (owned by guiops-worker).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UndoOperation {
-    Rename {
-        from: PathBuf,
-        to: PathBuf,
-    },
-    CreateDir {
-        path: PathBuf,
-    },
-    Trash {
-        original_paths: Vec<PathBuf>,
-    },
-    Copy {
-        destinations: Vec<PathBuf>,
-    },
-    Move {
-        from: Vec<PathBuf>,
-        to: Vec<PathBuf>,
-    },
-}
-
-/// Undo history stack (owned by guiops-worker).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UndoStack {
-    pub operations: Vec<UndoOperation>,
-}
-
-impl UndoStack {
-    pub fn new() -> Self {
-        Self {
-            operations: Vec::new(),
-        }
-    }
-
-    pub fn push(&mut self, op: UndoOperation) {
-        self.operations.push(op);
-    }
-
-    pub fn pop(&mut self) -> Option<UndoOperation> {
-        self.operations.pop()
-    }
-
-    pub fn peek(&self) -> Option<&UndoOperation> {
-        self.operations.last()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.operations.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.operations.len()
     }
 }
 

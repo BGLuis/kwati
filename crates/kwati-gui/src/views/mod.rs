@@ -38,8 +38,8 @@ use kwati_core::{Location, SortColumn, SortDirection, ViewMode};
 
 use crate::actions::navigation::{SetViewCompact, SetViewDetails, SetViewGrid};
 use crate::actions::operations::{
-    self, copy_locations_to_clipboard, cut_locations_to_clipboard, execute_undo,
-    get_location_clipboard,
+    self, apply_undo_result, copy_locations_to_clipboard, cut_locations_to_clipboard,
+    get_location_clipboard, run_undo_step,
 };
 use crate::actions::remote_sync::RemotePollerHost;
 use crate::actions::{
@@ -81,6 +81,7 @@ pub struct MainView {
     preview_width_anim: ScalarTransition,
     last_status_revision: u64,
     status_pop_started_at: Option<Instant>,
+    undo_in_flight: bool,
 }
 
 impl MainView {
@@ -297,6 +298,7 @@ impl MainView {
             ),
             last_status_revision: initial_status_rev,
             status_pop_started_at: None,
+            undo_in_flight: false,
         }
     }
 }
@@ -564,6 +566,10 @@ impl MainView {
             }
             ContextMenuAction::Remove => self.ask_to_remove_selection(window, cx),
             ContextMenuAction::NewFolder => self.open_new_folder_in_current(window, cx),
+            ContextMenuAction::Undo => {
+                self.trigger_undo(cx);
+                self.list.read(cx).focus_handle.focus(window);
+            }
             ContextMenuAction::Refresh => {
                 self.app_state.update(cx, |state, cx| {
                     state.refresh_current();
@@ -654,10 +660,36 @@ impl MainView {
         if !self.list_has_keyboard(window, cx) {
             return;
         }
-        self.app_state.update(cx, |state, _| {
-            let _ = execute_undo(state);
-        });
-        cx.notify();
+        self.trigger_undo(cx);
+    }
+
+    fn trigger_undo(&mut self, cx: &mut Context<Self>) {
+        if self.undo_in_flight {
+            return;
+        }
+        let stack = self.app_state.read(cx).undo_stack.clone();
+        if stack.is_empty() {
+            self.set_status("Nothing to undo", cx);
+            return;
+        }
+
+        self.undo_in_flight = true;
+        let app_state = self.app_state.clone();
+        cx.spawn(async move |this, cx| {
+            let (updated_stack, outcome) = cx
+                .background_executor()
+                .spawn(async move { run_undo_step(stack) })
+                .await;
+            let _ = app_state.update(cx, |state, cx| {
+                let _ = apply_undo_result(state, Some(updated_stack), outcome);
+                cx.notify();
+            });
+            let _ = this.update(cx, |this, cx| {
+                this.undo_in_flight = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {

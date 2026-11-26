@@ -7,7 +7,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
-use kwati_core::{volume_kind, ConflictPolicy, Location, VolumeKind};
+use kwati_core::{
+    is_trash_browsing_supported, list_trash, purge_trash_items, volume_kind, Confirmed,
+    ConflictPolicy, Location, TrashItem, VolumeKind,
+};
 use kwati_gui::actions::operations::{
     clear_clipboard, execute_copy, execute_undo, start_transfer, Transfer,
 };
@@ -277,6 +280,49 @@ fn delete_asks_first_and_escape_leaves_the_file(cx: &mut TestAppContext) {
     let _ = fs::remove_dir_all(&root);
 }
 
+fn normalize_test_dir(raw: PathBuf) -> PathBuf {
+    let canon = raw.canonicalize().unwrap_or(raw);
+    #[cfg(windows)]
+    {
+        let s = canon.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    canon
+}
+
+struct TrashTestDir {
+    path: PathBuf,
+}
+
+impl TrashTestDir {
+    fn new(name: &str) -> Self {
+        let path = normalize_test_dir(fixture(name));
+        Self { path }
+    }
+}
+
+impl Drop for TrashTestDir {
+    fn drop(&mut self) {
+        if is_trash_browsing_supported() {
+            if let Ok(items) = list_trash() {
+                let leftovers: Vec<TrashItem> = items
+                    .into_iter()
+                    .filter(|item| item.original_path().starts_with(&self.path))
+                    .collect();
+                if !leftovers.is_empty() {
+                    let _ = purge_trash_items(&leftovers, Confirmed::user_confirmed());
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 #[gpui::test]
 fn ctrl_z_undoes_the_last_rename_and_says_so(cx: &mut TestAppContext) {
     let root = fixture("undo");
@@ -288,7 +334,12 @@ fn ctrl_z_undoes_the_last_rename_and_says_so(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(root.join("renamed.txt").exists());
 
-    cx.simulate_keystrokes("ctrl-z");
+    let shortcut = if cfg!(target_os = "macos") {
+        "cmd-z"
+    } else {
+        "ctrl-z"
+    };
+    cx.simulate_keystrokes(shortcut);
     cx.run_until_parked();
 
     assert!(root.join("notes.txt").exists());
@@ -296,9 +347,45 @@ fn ctrl_z_undoes_the_last_rename_and_says_so(cx: &mut TestAppContext) {
     assert!(status(&main, cx).contains("Undid rename"));
 
     // Nothing is left to undo: the refusal is reported and nothing changes.
-    cx.simulate_keystrokes("ctrl-z");
+    cx.simulate_keystrokes(shortcut);
+    cx.run_until_parked();
     assert!(status(&main, cx).contains("Nothing to undo"));
     assert!(root.join("notes.txt").exists());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[gpui::test]
+fn ctrl_z_refuses_stale_rename_and_reports_reason_in_status_bar(cx: &mut TestAppContext) {
+    let root = fixture("undo_stale");
+    let (main, cx) = open_window(cx, &root);
+    select(&main, cx, "notes.txt");
+    cx.simulate_keystrokes("f2 ctrl-a");
+    cx.simulate_input("renamed.txt");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(root.join("renamed.txt").exists());
+
+    // Edit the renamed file out-of-band so undo is refused cleanly.
+    fs::write(root.join("renamed.txt"), "edited").unwrap();
+
+    let shortcut = if cfg!(target_os = "macos") {
+        "cmd-z"
+    } else {
+        "ctrl-z"
+    };
+    cx.simulate_keystrokes(shortcut);
+    cx.run_until_parked();
+
+    assert!(!root.join("notes.txt").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("renamed.txt")).unwrap(),
+        "edited"
+    );
+    let msg = status(&main, cx);
+    assert!(
+        msg.contains("target changed or moved since rename"),
+        "expected refusal reason in status bar, got: {msg}"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -352,7 +439,8 @@ fn a_transfer_is_queued_as_a_job_instead_of_blocking_the_window(cx: &mut TestApp
 
 #[test]
 fn undoing_a_copy_never_deletes_a_file_that_was_already_there() {
-    let root = fixture("undo_copy_existing");
+    let dir = TrashTestDir::new("undo_copy_existing");
+    let root = &dir.path;
     fs::write(root.join("sub/notes.txt"), "already here").unwrap();
     let mut state = AppState::new(Location::Local(root.join("sub")));
 
@@ -374,5 +462,4 @@ fn undoing_a_copy_never_deletes_a_file_that_was_already_there() {
         fs::read_to_string(root.join("sub/notes.txt")).unwrap(),
         "already here"
     );
-    let _ = fs::remove_dir_all(&root);
 }

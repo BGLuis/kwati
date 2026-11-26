@@ -30,6 +30,7 @@ pub enum ContextMenuAction {
     Paste,
     Remove,
     NewFolder,
+    Undo,
     Refresh,
     SidebarOpen(usize),
     SidebarRename(usize),
@@ -141,7 +142,13 @@ fn direction_labels_for_column(column: SortColumn) -> (&'static str, &'static st
     }
 }
 
-/// Builds the context menu entries applicable to the current selection and clipboard state.
+const UNDO_SHORTCUT: &str = if cfg!(target_os = "macos") {
+    "Cmd+Z"
+} else {
+    "Ctrl+Z"
+};
+
+/// Builds the context menu entries applicable to the current selection, clipboard, and undo stack.
 /// `folder_bookmarked` is `Some` when the selection is a single local folder, telling whether
 /// the sidebar already lists it.
 pub fn build_context_menu_entries(
@@ -149,6 +156,7 @@ pub fn build_context_menu_entries(
     has_clipboard: bool,
     folder_bookmarked: Option<bool>,
     folder_state: FolderMenuState,
+    undo_label: Option<&'static str>,
 ) -> Vec<ContextMenuEntry> {
     if selected.is_empty() {
         let (asc_label, desc_label) = direction_labels_for_column(folder_state.sort_column);
@@ -165,6 +173,13 @@ pub fn build_context_menu_entries(
                 "New Folder",
                 Some("Ctrl+Shift+N"),
                 true,
+                false,
+            ),
+            menu_item(
+                ContextMenuAction::Undo,
+                undo_label.unwrap_or("Undo"),
+                Some(UNDO_SHORTCUT),
+                undo_label.is_some(),
                 false,
             ),
             ContextMenuEntry::Separator,
@@ -563,27 +578,41 @@ impl ContextMenuView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let state = self.app_state.read(cx);
-        let selected = state.selected_locations();
-        let folder_bookmarked = match (state.selected_entries().as_slice(), selected.as_slice()) {
-            ([entry], [Location::Local(path)]) if entry.is_dir() => {
-                Some(state.is_place_pinned(path))
-            }
-            _ => None,
-        };
-        let folder_state = FolderMenuState {
-            view_mode: state.view_mode,
-            sort_column: state.sort_column,
-            sort_direction: state.sort_direction,
-            show_hidden: state.show_hidden,
-            folders_first: state.folders_first,
-            hidden_last: state.hidden_last,
-            show_sidebar: state.panels.sidebar_open,
-            show_preview: state.panels.preview_open,
+        let (selected, folder_bookmarked, folder_state, undo_label) = {
+            let state = self.app_state.read(cx);
+            let selected = state.selected_locations();
+            let folder_bookmarked = match (state.selected_entries().as_slice(), selected.as_slice())
+            {
+                ([entry], [Location::Local(path)]) if entry.is_dir() => {
+                    Some(state.is_place_pinned(path))
+                }
+                _ => None,
+            };
+            let folder_state = FolderMenuState {
+                view_mode: state.view_mode,
+                sort_column: state.sort_column,
+                sort_direction: state.sort_direction,
+                show_hidden: state.show_hidden,
+                folders_first: state.folders_first,
+                hidden_last: state.hidden_last,
+                show_sidebar: state.panels.sidebar_open,
+                show_preview: state.panels.preview_open,
+            };
+            (
+                selected,
+                folder_bookmarked,
+                folder_state,
+                state.undo_stack.undo_label(),
+            )
         };
         let has_clipboard = get_location_clipboard().is_some();
-        self.entries =
-            build_context_menu_entries(&selected, has_clipboard, folder_bookmarked, folder_state);
+        self.entries = build_context_menu_entries(
+            &selected,
+            has_clipboard,
+            folder_bookmarked,
+            folder_state,
+            undo_label,
+        );
         self.position = position;
         self.focused_index = first_enabled_index_in(&self.entries);
         self.hovered_index = None;
@@ -777,6 +806,7 @@ fn menu_action_icon(action: ContextMenuAction) -> Option<IconName> {
         | ContextMenuAction::Bookmark
         | ContextMenuAction::Cut
         | ContextMenuAction::Paste
+        | ContextMenuAction::Undo
         | ContextMenuAction::SidebarOpen(_)
         | ContextMenuAction::SidebarRename(_)
         | ContextMenuAction::SetViewMode(_)
