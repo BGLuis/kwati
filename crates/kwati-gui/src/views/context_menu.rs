@@ -1,16 +1,19 @@
 //! Context menu view for file list entries and empty space (#55).
 
+use std::borrow::Cow;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use gpui::{
     anchored, deferred, div, point, prelude::*, px, AnyElement, Context, CursorStyle, Entity,
     EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
-    Point, Size, Window,
+    Point, SharedString, Size, Window,
 };
 use kwati_core::{volume_kind, Location, SortColumn, SortDirection, ViewMode, VolumeKind};
 
+use crate::actions::open_with::{menu_applications_for, AppInfo};
 use crate::actions::operations::get_location_clipboard;
-use crate::components::{animated_icon, popup_entrance_metrics, IconMotion, IconName};
+use crate::components::{animated_icon, popup_entrance_metrics, Ellipsize, IconMotion, IconName};
 use crate::motion::{
     color_lerp, is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker,
     INSTANT, MENU_CASCADE_STEP, QUICK,
@@ -23,6 +26,8 @@ use crate::tokens::{radius, size, space, Fonts, TextRole};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextMenuAction {
     Open,
+    OpenWithApp(usize),
+    OpenWithOther,
     Rename,
     Bookmark,
     Copy,
@@ -79,14 +84,14 @@ impl Default for FolderMenuState {
 pub enum ContextMenuEntry {
     Item {
         action: ContextMenuAction,
-        label: &'static str,
+        label: Cow<'static, str>,
         shortcut: Option<&'static str>,
         enabled: bool,
         destructive: bool,
         checked: bool,
     },
     Submenu {
-        label: &'static str,
+        label: Cow<'static, str>,
         items: Vec<ContextMenuEntry>,
     },
     Separator,
@@ -101,14 +106,14 @@ pub enum ContextMenuEvent {
 
 fn menu_item(
     action: ContextMenuAction,
-    label: &'static str,
+    label: impl Into<Cow<'static, str>>,
     shortcut: Option<&'static str>,
     enabled: bool,
     destructive: bool,
 ) -> ContextMenuEntry {
     ContextMenuEntry::Item {
         action,
-        label,
+        label: label.into(),
         shortcut,
         enabled,
         destructive,
@@ -118,17 +123,24 @@ fn menu_item(
 
 fn checked_menu_item(
     action: ContextMenuAction,
-    label: &'static str,
+    label: impl Into<Cow<'static, str>>,
     shortcut: Option<&'static str>,
     checked: bool,
 ) -> ContextMenuEntry {
     ContextMenuEntry::Item {
         action,
-        label,
+        label: label.into(),
         shortcut,
         enabled: true,
         destructive: false,
         checked,
+    }
+}
+
+fn submenu(label: impl Into<Cow<'static, str>>, items: Vec<ContextMenuEntry>) -> ContextMenuEntry {
+    ContextMenuEntry::Submenu {
+        label: label.into(),
+        items,
     }
 }
 
@@ -150,11 +162,13 @@ const UNDO_SHORTCUT: &str = if cfg!(target_os = "macos") {
 
 /// Builds the context menu entries applicable to the current selection, clipboard, and undo stack.
 /// `folder_bookmarked` is `Some` when the selection is a single local folder, telling whether
-/// the sidebar already lists it.
+/// the sidebar already lists it. `open_with_apps` is `Some` when the selection is a single local
+/// file, listing the applications to display in the "Open With" submenu.
 pub fn build_context_menu_entries(
     selected: &[Location],
     has_clipboard: bool,
     folder_bookmarked: Option<bool>,
+    open_with_apps: Option<&[AppInfo]>,
     folder_state: FolderMenuState,
     undo_label: Option<&'static str>,
 ) -> Vec<ContextMenuEntry> {
@@ -183,9 +197,9 @@ pub fn build_context_menu_entries(
                 false,
             ),
             ContextMenuEntry::Separator,
-            ContextMenuEntry::Submenu {
-                label: "View",
-                items: vec![
+            submenu(
+                "View",
+                vec![
                     checked_menu_item(
                         ContextMenuAction::SetViewMode(ViewMode::Details),
                         "Details",
@@ -218,10 +232,10 @@ pub fn build_context_menu_entries(
                         folder_state.show_preview,
                     ),
                 ],
-            },
-            ContextMenuEntry::Submenu {
-                label: "Sort by",
-                items: vec![
+            ),
+            submenu(
+                "Sort by",
+                vec![
                     checked_menu_item(
                         ContextMenuAction::SetSortColumn(SortColumn::Name),
                         "Name",
@@ -285,7 +299,7 @@ pub fn build_context_menu_entries(
                         folder_state.hidden_last,
                     ),
                 ],
-            },
+            ),
             checked_menu_item(
                 ContextMenuAction::ToggleShowHidden,
                 "Show Hidden Files",
@@ -333,6 +347,9 @@ pub fn build_context_menu_entries(
                 false,
             ));
         }
+        if let Some(apps) = open_with_apps {
+            entries.push(submenu("Open With", build_open_with_submenu_items(apps)));
+        }
         entries.extend([
             ContextMenuEntry::Separator,
             menu_item(ContextMenuAction::Copy, "Copy", Some("Ctrl+C"), true, false),
@@ -368,6 +385,35 @@ pub fn build_context_menu_entries(
             ),
         ]
     }
+}
+
+fn build_open_with_submenu_items(apps: &[AppInfo]) -> Vec<ContextMenuEntry> {
+    let mut items = Vec::with_capacity(apps.len() + 2);
+    if !apps.is_empty() {
+        for (ix, app) in apps.iter().enumerate() {
+            let label: Cow<'static, str> = if app.is_default {
+                Cow::Owned(format!("{} (Default)", app.name))
+            } else {
+                Cow::Owned(app.name.clone())
+            };
+            items.push(menu_item(
+                ContextMenuAction::OpenWithApp(ix),
+                label,
+                None,
+                true,
+                false,
+            ));
+        }
+        items.push(ContextMenuEntry::Separator);
+    }
+    items.push(menu_item(
+        ContextMenuAction::OpenWithOther,
+        "Other application...",
+        None,
+        true,
+        false,
+    ));
+    items
 }
 
 /// Builds the context menu entries for a sidebar Places item at `index`.
@@ -512,6 +558,8 @@ pub struct ContextMenuView {
     is_open: bool,
     position: Point<Pixels>,
     entries: Vec<ContextMenuEntry>,
+    open_with_target: Option<PathBuf>,
+    open_with_apps: Vec<AppInfo>,
     focused_index: Option<usize>,
     hovered_index: Option<usize>,
     open_submenu: Option<usize>,
@@ -537,6 +585,8 @@ impl ContextMenuView {
             is_open: false,
             position: point(px(0.), px(0.)),
             entries: Vec::new(),
+            open_with_target: None,
+            open_with_apps: Vec::new(),
             focused_index: None,
             hovered_index: None,
             open_submenu: None,
@@ -553,6 +603,14 @@ impl ContextMenuView {
 
     pub fn entries(&self) -> &[ContextMenuEntry] {
         &self.entries
+    }
+
+    pub fn open_with_target(&self) -> Option<&PathBuf> {
+        self.open_with_target.as_ref()
+    }
+
+    pub fn open_with_apps(&self) -> &[AppInfo] {
+        &self.open_with_apps
     }
 
     pub fn position(&self) -> Point<Pixels> {
@@ -578,16 +636,20 @@ impl ContextMenuView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (selected, folder_bookmarked, folder_state, undo_label) = {
+        let (selected, folder_bookmarked, open_with_target, folder_state, undo_label) = {
             let state = self.app_state.read(cx);
             let selected = state.selected_locations();
-            let folder_bookmarked = match (state.selected_entries().as_slice(), selected.as_slice())
-            {
-                ([entry], [Location::Local(path)]) if entry.is_dir() => {
-                    Some(state.is_place_pinned(path))
-                }
-                _ => None,
-            };
+            let (folder_bookmarked, open_with_target) =
+                match (state.selected_entries().as_slice(), selected.as_slice()) {
+                    ([entry], [Location::Local(path)]) => {
+                        if entry.is_dir() || path.is_dir() {
+                            (Some(state.is_place_pinned(path)), None)
+                        } else {
+                            (None, Some(path.clone()))
+                        }
+                    }
+                    _ => (None, None),
+                };
             let folder_state = FolderMenuState {
                 view_mode: state.view_mode,
                 sort_column: state.sort_column,
@@ -601,15 +663,25 @@ impl ContextMenuView {
             (
                 selected,
                 folder_bookmarked,
+                open_with_target,
                 folder_state,
                 state.undo_stack.undo_label(),
             )
         };
         let has_clipboard = get_location_clipboard().is_some();
+        let open_with_apps = open_with_target
+            .as_deref()
+            .map(menu_applications_for)
+            .unwrap_or_default();
+        self.open_with_target = open_with_target;
+        self.open_with_apps = open_with_apps;
         self.entries = build_context_menu_entries(
             &selected,
             has_clipboard,
             folder_bookmarked,
+            self.open_with_target
+                .as_ref()
+                .map(|_| self.open_with_apps.as_slice()),
             folder_state,
             undo_label,
         );
@@ -635,6 +707,8 @@ impl ContextMenuView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_with_target = None;
+        self.open_with_apps.clear();
         self.entries = build_sidebar_place_menu_entries(index, is_trash);
         self.position = position;
         self.focused_index = first_enabled_index_in(&self.entries);
@@ -656,6 +730,8 @@ impl ContextMenuView {
         }
         self.is_open = false;
         self.entries.clear();
+        self.open_with_target = None;
+        self.open_with_apps.clear();
         self.focused_index = None;
         self.hovered_index = None;
         self.open_submenu = None;
@@ -802,7 +878,9 @@ fn menu_action_icon(action: ContextMenuAction) -> Option<IconName> {
         ContextMenuAction::NewFolder => Some(IconName::Folder),
         ContextMenuAction::Refresh => Some(IconName::Refresh),
         ContextMenuAction::SidebarRemove(_) => Some(IconName::Close),
-        ContextMenuAction::Rename
+        ContextMenuAction::OpenWithApp(_)
+        | ContextMenuAction::OpenWithOther
+        | ContextMenuAction::Rename
         | ContextMenuAction::Bookmark
         | ContextMenuAction::Cut
         | ContextMenuAction::Paste
@@ -978,7 +1056,13 @@ impl Render for ContextMenuView {
                                     }),
                                 )
                         })
-                        .child(div().flex().items_center().gap(space::S8).child(*label))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(space::S8)
+                                .child(SharedString::from(label.clone())),
+                        )
                         .child(animated_icon(
                             IconName::ChevronRight,
                             IconMotion::Rest,
@@ -1096,7 +1180,7 @@ impl Render for ContextMenuView {
                                 .items_center()
                                 .gap(space::S8)
                                 .children(icon_el)
-                                .child(*label),
+                                .child(SharedString::from(label.clone())),
                         )
                         .when_some(*shortcut, |el, key| {
                             el.child(
@@ -1219,10 +1303,17 @@ impl Render for ContextMenuView {
                                 .child(
                                     div()
                                         .flex()
+                                        .flex_1()
+                                        .min_w_0()
                                         .items_center()
                                         .gap(space::S8)
                                         .children(icon_el)
-                                        .child(*label),
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .ellipsize()
+                                                .child(SharedString::from(label.clone())),
+                                        ),
                                 )
                                 .when_some(*shortcut, |el, key| {
                                     el.child(

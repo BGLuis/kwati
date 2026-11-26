@@ -37,6 +37,7 @@ use gpui::{
 use kwati_core::{Location, SortColumn, SortDirection, ViewMode};
 
 use crate::actions::navigation::{SetViewCompact, SetViewDetails, SetViewGrid};
+use crate::actions::open_with::{launch_application, OpenWithPicker};
 use crate::actions::operations::{
     self, apply_undo_result, copy_locations_to_clipboard, cut_locations_to_clipboard,
     get_location_clipboard, run_undo_step,
@@ -526,6 +527,30 @@ impl MainView {
         });
     }
 
+    fn on_open_with_picker(
+        &mut self,
+        _: &OpenWithPicker,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.list_has_keyboard(window, cx) {
+            return;
+        }
+        let target = {
+            let state = self.app_state.read(cx);
+            let selected = state.selected_locations();
+            match (state.selected_entries().as_slice(), selected.as_slice()) {
+                ([entry], [Location::Local(path)]) if !entry.is_dir() && !path.is_dir() => {
+                    Some(path.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(path) = target {
+            self.open_dialog(window, cx, |dialogs, cx| dialogs.open_open_with(path, cx));
+        }
+    }
+
     fn execute_context_menu_action(
         &mut self,
         action: ContextMenuAction,
@@ -536,6 +561,79 @@ impl MainView {
             ContextMenuAction::Open => {
                 self.list.update(cx, |list, cx| list.open_selected(cx));
                 self.list.read(cx).focus_handle.focus(window);
+            }
+            ContextMenuAction::OpenWithApp(index) => {
+                let (target, app) = {
+                    let menu = self.context_menu.read(cx);
+                    (
+                        menu.open_with_target().cloned(),
+                        menu.open_with_apps().get(index).cloned(),
+                    )
+                };
+                self.list.read(cx).focus_handle.focus(window);
+                if let (Some(target), Some(app)) = (target, app) {
+                    let app_name = app.name.clone();
+                    cx.spawn(async move |this, cx| {
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move { launch_application(&app, &target) })
+                            .await;
+                        if let Err(err) = result {
+                            let _ = this.update(cx, |this, cx| {
+                                this.set_status(
+                                    format!("Failed to open with {app_name}: {err}"),
+                                    cx,
+                                );
+                            });
+                        }
+                    })
+                    .detach();
+                } else {
+                    self.set_status("No application selected", cx);
+                }
+            }
+            ContextMenuAction::OpenWithOther => {
+                let target = self.context_menu.read(cx).open_with_target().cloned();
+                self.list.read(cx).focus_handle.focus(window);
+                let Some(target) = target else {
+                    self.set_status("No local file selected", cx);
+                    return;
+                };
+                let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: false,
+                    prompt: Some("Choose application".into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    let chosen = match rx.await {
+                        Ok(Ok(Some(paths))) => match paths.into_iter().next() {
+                            Some(path) => path,
+                            None => return,
+                        },
+                        Ok(Ok(None)) => return,
+                        Ok(Err(err)) => {
+                            let _ = this.update(cx, |this, cx| {
+                                this.set_status(format!("Failed to choose application: {err}"), cx);
+                            });
+                            return;
+                        }
+                        Err(_) => return,
+                    };
+                    let exe = chosen.to_string_lossy().into_owned();
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            kwati_core::open_with_executable(&exe, &[target.as_path()])
+                        })
+                        .await;
+                    if let Err(err) = result {
+                        let _ = this.update(cx, |this, cx| {
+                            this.set_status(format!("Failed to open application: {err}"), cx);
+                        });
+                    }
+                })
+                .detach();
             }
             ContextMenuAction::Rename => self.open_rename_for_selection(window, cx),
             ContextMenuAction::Bookmark => {
@@ -900,6 +998,7 @@ impl Render for MainView {
             .on_action(cx.listener(Self::on_trash))
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_rename))
+            .on_action(cx.listener(Self::on_open_with_picker))
             .on_action(cx.listener(Self::on_new_folder))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_open_settings))
