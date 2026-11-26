@@ -20,6 +20,7 @@ mod smb;
 mod stream;
 mod transfer;
 mod trash;
+pub mod undo;
 pub mod volume;
 pub mod volumes;
 mod watcher;
@@ -75,6 +76,10 @@ pub use trash::{
     empty_trash, is_restore_conflict, is_trash_browsing_supported, is_trash_unavailable,
     list_trash, purge_trash_items, restore_conflict, restore_trash_items, trash, trash_with,
     RestoreConflict, TrashItem, TrashUnavailable,
+};
+pub use undo::{
+    is_undo_refused, CopiedEntry, MovedEntry, PathSnapshot, TrashedTarget, UndoAction, UndoRefused,
+    UndoStack, DEFAULT_MAX_UNDO,
 };
 pub use volume::{volume_kind, VolumeKind};
 pub use volumes::{
