@@ -3,6 +3,7 @@ pub mod chunking;
 mod connection;
 mod copy;
 mod delete;
+pub mod drives;
 mod ftp;
 pub mod icons;
 mod move_entry;
@@ -33,6 +34,7 @@ pub use copy::{
     copy_entry, ConflictPolicy, CopyOptions, CopyOutcome, Progress, DEFAULT_CHUNK_SIZE,
 };
 pub use delete::{delete_permanently, Confirmed};
+pub use drives::{eject, mount, unmounted_drives, DriveError, UnmountedDrive};
 pub use ftp::{CertificateInvalid, FtpBackend, TlsUnavailable};
 pub use icons::{
     default_icon_color, default_icons_path, freedesktop_candidates, group_for_type_key,
