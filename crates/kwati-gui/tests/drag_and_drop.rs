@@ -231,14 +231,12 @@ fn validate_internal_and_external_drop_refuses_self_and_subfolders() {
     std::fs::create_dir_all(&grandchild).unwrap();
     std::fs::create_dir_all(&sibling).unwrap();
 
-    let dragged_parent = DragEntries {
-        items: vec![DraggedEntry {
-            location: Location::Local(parent.clone()),
-            is_dir: true,
-            name: "parent".into(),
-            icon: IconName::Folder,
-        }],
-    };
+    let dragged_parent = DragEntries::from_items(vec![DraggedEntry {
+        location: Location::Local(parent.clone()),
+        is_dir: true,
+        name: "parent".into(),
+        icon: IconName::Folder,
+    }]);
 
     for op in [DropOperation::Move, DropOperation::Copy] {
         assert_eq!(
@@ -834,14 +832,12 @@ fn fast_drag_over_helpers_match_drop_policy_without_syscalls() {
     assert_eq!(mount_point_for_lexical(&file_a, &mounts), vol_a.as_path());
     assert_eq!(mount_point_for_lexical(&vol_b, &mounts), vol_b.as_path());
 
-    let dragged_file = DragEntries {
-        items: vec![DraggedEntry {
-            location: Location::Local(file_a.clone()),
-            is_dir: false,
-            name: "item.txt".into(),
-            icon: IconName::File,
-        }],
-    };
+    let dragged_file = DragEntries::from_items(vec![DraggedEntry {
+        location: Location::Local(file_a.clone()),
+        is_dir: false,
+        name: "item.txt".into(),
+        icon: IconName::File,
+    }]);
     let sub_loc = Location::Local(sub_a.clone());
     let vol_b_loc = Location::Local(vol_b.clone());
     let vol_a_loc = Location::Local(vol_a.clone());
@@ -868,14 +864,12 @@ fn fast_drag_over_helpers_match_drop_policy_without_syscalls() {
         Ok(())
     );
 
-    let dragged_dir = DragEntries {
-        items: vec![DraggedEntry {
-            location: Location::Local(vol_a.clone()),
-            is_dir: true,
-            name: "vol_a".into(),
-            icon: IconName::Folder,
-        }],
-    };
+    let dragged_dir = DragEntries::from_items(vec![DraggedEntry {
+        location: Location::Local(vol_a.clone()),
+        is_dir: true,
+        name: "vol_a".into(),
+        icon: IconName::Folder,
+    }]);
     assert_eq!(
         validate_internal_drop_fast(&dragged_dir, &sub_loc, DropOperation::Move),
         Err(DropRejection::IntoSelfOrSubfolder)
@@ -887,4 +881,112 @@ fn fast_drag_over_helpers_match_drop_policy_without_syscalls() {
     assert_eq!(validate_external_drop_fast(&[file_a], &sub_loc), Ok(()));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn large_multi_selection_drag_and_drop_policy_and_child_mount_checks() {
+    let root = temp_dir("large_multi_policy");
+    let vol_a = root.join("vol_a");
+    let vol_b = root.join("vol_b");
+    let sub_dir = vol_a.join("dragged_dir");
+    let nested_dir = sub_dir.join("nested");
+    let sibling_dir = vol_a.join("sibling_dir");
+    let child_mount = vol_a.join("child_mount");
+    std::fs::create_dir_all(&nested_dir).unwrap();
+    std::fs::create_dir_all(&sibling_dir).unwrap();
+    std::fs::create_dir_all(&vol_b).unwrap();
+    std::fs::create_dir_all(&child_mount).unwrap();
+
+    let mut items = Vec::with_capacity(5_000);
+    items.push(DraggedEntry {
+        location: Location::Local(sub_dir.clone()),
+        is_dir: true,
+        name: "dragged_dir".into(),
+        icon: IconName::Folder,
+    });
+    for i in 0..4_999 {
+        items.push(DraggedEntry {
+            location: Location::Local(vol_a.join(format!("file_{i:04}.txt"))),
+            is_dir: false,
+            name: format!("file_{i:04}.txt"),
+            icon: IconName::File,
+        });
+    }
+    let dragged = DragEntries::from_items(items.clone());
+
+    let mounts = vec![
+        root.clone(),
+        vol_a.clone(),
+        vol_b.clone(),
+        child_mount.clone(),
+    ];
+    let vol_a_loc = Location::Local(vol_a.clone());
+    let vol_b_loc = Location::Local(vol_b.clone());
+    let sibling_loc = Location::Local(sibling_dir.clone());
+    let sub_loc = Location::Local(sub_dir.clone());
+    let nested_loc = Location::Local(nested_dir.clone());
+
+    assert_eq!(
+        resolve_drop_operation_for_drag(&dragged, &sibling_loc, Modifiers::none(), &mounts),
+        DropOperation::Move
+    );
+    assert_eq!(
+        resolve_drop_operation_for_drag(&dragged, &vol_b_loc, Modifiers::none(), &mounts),
+        DropOperation::Copy
+    );
+    assert_eq!(
+        validate_internal_drop_fast(&dragged, &vol_a_loc, DropOperation::Move),
+        Err(DropRejection::AlreadyInFolder)
+    );
+    assert_eq!(
+        validate_internal_drop_fast(&dragged, &vol_a_loc, DropOperation::Copy),
+        Ok(())
+    );
+    assert_eq!(
+        validate_internal_drop_fast(&dragged, &sub_loc, DropOperation::Move),
+        Err(DropRejection::IntoSelfOrSubfolder)
+    );
+    assert_eq!(
+        validate_internal_drop_fast(&dragged, &nested_loc, DropOperation::Copy),
+        Err(DropRejection::IntoSelfOrSubfolder)
+    );
+    assert_eq!(
+        validate_internal_drop_fast(&dragged, &sibling_loc, DropOperation::Move),
+        Ok(())
+    );
+
+    let sources = dragged.locations();
+    let op =
+        resolve_drop_operation_for_os(&sources, &sibling_loc, Modifiers::none(), false, &mounts);
+    assert_eq!(op, DropOperation::Move);
+    assert_eq!(validate_internal_drop(&dragged, &sibling_loc, op), Ok(()));
+    assert_eq!(
+        validate_internal_drop(&dragged, &nested_loc, op),
+        Err(DropRejection::IntoSelfOrSubfolder)
+    );
+    assert_eq!(
+        validate_internal_drop(&dragged, &vol_a_loc, DropOperation::Move),
+        Err(DropRejection::AlreadyInFolder)
+    );
+
+    // If a dragged child under `vol_a` is itself a separate mount point, moving onto `sibling_loc`
+    // must become a cross-volume `Copy`.
+    items.push(DraggedEntry {
+        location: Location::Local(child_mount),
+        is_dir: true,
+        name: "child_mount".into(),
+        icon: IconName::Folder,
+    });
+    let dragged_with_mount = DragEntries::from_items(items);
+    assert_eq!(
+        resolve_drop_operation_for_drag(
+            &dragged_with_mount,
+            &sibling_loc,
+            Modifiers::none(),
+            &mounts
+        ),
+        DropOperation::Copy
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

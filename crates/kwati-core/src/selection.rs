@@ -5,11 +5,20 @@ use std::collections::HashSet;
 ///
 /// Keeps track of an anchor for range-based selections and allows selecting, toggling,
 /// inverting, and reconciling selections across directory reloads.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Selection {
     anchor: Option<Location>,
     selected: HashSet<Location>,
+    revision: u64,
 }
+
+impl PartialEq for Selection {
+    fn eq(&self, other: &Self) -> bool {
+        self.anchor == other.anchor && self.selected == other.selected
+    }
+}
+
+impl Eq for Selection {}
 
 impl Selection {
     /// Creates a new, empty selection with no anchor.
@@ -17,7 +26,17 @@ impl Selection {
         Self {
             anchor: None,
             selected: HashSet::new(),
+            revision: 0,
         }
+    }
+
+    /// Returns a monotonically wrapping revision counter bumped on selection mutations.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Returns a reference to the current anchor location, if one is set.
@@ -28,6 +47,7 @@ impl Selection {
     /// Sets or clears the anchor location.
     pub fn set_anchor<T: Into<Location>>(&mut self, anchor: Option<T>) {
         self.anchor = anchor.map(Into::into);
+        self.bump_revision();
     }
 
     /// Returns `true` if the given location is currently selected.
@@ -65,6 +85,7 @@ impl Selection {
         let loc = location.into();
         self.selected.insert(loc.clone());
         self.anchor = Some(loc);
+        self.bump_revision();
     }
 
     /// Deselects a location. If it was the anchor, resets the anchor to `None`.
@@ -73,6 +94,7 @@ impl Selection {
         if self.anchor.as_ref() == Some(location) {
             self.anchor = None;
         }
+        self.bump_revision();
     }
 
     /// Clears previous selection and selects only the given location, moving the anchor to it.
@@ -89,6 +111,7 @@ impl Selection {
             self.selected.insert(loc.clone());
         }
         self.anchor = Some(loc);
+        self.bump_revision();
     }
 
     /// Selects every entry between the anchor and the target in list order.
@@ -133,6 +156,7 @@ impl Selection {
             self.selected.insert(loc.clone());
             range_locations.push(loc);
         }
+        self.bump_revision();
 
         range_locations
     }
@@ -156,12 +180,14 @@ impl Selection {
         for entry in entries {
             self.selected.insert(Location::from(entry));
         }
+        self.bump_revision();
     }
 
     /// Clears the selection and resets the anchor.
     pub fn clear(&mut self) {
         self.selected.clear();
         self.anchor = None;
+        self.bump_revision();
     }
 
     /// Inverts the selection across the entries in the given slice.
@@ -183,6 +209,7 @@ impl Selection {
                 self.anchor = None;
             }
         }
+        self.bump_revision();
     }
 
     /// Reconciles the selection after a reload: keeps selected entries that still exist in
@@ -196,6 +223,7 @@ impl Selection {
                 self.anchor = None;
             }
         }
+        self.bump_revision();
     }
 
     /// Reconciles the selection against a slice of [`Location`]s directly.
@@ -207,6 +235,7 @@ impl Selection {
                 self.anchor = None;
             }
         }
+        self.bump_revision();
     }
 
     /// Alias for [`reload`].
@@ -266,6 +295,7 @@ impl FromIterator<Location> for Selection {
         Self {
             anchor: None,
             selected,
+            revision: 0,
         }
     }
 }

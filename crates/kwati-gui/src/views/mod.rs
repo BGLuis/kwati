@@ -59,6 +59,17 @@ use crate::tokens::{size, space, Fonts, TextRole};
 use crate::views::list_view::{format_modified, format_size};
 use crate::views::search_view::ToggleSearch;
 
+#[derive(Clone, PartialEq, Eq)]
+struct StatusSummaryKey {
+    listing_revision: u64,
+    selection_revision: u64,
+    trash_active: bool,
+    view_mode: ViewMode,
+    sort_column: SortColumn,
+    sort_direction: SortDirection,
+    show_hidden: bool,
+}
+
 /// The root shell view of kwati-gui.
 pub struct MainView {
     pub app_state: Entity<AppState>,
@@ -83,6 +94,7 @@ pub struct MainView {
     last_status_revision: u64,
     status_pop_started_at: Option<Instant>,
     undo_in_flight: bool,
+    cached_status_summary: Option<(StatusSummaryKey, u64, String)>,
 }
 
 impl MainView {
@@ -300,6 +312,7 @@ impl MainView {
             last_status_revision: initial_status_rev,
             status_pop_started_at: None,
             undo_in_flight: false,
+            cached_status_summary: None,
         }
     }
 }
@@ -877,14 +890,38 @@ impl Render for MainView {
             shown_sidebar_width,
         ) = {
             let state = self.app_state.read(cx);
-            let (count, sel_count, sel_bytes) = if state.trash_active {
-                (state.trash_items.len(), state.trash_selection.len(), 0)
+            let summary_key = StatusSummaryKey {
+                listing_revision: state.listing_revision,
+                selection_revision: state.selection.revision(),
+                trash_active: state.trash_active,
+                view_mode: state.view_mode,
+                sort_column: state.sort_column,
+                sort_direction: state.sort_direction,
+                show_hidden: state.show_hidden,
+            };
+            let (sel_bytes, view_metadata) = match &self.cached_status_summary {
+                Some((cached_key, cached_bytes, cached_meta)) if cached_key == &summary_key => {
+                    (*cached_bytes, cached_meta.clone())
+                }
+                _ => {
+                    let bytes = if state.trash_active {
+                        0
+                    } else {
+                        state.selected_total_size()
+                    };
+                    let meta = if state.trash_active {
+                        String::new()
+                    } else {
+                        format_status_selection_metadata(state)
+                    };
+                    self.cached_status_summary = Some((summary_key, bytes, meta.clone()));
+                    (bytes, meta)
+                }
+            };
+            let (count, sel_count) = if state.trash_active {
+                (state.trash_items.len(), state.trash_selection.len())
             } else {
-                (
-                    state.entries.len(),
-                    state.selection.len(),
-                    state.selected_total_size(),
-                )
+                (state.entries.len(), state.selection.len())
             };
             (
                 state.panels.resolve(window_width),
@@ -892,11 +929,7 @@ impl Render for MainView {
                 count,
                 sel_count,
                 sel_bytes,
-                if state.trash_active {
-                    String::new()
-                } else {
-                    format_status_selection_metadata(state)
-                },
+                view_metadata,
                 state.status_message.clone(),
                 state.status_revision,
                 state.status_is_completion,

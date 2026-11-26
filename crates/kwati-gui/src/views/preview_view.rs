@@ -578,11 +578,7 @@ impl PreviewView {
 
         let (listed, remote_ctx) = {
             let state = app_state.read(cx);
-            let listed = state
-                .entries
-                .iter()
-                .find(|entry| entry.path == path)
-                .cloned();
+            let listed = state.entry_by_path(&path).cloned();
             let remote_ctx = if matches!(location, Location::Remote { .. }) {
                 Some((
                     state.backend_for(&location),

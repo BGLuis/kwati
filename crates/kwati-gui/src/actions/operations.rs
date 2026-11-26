@@ -24,7 +24,13 @@ actions!(
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_JOB_CANCELS: Mutex<Option<HashMap<u64, Arc<AtomicBool>>>> = Mutex::new(None);
-static CLIPBOARD: Mutex<Option<LocationClipboard>> = Mutex::new(None);
+static CLIPBOARD: Mutex<Option<StoredClipboard>> = Mutex::new(None);
+
+#[derive(Clone)]
+struct StoredClipboard {
+    clipboard: LocationClipboard,
+    cut_set: Arc<HashSet<Location>>,
+}
 
 /// Location-aware clipboard contents for Copy and Cut/Paste across local and remote backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,22 +48,45 @@ pub struct Clipboard {
 
 pub fn copy_locations_to_clipboard(sources: Vec<Location>) {
     let mut cb = CLIPBOARD.lock().unwrap();
-    *cb = Some(LocationClipboard {
-        sources,
-        is_cut: false,
+    *cb = Some(StoredClipboard {
+        clipboard: LocationClipboard {
+            sources,
+            is_cut: false,
+        },
+        cut_set: Arc::new(HashSet::new()),
     });
 }
 
 pub fn cut_locations_to_clipboard(sources: Vec<Location>) {
+    let cut_set = Arc::new(sources.iter().cloned().collect());
     let mut cb = CLIPBOARD.lock().unwrap();
-    *cb = Some(LocationClipboard {
-        sources,
-        is_cut: true,
+    *cb = Some(StoredClipboard {
+        clipboard: LocationClipboard {
+            sources,
+            is_cut: true,
+        },
+        cut_set,
     });
 }
 
 pub fn get_location_clipboard() -> Option<LocationClipboard> {
-    CLIPBOARD.lock().unwrap().clone()
+    CLIPBOARD
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|stored| stored.clipboard.clone())
+}
+
+/// Returns whether the clipboard currently holds any locations in O(1) without cloning them.
+pub fn has_location_clipboard() -> bool {
+    CLIPBOARD.lock().unwrap().is_some()
+}
+
+/// Returns the cached `HashSet` of cut locations in O(1) via `Arc::clone` when a Cut is active.
+pub fn cut_location_set() -> Option<Arc<HashSet<Location>>> {
+    let guard = CLIPBOARD.lock().unwrap();
+    let stored = guard.as_ref()?;
+    stored.clipboard.is_cut.then(|| Arc::clone(&stored.cut_set))
 }
 
 pub fn copy_to_clipboard(sources: Vec<PathBuf>) {

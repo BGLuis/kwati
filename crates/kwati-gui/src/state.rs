@@ -197,6 +197,7 @@ pub enum TrashSortColumn {
 pub struct AppState {
     pub current_location: Location,
     pub entries: Arc<Vec<Entry>>,
+    entry_index: HashMap<PathBuf, usize>,
     pub selection: Selection,
     pub trash_active: bool,
     pub trash_items: Arc<Vec<TrashItem>>,
@@ -280,6 +281,7 @@ impl AppState {
             history: History::with_initial(initial_location.clone()),
             current_location: initial_location,
             entries: Arc::new(Vec::new()),
+            entry_index: HashMap::new(),
             selection: Selection::new(),
             trash_active: false,
             trash_items: Arc::new(Vec::new()),
@@ -2052,9 +2054,39 @@ impl AppState {
             .retain(|(_, ts)| now.saturating_duration_since(*ts) < JOB_COMPLETE_HOLD);
         self.recent_deletions
             .retain(|(_, ts)| now.saturating_duration_since(*ts) < JOB_COMPLETE_HOLD);
+        self.entry_index = entries
+            .iter()
+            .enumerate()
+            .map(|(ix, e)| (e.path.clone(), ix))
+            .collect();
         self.entries = Arc::new(entries);
         let listed: Vec<Location> = self.entries.iter().map(|e| self.location_of(e)).collect();
         self.selection.reload_locations(&listed);
+    }
+
+    fn matches_current_backend(&self, loc: &Location) -> bool {
+        match (&self.current_location, loc) {
+            (Location::Local(_), Location::Local(_)) => true,
+            (Location::Remote { profile_id: a, .. }, Location::Remote { profile_id: b, .. }) => {
+                a == b
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the listed index for `path` in O(1) when `entry_index` is synchronized.
+    pub fn entry_index_of(&self, path: &Path) -> Option<usize> {
+        if self.entry_index.len() == self.entries.len() {
+            self.entry_index.get(path).copied()
+        } else {
+            self.entries.iter().position(|e| e.path == path)
+        }
+    }
+
+    /// Returns the listed [`Entry`] for `path` in O(1) when `entry_index` is synchronized.
+    pub fn entry_by_path(&self, path: &Path) -> Option<&Entry> {
+        self.entry_index_of(path)
+            .and_then(|ix| self.entries.get(ix))
     }
 
     /// Marks user-created, renamed, or pasted locations to receive the `accent` entrance flash.
@@ -2108,6 +2140,20 @@ impl AppState {
         if self.selection.is_empty() {
             return 0;
         }
+        if self.entry_index.len() == self.entries.len() {
+            return self
+                .selection
+                .iter()
+                .filter(|loc| self.matches_current_backend(loc))
+                .filter_map(|loc| {
+                    self.entry_index
+                        .get(loc.path())
+                        .and_then(|&ix| self.entries.get(ix))
+                })
+                .filter(|entry| !entry.is_dir())
+                .filter_map(|entry| entry.size)
+                .sum();
+        }
         if self.selection.len() == 1 {
             return self
                 .selected_entry()
@@ -2158,11 +2204,11 @@ impl AppState {
             return;
         };
         let target_loc = self.location_of(target_entry);
-        let anchor_idx = self.selection.anchor().and_then(|anchor| {
-            self.entries
-                .iter()
-                .position(|e| &self.location_of(e) == anchor)
-        });
+        let anchor_idx = self
+            .selection
+            .anchor()
+            .filter(|anchor| self.matches_current_backend(anchor))
+            .and_then(|anchor| self.entry_index_of(anchor.path()));
         let (start, end, preserved_anchor) = match anchor_idx {
             Some(a_idx) => {
                 let anchor_loc = self.location_of(&self.entries[a_idx]);
@@ -2220,6 +2266,23 @@ impl AppState {
     pub fn selected_index(&self) -> Option<usize> {
         if self.selection.is_empty() {
             return None;
+        }
+        if self.entry_index.len() == self.entries.len() {
+            if self.selection.len() == 1 {
+                let loc = self.selection.iter().next()?;
+                return self
+                    .matches_current_backend(loc)
+                    .then(|| self.entry_index.get(loc.path()).copied())
+                    .flatten();
+            }
+            if self.selection.len().saturating_mul(4) < self.entries.len() {
+                return self
+                    .selection
+                    .iter()
+                    .filter(|loc| self.matches_current_backend(loc))
+                    .filter_map(|loc| self.entry_index.get(loc.path()).copied())
+                    .min();
+            }
         }
         self.entries
             .iter()

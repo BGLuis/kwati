@@ -245,3 +245,68 @@ fn selection_all_clear_invert() {
     assert!(!selection.is_selected(&loc_x));
     assert!(!selection.is_selected(&loc_z));
 }
+
+#[test]
+fn selection_revision_increments_on_mutations_and_equality_ignores_revision() {
+    let test_dir = TestDir::new("selection_revision");
+    let base = test_dir.path();
+    std::fs::write(base.join("a.txt"), b"").unwrap();
+    std::fs::write(base.join("b.txt"), b"").unwrap();
+
+    let listing = list_dir(base).unwrap();
+    let entries = listing.entries();
+    let loc_a = entries[0].location();
+    let loc_b = entries[1].location();
+
+    let mut sel1 = Selection::new();
+    let mut sel2 = Selection::new();
+    assert_eq!(sel1.revision(), 0);
+
+    sel1.select(&loc_a);
+    let r1 = sel1.revision();
+    assert!(r1 > 0);
+
+    sel1.toggle(&loc_b);
+    let r2 = sel1.revision();
+    assert!(r2 > r1);
+
+    sel1.deselect(&loc_b);
+    let r3 = sel1.revision();
+    assert!(r3 > r2);
+
+    sel1.set_anchor(Some(loc_b.clone()));
+    let r4 = sel1.revision();
+    assert!(r4 > r3);
+
+    sel1.range_from_anchor(&loc_a, &listing);
+    let r5 = sel1.revision();
+    assert!(r5 > r4);
+
+    sel1.invert(&listing);
+    let r6 = sel1.revision();
+    assert!(r6 > r5);
+
+    sel1.reload(&listing);
+    let r7 = sel1.revision();
+    assert!(r7 > r6);
+
+    sel1.reload_locations(&[loc_a.clone(), loc_b.clone()]);
+    let r8 = sel1.revision();
+    assert!(r8 > r7);
+
+    sel1.select_all(&listing);
+    let r9 = sel1.revision();
+    assert!(r9 > r8);
+
+    sel1.clear();
+    let r10 = sel1.revision();
+    assert!(r10 > r9);
+
+    sel1.select_only(&loc_a);
+    let r11 = sel1.revision();
+    assert!(r11 > r10);
+
+    sel2.select_only(&loc_a);
+    assert_ne!(sel1.revision(), sel2.revision());
+    assert_eq!(sel1, sel2);
+}

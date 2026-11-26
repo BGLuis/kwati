@@ -1017,7 +1017,7 @@ impl SidebarView {
                     state.set_status(err);
                 });
             }
-        } else if !dragged.items.is_empty() {
+        } else if !dragged.is_empty() {
             self.app_state.update(cx, |state, _| {
                 state.set_status("Apenas pastas locais podem ser fixadas em Places.");
             });

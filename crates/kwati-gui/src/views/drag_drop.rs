@@ -132,14 +132,29 @@ pub fn resolve_drop_operation_for_os_drag(
     is_macos: bool,
     mounts: &[PathBuf],
 ) -> DropOperation {
-    if is_copy_modifier_for_os(modifiers, is_macos) {
+    if is_copy_modifier_for_os(modifiers, is_macos) || dragged.is_empty() {
         return DropOperation::Copy;
     }
-    if !dragged.items.is_empty()
-        && dragged
-            .items
-            .iter()
-            .all(|item| same_volume_lexical(&item.location, dest_dir, mounts))
+    if let Some(parent) = dragged.common_parent() {
+        let dragged_contains_child_mount = match parent {
+            Location::Local(parent_path) => mounts.iter().any(|m| {
+                m.parent() == Some(parent_path.as_path())
+                    && dragged.contains_location(&Location::Local(m.clone()))
+            }),
+            Location::Remote { .. } => false,
+        };
+        if !dragged_contains_child_mount {
+            return if same_volume_lexical(parent, dest_dir, mounts) {
+                DropOperation::Move
+            } else {
+                DropOperation::Copy
+            };
+        }
+    }
+    if dragged
+        .items()
+        .iter()
+        .all(|item| same_volume_lexical(&item.location, dest_dir, mounts))
     {
         DropOperation::Move
     } else {
@@ -175,21 +190,44 @@ pub fn validate_internal_drop_fast(
     dest_dir: &Location,
     operation: DropOperation,
 ) -> Result<(), DropRejection> {
-    if dragged.items.is_empty() {
+    if dragged.is_empty() {
         return Err(DropRejection::Empty);
     }
-    for item in &dragged.items {
-        if is_self_or_subfolder_lexical(&item.location, item.is_dir, dest_dir) {
-            return Err(DropRejection::IntoSelfOrSubfolder);
+    if dragged.contains_location(dest_dir) {
+        return Err(DropRejection::IntoSelfOrSubfolder);
+    }
+    if let Some(dir_locs) = dragged.dir_locations() {
+        if !dir_locs.is_empty() {
+            let mut cur = dest_dir.parent();
+            while let Some(anc) = cur {
+                if dir_locs.contains(&anc) {
+                    return Err(DropRejection::IntoSelfOrSubfolder);
+                }
+                if dragged.common_parent() == Some(&anc) {
+                    break;
+                }
+                cur = anc.parent();
+            }
+        }
+    } else {
+        for item in dragged.items() {
+            if is_self_or_subfolder_lexical(&item.location, item.is_dir, dest_dir) {
+                return Err(DropRejection::IntoSelfOrSubfolder);
+            }
         }
     }
-    if operation.is_move()
-        && dragged
-            .items
-            .iter()
-            .all(|item| item.location.parent().as_ref() == Some(dest_dir))
-    {
-        return Err(DropRejection::AlreadyInFolder);
+    if operation.is_move() {
+        let already_in = if dragged.is_payload_resolved() {
+            dragged.common_parent() == Some(dest_dir)
+        } else {
+            dragged
+                .items()
+                .iter()
+                .all(|item| item.location.parent().as_ref() == Some(dest_dir))
+        };
+        if already_in {
+            return Err(DropRejection::AlreadyInFolder);
+        }
     }
     Ok(())
 }
@@ -302,6 +340,77 @@ pub fn resolve_drop_operation(
     )
 }
 
+struct PreparedMount<'a> {
+    raw: &'a Path,
+    raw_depth: usize,
+    norm: PathBuf,
+    norm_depth: usize,
+}
+
+fn prepare_mounts(mounts: &[PathBuf]) -> Vec<PreparedMount<'_>> {
+    mounts
+        .iter()
+        .map(|mount| {
+            let norm = normalize_path(mount);
+            let norm_depth = norm.components().count();
+            PreparedMount {
+                raw: mount.as_path(),
+                raw_depth: mount.components().count(),
+                norm,
+                norm_depth,
+            }
+        })
+        .collect()
+}
+
+fn mount_point_for_prepared<'a>(
+    path: &Path,
+    normalized: &'a Path,
+    prepared: &'a [PreparedMount<'a>],
+) -> &'a Path {
+    let mut best: Option<(usize, &'a Path)> = None;
+    for mount in prepared {
+        let matched = if path.starts_with(mount.raw) {
+            Some((mount.raw_depth, mount.norm.as_path()))
+        } else if normalized.starts_with(&mount.norm) {
+            Some((mount.norm_depth, mount.norm.as_path()))
+        } else {
+            None
+        };
+        if let Some((depth, key)) = matched {
+            if best.is_none_or(|(best_depth, _)| depth > best_depth) {
+                best = Some((depth, key));
+            }
+        }
+    }
+    best.map(|(_, key)| key)
+        .unwrap_or_else(|| normalized.ancestors().last().unwrap_or(normalized))
+}
+
+fn is_symlink_path(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+fn normalize_with_parent_cache(
+    path: &Path,
+    cached_parent: &mut Option<(PathBuf, PathBuf)>,
+) -> PathBuf {
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if !is_symlink_path(path) {
+            let parent_norm = match cached_parent {
+                Some((prev_raw, prev_norm)) if prev_raw.as_path() == parent => prev_norm.clone(),
+                _ => {
+                    let norm = normalize_path(parent);
+                    *cached_parent = Some((parent.to_path_buf(), norm.clone()));
+                    norm
+                }
+            };
+            return parent_norm.join(name);
+        }
+    }
+    normalize_path(path)
+}
+
 /// Pure OS-parameterized helper for [`resolve_drop_operation`].
 pub fn resolve_drop_operation_for_os(
     sources: &[Location],
@@ -310,13 +419,44 @@ pub fn resolve_drop_operation_for_os(
     is_macos: bool,
     mounts: &[PathBuf],
 ) -> DropOperation {
-    if is_copy_modifier_for_os(modifiers, is_macos) {
+    if is_copy_modifier_for_os(modifiers, is_macos) || sources.is_empty() {
         return DropOperation::Copy;
     }
-    if !sources.is_empty() && sources.iter().all(|src| same_volume(src, dest_dir, mounts)) {
-        DropOperation::Move
-    } else {
-        DropOperation::Copy
+    match dest_dir {
+        Location::Remote {
+            profile_id: dst_profile,
+            ..
+        } => {
+            if sources.iter().all(|src| {
+                matches!(
+                    src,
+                    Location::Remote { profile_id, .. } if profile_id == dst_profile
+                )
+            }) {
+                DropOperation::Move
+            } else {
+                DropOperation::Copy
+            }
+        }
+        Location::Local(dst_path) => {
+            let prepared = prepare_mounts(mounts);
+            let dst_norm = normalize_path(dst_path);
+            let dst_mount = mount_point_for_prepared(dst_path, &dst_norm, &prepared);
+            let mut cached_parent: Option<(PathBuf, PathBuf)> = None;
+            let all_same = sources.iter().all(|src| match src {
+                Location::Local(src_path) => {
+                    let src_norm = normalize_with_parent_cache(src_path, &mut cached_parent);
+                    let src_mount = mount_point_for_prepared(src_path, &src_norm, &prepared);
+                    src_mount == dst_mount
+                }
+                Location::Remote { .. } => false,
+            });
+            if all_same {
+                DropOperation::Move
+            } else {
+                DropOperation::Copy
+            }
+        }
     }
 }
 
@@ -332,10 +472,7 @@ pub fn is_self_or_subfolder(src: &Location, src_is_dir: bool, dest_dir: &Locatio
             }
             let src_norm = normalize_path(src_path);
             let dst_norm = normalize_path(dst_path);
-            if src_norm == dst_norm || (src_is_dir && dst_norm.starts_with(&src_norm)) {
-                return true;
-            }
-            false
+            src_norm == dst_norm || (src_is_dir && dst_norm.starts_with(&src_norm))
         }
         (
             Location::Remote {
@@ -357,21 +494,49 @@ pub fn validate_internal_drop(
     dest_dir: &Location,
     operation: DropOperation,
 ) -> Result<(), DropRejection> {
-    if dragged.items.is_empty() {
+    if dragged.is_empty() {
         return Err(DropRejection::Empty);
     }
-    for item in &dragged.items {
-        if is_self_or_subfolder(&item.location, item.is_dir, dest_dir) {
-            return Err(DropRejection::IntoSelfOrSubfolder);
+    if dragged.contains_location(dest_dir) {
+        return Err(DropRejection::IntoSelfOrSubfolder);
+    }
+    match dest_dir {
+        Location::Local(dst_path) => {
+            let dst_norm = normalize_path(dst_path);
+            let mut cached_parent: Option<(PathBuf, PathBuf)> = None;
+            for item in dragged.items() {
+                let Location::Local(src_path) = &item.location else {
+                    continue;
+                };
+                if src_path == dst_path || (item.is_dir && dst_path.starts_with(src_path)) {
+                    return Err(DropRejection::IntoSelfOrSubfolder);
+                }
+                let src_norm = normalize_with_parent_cache(src_path, &mut cached_parent);
+                if src_norm == dst_norm || (item.is_dir && dst_norm.starts_with(&src_norm)) {
+                    return Err(DropRejection::IntoSelfOrSubfolder);
+                }
+            }
+        }
+        Location::Remote { .. } => {
+            for item in dragged.items() {
+                if is_self_or_subfolder(&item.location, item.is_dir, dest_dir) {
+                    return Err(DropRejection::IntoSelfOrSubfolder);
+                }
+            }
         }
     }
-    if operation.is_move()
-        && dragged
-            .items
-            .iter()
-            .all(|item| item.location.parent().as_ref() == Some(dest_dir))
-    {
-        return Err(DropRejection::AlreadyInFolder);
+    if operation.is_move() {
+        let already_in = if dragged.is_payload_resolved() {
+            dragged.common_parent() == Some(dest_dir)
+        } else {
+            dragged
+                .items()
+                .iter()
+                .all(|item| item.location.parent().as_ref() == Some(dest_dir))
+        };
+        if already_in {
+            return Err(DropRejection::AlreadyInFolder);
+        }
     }
     Ok(())
 }

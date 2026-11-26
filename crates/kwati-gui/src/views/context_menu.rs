@@ -9,10 +9,12 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
     Point, SharedString, Size, Window,
 };
-use kwati_core::{all_local_volumes, Location, SortColumn, SortDirection, ViewMode};
+use kwati_core::{
+    all_local_volumes, volume_kind, Location, SortColumn, SortDirection, ViewMode, VolumeKind,
+};
 
 use crate::actions::open_with::{menu_applications_for, AppInfo};
-use crate::actions::operations::get_location_clipboard;
+use crate::actions::operations::has_location_clipboard;
 use crate::components::{animated_icon, popup_entrance_metrics, Ellipsize, IconMotion, IconName};
 use crate::motion::{
     color_lerp, is_reduced_motion, request_frame_if_active, Curve, MotionKind, MotionTracker,
@@ -159,6 +161,26 @@ const UNDO_SHORTCUT: &str = if cfg!(target_os = "macos") {
 } else {
     "Ctrl+Z"
 };
+
+fn build_multi_selection_menu_entries(trash_available: bool) -> Vec<ContextMenuEntry> {
+    let remove_label = if trash_available {
+        "Move to Trash"
+    } else {
+        "Delete Permanently"
+    };
+    vec![
+        menu_item(ContextMenuAction::Copy, "Copy", Some("Ctrl+C"), true, false),
+        menu_item(ContextMenuAction::Cut, "Cut", Some("Ctrl+X"), true, false),
+        ContextMenuEntry::Separator,
+        menu_item(
+            ContextMenuAction::Remove,
+            remove_label,
+            Some("Delete"),
+            true,
+            true,
+        ),
+    ]
+}
 
 /// Builds the context menu entries applicable to the current selection, clipboard, and undo stack.
 /// `folder_bookmarked` is `Some` when the selection is a single local folder, telling whether
@@ -377,18 +399,7 @@ pub fn build_context_menu_entries(
         ]);
         entries
     } else {
-        vec![
-            menu_item(ContextMenuAction::Copy, "Copy", Some("Ctrl+C"), true, false),
-            menu_item(ContextMenuAction::Cut, "Cut", Some("Ctrl+X"), true, false),
-            ContextMenuEntry::Separator,
-            menu_item(
-                ContextMenuAction::Remove,
-                remove_label,
-                Some("Delete"),
-                true,
-                true,
-            ),
-        ]
+        build_multi_selection_menu_entries(trash_available)
     }
 }
 
@@ -641,20 +652,51 @@ impl ContextMenuView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (selected, folder_bookmarked, open_with_target, folder_state, undo_label) = {
+        enum MenuSelectionKind {
+            Empty,
+            Single {
+                location: Location,
+                folder_bookmarked: Option<bool>,
+                open_with_target: Option<PathBuf>,
+            },
+            Multi {
+                trash_available: bool,
+            },
+        }
+
+        let (selection_kind, folder_state, undo_label) = {
             let state = self.app_state.read(cx);
-            let selected = state.selected_locations();
-            let (folder_bookmarked, open_with_target) =
-                match (state.selected_entries().as_slice(), selected.as_slice()) {
-                    ([entry], [Location::Local(path)]) => {
-                        if entry.is_dir() || path.is_dir() {
-                            (Some(state.is_place_pinned(path)), None)
-                        } else {
-                            (None, Some(path.clone()))
+            let selection_kind = match state.selection.len() {
+                0 => MenuSelectionKind::Empty,
+                1 => match state.selected_entry() {
+                    Some(entry) => {
+                        let location = state.location_of(entry);
+                        let (folder_bookmarked, open_with_target) = match &location {
+                            Location::Local(path) => {
+                                if entry.is_dir() || path.is_dir() {
+                                    (Some(state.is_place_pinned(path)), None)
+                                } else {
+                                    (None, Some(path.clone()))
+                                }
+                            }
+                            Location::Remote { .. } => (None, None),
+                        };
+                        MenuSelectionKind::Single {
+                            location,
+                            folder_bookmarked,
+                            open_with_target,
                         }
                     }
-                    _ => (None, None),
-                };
+                    None => MenuSelectionKind::Empty,
+                },
+                _ => {
+                    let trash_available = match &state.current_location {
+                        Location::Local(dir) => volume_kind(dir) == VolumeKind::Local,
+                        Location::Remote { .. } => false,
+                    };
+                    MenuSelectionKind::Multi { trash_available }
+                }
+            };
             let folder_state = FolderMenuState {
                 view_mode: state.view_mode,
                 sort_column: state.sort_column,
@@ -665,31 +707,50 @@ impl ContextMenuView {
                 show_sidebar: state.panels.sidebar_open,
                 show_preview: state.panels.preview_open,
             };
-            (
-                selected,
+            (selection_kind, folder_state, state.undo_stack.undo_label())
+        };
+        let has_clipboard = has_location_clipboard();
+        match selection_kind {
+            MenuSelectionKind::Empty => {
+                self.open_with_target = None;
+                self.open_with_apps.clear();
+                self.entries = build_context_menu_entries(
+                    &[],
+                    has_clipboard,
+                    None,
+                    None,
+                    folder_state,
+                    undo_label,
+                );
+            }
+            MenuSelectionKind::Single {
+                location,
                 folder_bookmarked,
                 open_with_target,
-                folder_state,
-                state.undo_stack.undo_label(),
-            )
-        };
-        let has_clipboard = get_location_clipboard().is_some();
-        let open_with_apps = open_with_target
-            .as_deref()
-            .map(menu_applications_for)
-            .unwrap_or_default();
-        self.open_with_target = open_with_target;
-        self.open_with_apps = open_with_apps;
-        self.entries = build_context_menu_entries(
-            &selected,
-            has_clipboard,
-            folder_bookmarked,
-            self.open_with_target
-                .as_ref()
-                .map(|_| self.open_with_apps.as_slice()),
-            folder_state,
-            undo_label,
-        );
+            } => {
+                let open_with_apps = open_with_target
+                    .as_deref()
+                    .map(menu_applications_for)
+                    .unwrap_or_default();
+                self.open_with_target = open_with_target;
+                self.open_with_apps = open_with_apps;
+                self.entries = build_context_menu_entries(
+                    std::slice::from_ref(&location),
+                    has_clipboard,
+                    folder_bookmarked,
+                    self.open_with_target
+                        .as_ref()
+                        .map(|_| self.open_with_apps.as_slice()),
+                    folder_state,
+                    undo_label,
+                );
+            }
+            MenuSelectionKind::Multi { trash_available } => {
+                self.open_with_target = None;
+                self.open_with_apps.clear();
+                self.entries = build_multi_selection_menu_entries(trash_available);
+            }
+        }
         self.position = position;
         self.focused_index = first_enabled_index_in(&self.entries);
         self.hovered_index = None;

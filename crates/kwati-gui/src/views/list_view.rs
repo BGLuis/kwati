@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use gpui::{
@@ -24,7 +25,7 @@ use crate::actions::navigation::{
     ClearSelection, GoBack, GoForward, GoUp, OpenContextMenu, OpenSelected, PageDown, PageUp,
     Refresh, SelectAll, SelectFirst, SelectLast, SelectNext, SelectPrevious, ToggleHidden,
 };
-use crate::actions::operations::get_location_clipboard;
+use crate::actions::operations::cut_location_set;
 use crate::components::interactive::focus_ring_color;
 use crate::components::{
     fast_icon_for_entry, icon_for_entry, probe_entry_icon, render_resolved_icon,
@@ -100,12 +101,19 @@ pub fn format_modified(time: Option<std::time::SystemTime>) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hours, minutes)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RubberBandSelection {
+    Range(usize, usize),
+    Indices(Vec<usize>),
+}
+
 /// Active rubber-band drag rectangle in window coordinates.
 #[derive(Clone, Debug)]
 struct RubberBand {
     start: Point<Pixels>,
     current: Point<Pixels>,
-    base_selection: Option<HashSet<Location>>,
+    base_selection: Option<Arc<HashSet<Location>>>,
+    last_touched: Option<RubberBandSelection>,
 }
 
 impl RubberBand {
@@ -177,7 +185,7 @@ pub struct ListView {
     grid_columns: usize,
     last_view_mode: ViewMode,
     rubber_band: Option<RubberBand>,
-    dragging_locations: HashSet<Location>,
+    dragging_locations: Arc<HashSet<Location>>,
     hovered_location: Option<Location>,
     pressed_location: Option<Location>,
     hovered_header: Option<u8>,
@@ -245,7 +253,7 @@ impl ListView {
             grid_columns: DEFAULT_GRID_COLUMNS,
             last_view_mode: initial_mode,
             rubber_band: None,
-            dragging_locations: HashSet::new(),
+            dragging_locations: Arc::new(HashSet::new()),
             hovered_location: None,
             pressed_location: None,
             hovered_header: None,
@@ -657,7 +665,9 @@ impl ListView {
         }
         self.focus_handle.focus(window);
         let base_selection = if event.modifiers.secondary() {
-            Some(self.app_state.read(cx).selection.locations().clone())
+            Some(Arc::new(
+                self.app_state.read(cx).selection.locations().clone(),
+            ))
         } else {
             self.app_state.update(cx, |state, cx| {
                 if !state.selection.is_empty() {
@@ -671,6 +681,7 @@ impl ListView {
             start: event.position,
             current: event.position,
             base_selection,
+            last_touched: None,
         });
         cx.notify();
     }
@@ -741,10 +752,29 @@ impl ListView {
                             }
                         }
                     }
-                    self.app_state.update(cx, |state, cx| {
-                        state.select_indices(touched, base_selection.as_ref());
-                        cx.notify();
-                    });
+                    let next = RubberBandSelection::Indices(touched);
+                    let changed = self
+                        .rubber_band
+                        .as_ref()
+                        .is_some_and(|rb| rb.last_touched.as_ref() != Some(&next));
+                    if changed {
+                        if let Some(rb) = self.rubber_band.as_mut() {
+                            rb.last_touched = Some(next);
+                        }
+                        if let Some(RubberBandSelection::Indices(indices)) = self
+                            .rubber_band
+                            .as_ref()
+                            .and_then(|rb| rb.last_touched.as_ref())
+                        {
+                            self.app_state.update(cx, |state, cx| {
+                                state.select_indices(
+                                    indices.iter().copied(),
+                                    base_selection.as_deref(),
+                                );
+                                cx.notify();
+                            });
+                        }
+                    }
                 }
             } else {
                 let row_h = self.effective_row_height(view_mode, entry_count);
@@ -753,15 +783,40 @@ impl ListView {
                     let bottom_rel = (bottom - list_bounds.top() - scroll_offset.y).max(px(0.));
                     let r_start = ((top_rel / row_h).floor() as usize).min(entry_count - 1);
                     let r_end = ((bottom_rel / row_h).floor() as usize).min(entry_count - 1);
-                    self.app_state.update(cx, |state, cx| {
-                        let touched = (r_start..=r_end).filter(|&ix| {
-                            let row_top = list_bounds.top() + row_h * (ix as f32) + scroll_offset.y;
-                            let row_bottom = row_top + row_h;
-                            row_bottom > top && row_top < bottom
+                    let mut range_opt: Option<(usize, usize)> = None;
+                    for ix in r_start..=r_end {
+                        let row_top = list_bounds.top() + row_h * (ix as f32) + scroll_offset.y;
+                        let row_bottom = row_top + row_h;
+                        if row_bottom > top && row_top < bottom {
+                            match &mut range_opt {
+                                Some((_, end)) => *end = ix,
+                                None => range_opt = Some((ix, ix)),
+                            }
+                        }
+                    }
+                    let next = match range_opt {
+                        Some((start, end)) => RubberBandSelection::Range(start, end),
+                        None => RubberBandSelection::Indices(Vec::new()),
+                    };
+                    let changed = self
+                        .rubber_band
+                        .as_ref()
+                        .is_some_and(|rb| rb.last_touched.as_ref() != Some(&next));
+                    if changed {
+                        if let Some(rb) = self.rubber_band.as_mut() {
+                            rb.last_touched = Some(next);
+                        }
+                        self.app_state.update(cx, |state, cx| {
+                            match range_opt {
+                                Some((start, end)) => {
+                                    state.select_indices(start..=end, base_selection.as_deref())
+                                }
+                                None => state
+                                    .select_indices(std::iter::empty(), base_selection.as_deref()),
+                            }
+                            cx.notify();
                         });
-                        state.select_indices(touched, base_selection.as_ref());
-                        cx.notify();
-                    });
+                    }
                 }
             }
         }
@@ -1126,16 +1181,117 @@ pub struct DraggedEntry {
     pub icon: IconName,
 }
 
+#[derive(Debug)]
+struct DragEntriesPayload {
+    items: Vec<DraggedEntry>,
+    locations: Arc<HashSet<Location>>,
+    common_parent: Option<Location>,
+    dir_locations: HashSet<Location>,
+}
+
+impl DragEntriesPayload {
+    fn from_items(items: Vec<DraggedEntry>) -> Self {
+        let locations = Arc::new(items.iter().map(|i| i.location.clone()).collect());
+        let common_parent = items.first().and_then(|first| {
+            let parent = first.location.parent()?;
+            items
+                .iter()
+                .all(|i| i.location.parent().as_ref() == Some(&parent))
+                .then_some(parent)
+        });
+        let dir_locations = items
+            .iter()
+            .filter(|i| i.is_dir)
+            .map(|i| i.location.clone())
+            .collect();
+        Self {
+            items,
+            locations,
+            common_parent,
+            dir_locations,
+        }
+    }
+}
+
 /// Drag payload produced when dragging one or more entries from [`ListView`].
+///
+/// Pre-drag row rendering attaches lightweight lazy handles without cloning all selected items;
+/// the full payload and O(1) lookup indices are resolved once in `.on_drag`.
 #[derive(Clone, Debug)]
 pub struct DragEntries {
-    pub items: Vec<DraggedEntry>,
+    payload: Arc<OnceLock<DragEntriesPayload>>,
+    pending_single: Option<DraggedEntry>,
 }
 
 impl DragEntries {
+    /// Creates a resolved drag payload from an explicit list of entries.
+    pub fn from_items(items: Vec<DraggedEntry>) -> Self {
+        let lock = OnceLock::new();
+        let _ = lock.set(DragEntriesPayload::from_items(items));
+        Self {
+            payload: Arc::new(lock),
+            pending_single: None,
+        }
+    }
+
+    pub(crate) fn pending_single(item: DraggedEntry) -> Self {
+        Self {
+            payload: Arc::new(OnceLock::new()),
+            pending_single: Some(item),
+        }
+    }
+
+    pub(crate) fn pending_selection() -> Self {
+        Self {
+            payload: Arc::new(OnceLock::new()),
+            pending_single: None,
+        }
+    }
+
+    pub(crate) fn resolve_on_drag_start(&self, state: &AppState) {
+        self.payload.get_or_init(|| {
+            if let Some(single) = &self.pending_single {
+                DragEntriesPayload::from_items(vec![single.clone()])
+            } else {
+                let items = state
+                    .selected_entries()
+                    .into_iter()
+                    .map(|e| DraggedEntry {
+                        location: state.location_of(e),
+                        is_dir: e.is_dir(),
+                        name: e.display_name().to_string(),
+                        icon: if e.is_dir() {
+                            IconName::Folder
+                        } else {
+                            IconName::File
+                        },
+                    })
+                    .collect();
+                DragEntriesPayload::from_items(items)
+            }
+        });
+    }
+
+    /// Returns all carried entries (or the single pending entry prior to drag start).
+    pub fn items(&self) -> &[DraggedEntry] {
+        if let Some(payload) = self.payload.get() {
+            &payload.items
+        } else {
+            self.pending_single.as_slice()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items().is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items().len()
+    }
+
     /// Returns the path and name if this drag carries a single local directory.
     pub fn single_local_folder(&self) -> Option<(&Path, &str)> {
-        let [item] = self.items.as_slice() else {
+        let [item] = self.items() else {
             return None;
         };
         if !item.is_dir {
@@ -1148,7 +1304,31 @@ impl DragEntries {
     }
 
     pub fn locations(&self) -> Vec<Location> {
-        self.items.iter().map(|i| i.location.clone()).collect()
+        self.items().iter().map(|i| i.location.clone()).collect()
+    }
+
+    pub(crate) fn locations_set(&self) -> Option<Arc<HashSet<Location>>> {
+        self.payload.get().map(|p| Arc::clone(&p.locations))
+    }
+
+    pub(crate) fn is_payload_resolved(&self) -> bool {
+        self.payload.get().is_some()
+    }
+
+    pub(crate) fn common_parent(&self) -> Option<&Location> {
+        self.payload.get().and_then(|p| p.common_parent.as_ref())
+    }
+
+    pub(crate) fn dir_locations(&self) -> Option<&HashSet<Location>> {
+        self.payload.get().map(|p| &p.dir_locations)
+    }
+
+    pub(crate) fn contains_location(&self, loc: &Location) -> bool {
+        if let Some(payload) = self.payload.get() {
+            payload.locations.contains(loc)
+        } else {
+            self.items().iter().any(|i| &i.location == loc)
+        }
     }
 }
 
@@ -1551,37 +1731,12 @@ impl ListView {
     }
 
     fn single_drag_entry(entry: &Entry, loc: &Location, glyph: IconName) -> DragEntries {
-        DragEntries {
-            items: vec![DraggedEntry {
-                location: loc.clone(),
-                is_dir: entry.is_dir(),
-                name: entry.display_name().to_string(),
-                icon: glyph,
-            }],
-        }
-    }
-
-    fn multi_drag_entries(&self, cx: &Context<Self>) -> Option<DragEntries> {
-        let state = self.app_state.read(cx);
-        if state.selection.len() <= 1 {
-            return None;
-        }
-        let items = state
-            .selection
-            .selected_in_order(&state.entries)
-            .into_iter()
-            .map(|e| DraggedEntry {
-                location: state.location_of(e),
-                is_dir: e.is_dir(),
-                name: e.display_name().to_string(),
-                icon: if e.is_dir() {
-                    IconName::Folder
-                } else {
-                    IconName::File
-                },
-            })
-            .collect();
-        Some(DragEntries { items })
+        DragEntries::pending_single(DraggedEntry {
+            location: loc.clone(),
+            is_dir: entry.is_dir(),
+            name: entry.display_name().to_string(),
+            icon: glyph,
+        })
     }
 
     pub fn handle_entries_drop(
@@ -1675,28 +1830,28 @@ impl ListView {
             }))
             .when_some(drag_entries, |el, drag_entries| {
                 el.on_drag(drag_entries, move |dragged, _, _, cx| {
-                    let _ = list_handle.update(cx, |this, cx| {
-                        this.dragging_locations = dragged.locations().into_iter().collect();
-                        cx.notify();
-                    });
-                    let label = match dragged.items.as_slice() {
-                        [only] => only.name.clone(),
-                        [first, ..] => format!("{} (+{})", first.name, dragged.items.len() - 1),
-                        [] => String::new(),
-                    };
-                    let icon = dragged
-                        .items
-                        .first()
-                        .map(|i| i.icon)
-                        .unwrap_or(IconName::File);
-                    let theme = Theme::get(cx);
                     let (icon_prefs, icon_resolver) = {
                         let state = app_state_for_drag.read(cx);
+                        dragged.resolve_on_drag_start(state);
                         (
                             state.icon_config.active.clone(),
                             state.icon_resolver.clone(),
                         )
                     };
+                    let _ = list_handle.update(cx, |this, cx| {
+                        this.dragging_locations = dragged
+                            .locations_set()
+                            .unwrap_or_else(|| Arc::new(dragged.locations().into_iter().collect()));
+                        cx.notify();
+                    });
+                    let items = dragged.items();
+                    let label = match items {
+                        [only] => only.name.clone(),
+                        [first, ..] => format!("{} (+{})", first.name, items.len() - 1),
+                        [] => String::new(),
+                    };
+                    let icon = items.first().map(|i| i.icon).unwrap_or(IconName::File);
+                    let theme = Theme::get(cx);
                     let icon_color = if icon.is_folder() {
                         resolve_icon_color(icon.key_name(), &icon_prefs, &theme)
                     } else {
@@ -2202,7 +2357,7 @@ impl ListView {
 impl Render for ListView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !cx.has_active_drag() && !self.dragging_locations.is_empty() {
-            self.dragging_locations.clear();
+            self.dragging_locations = Arc::new(HashSet::new());
         }
         let has_active_drag = cx.has_active_drag();
         let theme = Theme::get(cx);
@@ -2308,10 +2463,7 @@ impl Render for ListView {
         );
         self.scrollbar_state.is_dragging = self.scrollbar_drag.borrow().is_dragging;
 
-        let cut_sources: HashSet<Location> = get_location_clipboard()
-            .filter(|c| c.is_cut)
-            .map(|c| c.sources.into_iter().collect())
-            .unwrap_or_default();
+        let cut_sources = cut_location_set();
         let list_focused = self.focus_handle.is_focused(window);
 
         let header_hovers = [
@@ -2792,16 +2944,10 @@ impl Render for ListView {
                                               cx| {
                                             let mut items: Vec<gpui::AnyElement> =
                                                 Vec::with_capacity(range.len());
-                                            let visible_rows: Vec<(
-                                                usize,
-                                                Location,
-                                                bool,
-                                                bool,
-                                                bool,
-                                            )> = {
+                                            let (visible_rows, selected_count): (Vec<_>, usize) = {
                                                 let state = this.app_state.read(cx);
                                                 let sel = &state.selection;
-                                                match view_mode {
+                                                let rows = match view_mode {
                                                     ViewMode::Details | ViewMode::CompactList => {
                                                         range
                                                             .clone()
@@ -2816,8 +2962,11 @@ impl Render for ListView {
                                                                         && focused_location
                                                                             .as_ref()
                                                                             == Some(&loc);
-                                                                    let is_cut =
-                                                                        cut_sources.contains(&loc);
+                                                                    let is_cut = cut_sources
+                                                                        .as_deref()
+                                                                        .is_some_and(|s| {
+                                                                            s.contains(&loc)
+                                                                        });
                                                                     (
                                                                         ix,
                                                                         loc,
@@ -2849,8 +2998,11 @@ impl Render for ListView {
                                                                         && focused_location
                                                                             .as_ref()
                                                                             == Some(&loc);
-                                                                    let is_cut =
-                                                                        cut_sources.contains(&loc);
+                                                                    let is_cut = cut_sources
+                                                                        .as_deref()
+                                                                        .is_some_and(|s| {
+                                                                            s.contains(&loc)
+                                                                        });
                                                                     out.push((
                                                                         ix,
                                                                         loc,
@@ -2863,14 +3015,12 @@ impl Render for ListView {
                                                         }
                                                         out
                                                     }
-                                                }
+                                                };
+                                                (rows, sel.len())
                                             };
 
-                                            let multi_drag = if has_active_drag {
-                                                None
-                                            } else {
-                                                this.multi_drag_entries(cx)
-                                            };
+                                            let multi_drag = (!has_active_drag && selected_count > 1)
+                                                .then(DragEntries::pending_selection);
 
                                             match view_mode {
                                                 ViewMode::Details | ViewMode::CompactList => {

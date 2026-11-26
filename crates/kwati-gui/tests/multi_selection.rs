@@ -8,8 +8,11 @@ use gpui::{
     point, px, size, AppContext as _, Entity, Modifiers, MouseButton, Pixels, Point,
     TestAppContext, VisualTestContext,
 };
-use kwati_core::Location;
-use kwati_gui::actions::operations::clear_clipboard;
+use kwati_core::{Entry, Location};
+use kwati_gui::actions::operations::{
+    clear_clipboard, copy_locations_to_clipboard, cut_location_set, cut_locations_to_clipboard,
+    has_location_clipboard,
+};
 use kwati_gui::actions::register_keybindings;
 use kwati_gui::components::register_text_input_keybindings;
 use kwati_gui::state::AppState;
@@ -288,4 +291,71 @@ fn three_selected_entries_copy_paste_and_prompt_once_on_delete(cx: &mut TestAppC
     }
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn large_directory_selection_lookups_total_size_and_cut_cache() {
+    let _clipboard = clipboard();
+    let dir = PathBuf::from("/tmp/kwati_large_selection_in_memory");
+    let mut state = AppState::new(Location::Local(dir.clone()));
+
+    let entries: Vec<Entry> = (0..5_000usize)
+        .map(|i| {
+            let is_dir = i % 10 == 0;
+            let name = format!("item_{i:04}");
+            let mut entry = Entry::new(name.clone().into(), dir.join(&name), is_dir);
+            if !is_dir {
+                entry = entry.with_size((i as u64) + 1);
+            }
+            entry
+        })
+        .collect();
+    let total_all_files: u64 = entries
+        .iter()
+        .filter(|e| !e.is_dir())
+        .filter_map(|e| e.size)
+        .sum();
+    state.set_entries(entries);
+
+    assert_eq!(state.selected_index(), None);
+    assert_eq!(state.selected_total_size(), 0);
+    assert!(state.entry_by_path(&dir.join("item_4321")).is_some());
+
+    let rev_0 = state.selection.revision();
+    state.select_index(4_321);
+    assert!(state.selection.revision() > rev_0);
+    assert_eq!(state.selected_index(), Some(4_321));
+    assert_eq!(state.selected_total_size(), 4_322);
+
+    state.select_range_to(4_325, false);
+    assert_eq!(state.selected_count(), 5);
+    assert_eq!(state.selected_index(), Some(4_321));
+    // 4321..=4325 are all non-dirs (none divisible by 10): sizes 4322..=4326
+    assert_eq!(
+        state.selected_total_size(),
+        4_322 + 4_323 + 4_324 + 4_325 + 4_326
+    );
+
+    state.select_all_entries();
+    assert_eq!(state.selected_count(), 5_000);
+    assert_eq!(state.selected_index(), Some(0));
+    assert_eq!(state.selected_total_size(), total_all_files);
+
+    let locs = state.selected_locations();
+    copy_locations_to_clipboard(locs.clone());
+    assert!(has_location_clipboard());
+    assert!(cut_location_set().is_none());
+
+    cut_locations_to_clipboard(locs.clone());
+    assert!(has_location_clipboard());
+    let set_1 = cut_location_set().expect("cut set should be cached");
+    let set_2 = cut_location_set().expect("cut set should be shared via Arc");
+    assert!(std::sync::Arc::ptr_eq(&set_1, &set_2));
+    assert_eq!(set_1.len(), 5_000);
+    assert!(set_1.contains(&locs[0]));
+    assert!(set_1.contains(&locs[4_999]));
+
+    clear_clipboard();
+    assert!(!has_location_clipboard());
+    assert!(cut_location_set().is_none());
 }

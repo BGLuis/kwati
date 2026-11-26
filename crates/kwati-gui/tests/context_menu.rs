@@ -1176,3 +1176,64 @@ fn open_with_submenu_launches_desktop_script_and_reports_missing_executable(
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[gpui::test]
+fn context_menu_open_at_handles_large_multi_selection_without_open_with(cx: &mut TestAppContext) {
+    let _clipboard = clipboard();
+    let root = fixture("large_multi_menu");
+    let (main, cx) = open_window(cx, &root);
+
+    let synthetic_entries: Vec<Entry> = (0..2_000usize)
+        .map(|i| {
+            let name = format!("bulk_{i:04}.txt");
+            Entry::new(name.clone().into(), root.join(&name), false).with_size(1)
+        })
+        .collect();
+
+    main.update(cx, |main, cx| {
+        main.app_state.update(cx, |state, cx| {
+            state.set_entries(synthetic_entries);
+            state.select_all_entries();
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("shift-f10");
+    cx.run_until_parked();
+
+    assert!(is_menu_open(&main, cx));
+    assert_eq!(
+        menu_actions(&main, cx),
+        [
+            ContextMenuAction::Copy,
+            ContextMenuAction::Cut,
+            ContextMenuAction::Remove,
+        ]
+    );
+    assert!(menu_submenu_labels(&main, cx).is_empty());
+    let has_open_with_apps = main.read_with(cx, |main, cx| {
+        !main.context_menu.read(cx).open_with_apps().is_empty()
+            || main.context_menu.read(cx).open_with_target().is_some()
+    });
+    assert!(!has_open_with_apps);
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Clearing selection switches back to the empty-space context menu.
+    main.update(cx, |main, cx| {
+        main.app_state.update(cx, |state, cx| {
+            state.clear_selection();
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-f10");
+    cx.run_until_parked();
+    assert!(is_menu_open(&main, cx));
+    assert!(menu_actions(&main, cx).contains(&ContextMenuAction::Paste));
+    assert!(menu_actions(&main, cx).contains(&ContextMenuAction::NewFolder));
+
+    let _ = fs::remove_dir_all(&root);
+}
