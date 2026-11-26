@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 
-use kwati_core::{list_dir, ConflictPolicy, CopyOutcome, Location};
+use kwati_core::{
+    is_trash_browsing_supported, list_dir, list_trash, purge_trash_items, Confirmed,
+    ConflictPolicy, CopyOutcome, Location, TrashItem,
+};
 use kwati_gui::actions::operations::{
     check_paste_conflict, clear_clipboard, copy_to_clipboard, cut_to_clipboard, execute_copy,
     execute_create_folder, execute_move, execute_permanent_delete, execute_rename, execute_trash,
@@ -24,6 +27,51 @@ fn create_temp_test_dir(name: &str) -> PathBuf {
     dir.push(format!("kwati_test_guiops_{}_{}_{}", name, time, id));
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+fn normalize_test_dir(raw: PathBuf) -> PathBuf {
+    let canon = raw.canonicalize().unwrap_or(raw);
+    #[cfg(windows)]
+    {
+        let s = canon.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    canon
+}
+
+struct TrashTestDir {
+    path: PathBuf,
+}
+
+impl TrashTestDir {
+    fn new(name: &str) -> Self {
+        // trash::delete canonicalizes parent directories (and strips \\?\ on Windows), so match
+        // the exact form stored in the system trash.
+        let path = normalize_test_dir(create_temp_test_dir(name));
+        Self { path }
+    }
+}
+
+impl Drop for TrashTestDir {
+    fn drop(&mut self) {
+        if is_trash_browsing_supported() {
+            if let Ok(items) = list_trash() {
+                let leftovers: Vec<TrashItem> = items
+                    .into_iter()
+                    .filter(|item| item.original_parent == self.path)
+                    .collect();
+                if !leftovers.is_empty() {
+                    let _ = purge_trash_items(&leftovers, Confirmed::user_confirmed());
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 // =========================================================================
@@ -171,12 +219,12 @@ fn test_create_folder_refuses_existing() {
 
 #[test]
 fn test_trash_success_removes_entry_and_records_undo() {
-    let test_dir = create_temp_test_dir("trash_success");
-    let file_path = test_dir.join("to_trash.txt");
+    let test_dir = TrashTestDir::new("trash_success");
+    let file_path = test_dir.path.join("to_trash.txt");
     fs::write(&file_path, "trash content").unwrap();
 
-    let mut state = AppState::new(Location::Local(test_dir.clone()));
-    let initial_listing = list_dir(&test_dir).unwrap();
+    let mut state = AppState::new(Location::Local(test_dir.path.clone()));
+    let initial_listing = list_dir(&test_dir.path).unwrap();
     state.set_entries(initial_listing.into_entries());
     state
         .selection
@@ -201,8 +249,6 @@ fn test_trash_success_removes_entry_and_records_undo() {
         assert!(state.status_message.is_some());
         assert!(state.status_message.unwrap().contains("trash"));
     }
-
-    let _ = fs::remove_dir_all(test_dir);
 }
 
 #[test]
