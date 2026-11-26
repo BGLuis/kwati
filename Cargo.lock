@@ -3714,6 +3714,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "serde",
+ "serde_json",
  "smb",
  "suppaftp",
  "sysinfo 0.40.3",
@@ -3722,6 +3723,7 @@ dependencies = [
  "trash",
  "windows-native-keyring-store",
  "windows-sys 0.61.2",
+ "zbus",
  "zbus-secret-service-keyring-store",
 ]
 
