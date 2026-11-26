@@ -7,7 +7,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
@@ -41,8 +40,9 @@ use crate::state::{entry_location, AppState, EntryChangeOrigin, NavigationDirect
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, Fonts, TextRole, BODY_SIZE};
 use crate::views::drag_drop::{
-    is_copy_modifier, resolve_drop_operation, validate_external_drop, validate_internal_drop,
-    DropOperation, DropRejection,
+    is_copy_modifier, resolve_drop_operation, resolve_drop_operation_for_drag,
+    validate_external_drop, validate_external_drop_fast, validate_internal_drop,
+    validate_internal_drop_fast, DropOperation, DropRejection,
 };
 
 /// Formats a file size in human-readable units (B, KB, MB, GB, TB).
@@ -1155,24 +1155,14 @@ impl DragEntries {
 struct DragEntriesPreview {
     label: String,
     icon: IconName,
-    icon_prefs: IconPreferences,
-    icon_resolver: Arc<IconResolver>,
+    resolved_icon: ResolvedIcon,
+    icon_color: Hsla,
 }
 
 impl Render for DragEntriesPreview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
         let copy_mode = is_copy_modifier(window.modifiers());
-        let color = if self.icon.is_folder() {
-            resolve_icon_color(self.icon.key_name(), &self.icon_prefs, &theme)
-        } else {
-            theme.text.into()
-        };
-        let resolved = self.icon_resolver.resolve(
-            &self.icon_prefs,
-            self.icon.key_name(),
-            (size::ICON / px(1.0)).round().max(1.0) as u16,
-        );
 
         div()
             .h(size::ROW)
@@ -1189,11 +1179,11 @@ impl Render for DragEntriesPreview {
             .text_body()
             .text_color(theme.text)
             .child(render_resolved_icon(
-                &resolved,
+                &self.resolved_icon,
                 self.icon,
                 IconMotion::Rest,
                 size::ICON,
-                color,
+                self.icon_color,
             ))
             .child(self.label.clone())
             .when(copy_mode, |preview| {
@@ -1560,41 +1550,38 @@ impl ListView {
         }
     }
 
-    fn drag_entries_for(
-        &self,
-        entry: &Entry,
-        loc: &Location,
-        glyph: IconName,
-        cx: &Context<Self>,
-    ) -> DragEntries {
-        let state = self.app_state.read(cx);
-        if state.selection.len() > 1 && state.selection.contains(loc) {
-            let items = state
-                .selection
-                .selected_in_order(&state.entries)
-                .into_iter()
-                .map(|e| DraggedEntry {
-                    location: state.location_of(e),
-                    is_dir: e.is_dir(),
-                    name: e.display_name().to_string(),
-                    icon: if e.is_dir() {
-                        IconName::Folder
-                    } else {
-                        IconName::File
-                    },
-                })
-                .collect();
-            DragEntries { items }
-        } else {
-            DragEntries {
-                items: vec![DraggedEntry {
-                    location: loc.clone(),
-                    is_dir: entry.is_dir(),
-                    name: entry.display_name().to_string(),
-                    icon: glyph,
-                }],
-            }
+    fn single_drag_entry(entry: &Entry, loc: &Location, glyph: IconName) -> DragEntries {
+        DragEntries {
+            items: vec![DraggedEntry {
+                location: loc.clone(),
+                is_dir: entry.is_dir(),
+                name: entry.display_name().to_string(),
+                icon: glyph,
+            }],
         }
+    }
+
+    fn multi_drag_entries(&self, cx: &Context<Self>) -> Option<DragEntries> {
+        let state = self.app_state.read(cx);
+        if state.selection.len() <= 1 {
+            return None;
+        }
+        let items = state
+            .selection
+            .selected_in_order(&state.entries)
+            .into_iter()
+            .map(|e| DraggedEntry {
+                location: state.location_of(e),
+                is_dir: e.is_dir(),
+                name: e.display_name().to_string(),
+                icon: if e.is_dir() {
+                    IconName::Folder
+                } else {
+                    IconName::File
+                },
+            })
+            .collect();
+        Some(DragEntries { items })
     }
 
     pub fn handle_entries_drop(
@@ -1666,20 +1653,14 @@ impl ListView {
         ix: usize,
         loc: Location,
         is_dir: bool,
-        drag_entries: DragEntries,
+        drag_entries: Option<DragEntries>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let loc_hover = loc.clone();
         let loc_press = loc.clone();
         let loc_click = loc.clone();
         let list_handle = cx.entity().downgrade();
-        let (icon_prefs, icon_resolver) = {
-            let state = self.app_state.read(cx);
-            (
-                state.icon_config.active.clone(),
-                state.icon_resolver.clone(),
-            )
-        };
+        let app_state_for_drag = self.app_state.clone();
 
         let el = el
             .on_hover(cx.listener(move |this, hovered, _, cx| {
@@ -1692,26 +1673,46 @@ impl ListView {
                     cx.notify();
                 }
             }))
-            .on_drag(drag_entries, move |dragged, _, _, cx| {
-                let _ = list_handle.update(cx, |this, cx| {
-                    this.dragging_locations = dragged.locations().into_iter().collect();
-                    cx.notify();
-                });
-                let label = match dragged.items.as_slice() {
-                    [only] => only.name.clone(),
-                    [first, ..] => format!("{} (+{})", first.name, dragged.items.len() - 1),
-                    [] => String::new(),
-                };
-                let icon = dragged
-                    .items
-                    .first()
-                    .map(|i| i.icon)
-                    .unwrap_or(IconName::File);
-                cx.new(|_| DragEntriesPreview {
-                    label,
-                    icon,
-                    icon_prefs: icon_prefs.clone(),
-                    icon_resolver: icon_resolver.clone(),
+            .when_some(drag_entries, |el, drag_entries| {
+                el.on_drag(drag_entries, move |dragged, _, _, cx| {
+                    let _ = list_handle.update(cx, |this, cx| {
+                        this.dragging_locations = dragged.locations().into_iter().collect();
+                        cx.notify();
+                    });
+                    let label = match dragged.items.as_slice() {
+                        [only] => only.name.clone(),
+                        [first, ..] => format!("{} (+{})", first.name, dragged.items.len() - 1),
+                        [] => String::new(),
+                    };
+                    let icon = dragged
+                        .items
+                        .first()
+                        .map(|i| i.icon)
+                        .unwrap_or(IconName::File);
+                    let theme = Theme::get(cx);
+                    let (icon_prefs, icon_resolver) = {
+                        let state = app_state_for_drag.read(cx);
+                        (
+                            state.icon_config.active.clone(),
+                            state.icon_resolver.clone(),
+                        )
+                    };
+                    let icon_color = if icon.is_folder() {
+                        resolve_icon_color(icon.key_name(), &icon_prefs, &theme)
+                    } else {
+                        theme.text.into()
+                    };
+                    let resolved_icon = icon_resolver.resolve(
+                        &icon_prefs,
+                        icon.key_name(),
+                        (size::ICON / px(1.0)).round().max(1.0) as u16,
+                    );
+                    cx.new(|_| DragEntriesPreview {
+                        label,
+                        icon,
+                        resolved_icon,
+                        icon_color,
+                    })
                 })
             })
             .on_mouse_down(
@@ -1765,14 +1766,14 @@ impl ListView {
             let dest_ext_drag = loc.clone();
             let dest_ext_drop = loc;
             el.drag_over::<DragEntries>(move |style, dragged, window, cx| {
-                let mounts = app_state_drag.read(cx).volume_mounts.clone();
-                let op = resolve_drop_operation(
-                    &dragged.locations(),
+                let mounts = &app_state_drag.read(cx).volume_mounts;
+                let op = resolve_drop_operation_for_drag(
+                    dragged,
                     &dest_drag,
                     window.modifiers(),
-                    &mounts,
+                    mounts,
                 );
-                if validate_internal_drop(dragged, &dest_drag, op).is_ok() {
+                if validate_internal_drop_fast(dragged, &dest_drag, op).is_ok() {
                     let theme = Theme::get(cx);
                     style
                         .bg(theme.surface_raised)
@@ -1786,7 +1787,7 @@ impl ListView {
                 this.handle_entries_drop(dragged, dest_drop.clone(), window.modifiers(), true, cx);
             }))
             .drag_over::<ExternalPaths>(move |style, paths, _, cx| {
-                if validate_external_drop(paths.paths(), &dest_ext_drag).is_ok() {
+                if validate_external_drop_fast(paths.paths(), &dest_ext_drag).is_ok() {
                     let theme = Theme::get(cx);
                     style
                         .bg(theme.surface_raised)
@@ -1811,12 +1812,12 @@ impl ListView {
         entry: &Entry,
         loc: Location,
         is_selected: bool,
+        drag_entries: Option<DragEntries>,
         vis: ItemVisuals,
         theme: &Theme,
         fonts: &Fonts,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let drag_entries = self.drag_entries_for(entry, &loc, vis.glyph, cx);
         let (name, size_str, date_str) = self.cached_row_text(ix, entry);
         let secondary_col: Hsla = if is_selected {
             theme.text.into()
@@ -1882,15 +1883,16 @@ impl ListView {
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_compact_row(
         &mut self,
         ix: usize,
         entry: &Entry,
         loc: Location,
+        drag_entries: Option<DragEntries>,
         vis: ItemVisuals,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let drag_entries = self.drag_entries_for(entry, &loc, vis.glyph, cx);
         let (name, _, _) = self.cached_row_text(ix, entry);
         let base = div()
             .id(ix)
@@ -1931,12 +1933,12 @@ impl ListView {
         ix: usize,
         entry: &Entry,
         loc: Location,
+        drag_entries: Option<DragEntries>,
         vis: ItemVisuals,
         fonts: &Fonts,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let drag_entries = self.drag_entries_for(entry, &loc, vis.glyph, cx);
         let (name, _, _) = self.cached_row_text(ix, entry);
         let (line1, line2) = self.cached_grid_label(ix, &name, font(fonts.sans.clone()), window);
         let base = div()
@@ -2727,17 +2729,15 @@ impl Render for ListView {
                                 {
                                     return style;
                                 }
-                                let (dest, mounts) = {
-                                    let state = app_state_list_drag.read(cx);
-                                    (state.current_location.clone(), state.volume_mounts.clone())
-                                };
-                                let op = resolve_drop_operation(
-                                    &dragged.locations(),
-                                    &dest,
+                                let state = app_state_list_drag.read(cx);
+                                let dest = &state.current_location;
+                                let op = resolve_drop_operation_for_drag(
+                                    dragged,
+                                    dest,
                                     window.modifiers(),
-                                    &mounts,
+                                    &state.volume_mounts,
                                 );
-                                if validate_internal_drop(dragged, &dest, op).is_ok() {
+                                if validate_internal_drop_fast(dragged, dest, op).is_ok() {
                                     let theme = Theme::get(cx);
                                     style.border_1().border_color(theme.accent)
                                 } else {
@@ -2761,9 +2761,8 @@ impl Render for ListView {
                                 {
                                     return style;
                                 }
-                                let dest =
-                                    app_state_list_ext_drag.read(cx).current_location.clone();
-                                if validate_external_drop(paths.paths(), &dest).is_ok() {
+                                let dest = &app_state_list_ext_drag.read(cx).current_location;
+                                if validate_external_drop_fast(paths.paths(), dest).is_ok() {
                                     let theme = Theme::get(cx);
                                     style.border_1().border_color(theme.accent)
                                 } else {
@@ -2867,6 +2866,12 @@ impl Render for ListView {
                                                 }
                                             };
 
+                                            let multi_drag = if has_active_drag {
+                                                None
+                                            } else {
+                                                this.multi_drag_entries(cx)
+                                            };
+
                                             match view_mode {
                                                 ViewMode::Details | ViewMode::CompactList => {
                                                     for (
@@ -2899,6 +2904,24 @@ impl Render for ListView {
                                                                 &icon_prefs_for_rows,
                                                                 &icon_resolver,
                                                             );
+                                                            let drag_entries = if has_active_drag {
+                                                                None
+                                                            } else if is_selected {
+                                                                Some(
+                                                                    multi_drag
+                                                                        .clone()
+                                                                        .unwrap_or_else(|| {
+                                                                            Self::single_drag_entry(
+                                                                                entry, &loc,
+                                                                                vis.glyph,
+                                                                            )
+                                                                        }),
+                                                                )
+                                                            } else {
+                                                                Some(Self::single_drag_entry(
+                                                                    entry, &loc, vis.glyph,
+                                                                ))
+                                                            };
                                                             if view_mode == ViewMode::Details {
                                                                 items.push(
                                                                     this.render_details_row(
@@ -2906,6 +2929,7 @@ impl Render for ListView {
                                                                         entry,
                                                                         loc,
                                                                         is_selected,
+                                                                        drag_entries,
                                                                         vis,
                                                                         &theme_for_rows,
                                                                         &row_fonts,
@@ -2915,7 +2939,12 @@ impl Render for ListView {
                                                             } else {
                                                                 items.push(
                                                                     this.render_compact_row(
-                                                                        ix, entry, loc, vis, cx,
+                                                                        ix,
+                                                                        entry,
+                                                                        loc,
+                                                                        drag_entries,
+                                                                        vis,
+                                                                        cx,
                                                                     ),
                                                                 );
                                                             }
@@ -2964,10 +2993,42 @@ impl Render for ListView {
                                                                             &icon_prefs_for_rows,
                                                                             &icon_resolver,
                                                                         );
+                                                                    let drag_entries =
+                                                                        if has_active_drag {
+                                                                            None
+                                                                        } else if is_selected {
+                                                                            Some(
+                                                                                multi_drag
+                                                                                    .clone()
+                                                                                    .unwrap_or_else(
+                                                                                        || {
+                                                                                            Self::single_drag_entry(
+                                                                                                entry,
+                                                                                                &loc,
+                                                                                                vis.glyph,
+                                                                                            )
+                                                                                        },
+                                                                                    ),
+                                                                            )
+                                                                        } else {
+                                                                            Some(
+                                                                                Self::single_drag_entry(
+                                                                                    entry,
+                                                                                    &loc,
+                                                                                    vis.glyph,
+                                                                                ),
+                                                                            )
+                                                                        };
                                                                     row_tiles.push(
                                                                         this.render_grid_tile(
-                                                                            ix, entry, loc, vis,
-                                                                            &row_fonts, window, cx,
+                                                                            ix,
+                                                                            entry,
+                                                                            loc,
+                                                                            drag_entries,
+                                                                            vis,
+                                                                            &row_fonts,
+                                                                            window,
+                                                                            cx,
                                                                         ),
                                                                     );
                                                                 }

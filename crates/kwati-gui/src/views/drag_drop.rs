@@ -55,9 +55,11 @@ pub const fn is_copy_modifier_for_os(modifiers: Modifiers, is_macos: bool) -> bo
     }
 }
 
-/// Collects all local mount points reported by `kwati_core` (`list_volumes` + `network_mounts`).
+/// Collects all local mount points reported by `kwati_core` (`list_volumes` + `network_mounts`),
+/// pre-including canonicalized targets so lexical drag-over checks match symlinked mounts without
+/// hitting the filesystem on the UI thread.
 pub fn collect_volume_mounts() -> Vec<PathBuf> {
-    let mut mounts: Vec<PathBuf> = kwati_core::list_volumes()
+    let raw: Vec<PathBuf> = kwati_core::list_volumes()
         .into_iter()
         .map(|v| v.mount_point)
         .chain(
@@ -66,9 +68,149 @@ pub fn collect_volume_mounts() -> Vec<PathBuf> {
                 .map(|m| m.mount_point),
         )
         .collect();
+    let mut mounts = Vec::with_capacity(raw.len() * 2);
+    for mount in raw {
+        if let Ok(canon) = mount.canonicalize() {
+            if canon != mount {
+                mounts.push(canon);
+            }
+        }
+        mounts.push(mount);
+    }
     mounts.sort();
     mounts.dedup();
     mounts
+}
+
+/// Finds the longest matching mount point from `mounts` using only lexical path prefixes
+/// (no filesystem syscalls or allocations).
+pub fn mount_point_for_lexical<'a>(path: &'a Path, mounts: &'a [PathBuf]) -> &'a Path {
+    let mut best: Option<(usize, &'a Path)> = None;
+    for mount in mounts {
+        if path.starts_with(mount) {
+            let depth = mount.components().count();
+            if best.is_none_or(|(best_depth, _)| depth > best_depth) {
+                best = Some((depth, mount.as_path()));
+            }
+        }
+    }
+    best.map(|(_, key)| key)
+        .unwrap_or_else(|| path.ancestors().last().unwrap_or(path))
+}
+
+fn same_volume_lexical(src: &Location, dst: &Location, mounts: &[PathBuf]) -> bool {
+    match (src, dst) {
+        (Location::Local(src_path), Location::Local(dst_path)) => {
+            mount_point_for_lexical(src_path, mounts) == mount_point_for_lexical(dst_path, mounts)
+        }
+        (Location::Remote { profile_id: a, .. }, Location::Remote { profile_id: b, .. }) => a == b,
+        _ => false,
+    }
+}
+
+/// Zero-syscall variant of [`resolve_drop_operation`] for per-frame `.drag_over` styling.
+pub fn resolve_drop_operation_for_drag(
+    dragged: &DragEntries,
+    dest_dir: &Location,
+    modifiers: Modifiers,
+    mounts: &[PathBuf],
+) -> DropOperation {
+    resolve_drop_operation_for_os_drag(
+        dragged,
+        dest_dir,
+        modifiers,
+        cfg!(target_os = "macos"),
+        mounts,
+    )
+}
+
+/// Pure OS-parameterized helper for [`resolve_drop_operation_for_drag`].
+pub fn resolve_drop_operation_for_os_drag(
+    dragged: &DragEntries,
+    dest_dir: &Location,
+    modifiers: Modifiers,
+    is_macos: bool,
+    mounts: &[PathBuf],
+) -> DropOperation {
+    if is_copy_modifier_for_os(modifiers, is_macos) {
+        return DropOperation::Copy;
+    }
+    if !dragged.items.is_empty()
+        && dragged
+            .items
+            .iter()
+            .all(|item| same_volume_lexical(&item.location, dest_dir, mounts))
+    {
+        DropOperation::Move
+    } else {
+        DropOperation::Copy
+    }
+}
+
+fn is_self_or_subfolder_lexical(src: &Location, src_is_dir: bool, dest_dir: &Location) -> bool {
+    if src == dest_dir {
+        return true;
+    }
+    match (src, dest_dir) {
+        (Location::Local(src_path), Location::Local(dst_path)) => {
+            src_is_dir && dst_path.starts_with(src_path)
+        }
+        (
+            Location::Remote {
+                profile_id: sp,
+                path: src_path,
+            },
+            Location::Remote {
+                profile_id: dp,
+                path: dst_path,
+            },
+        ) => sp == dp && src_is_dir && dst_path.starts_with(src_path),
+        _ => false,
+    }
+}
+
+/// Zero-syscall variant of [`validate_internal_drop`] for per-frame `.drag_over` styling.
+pub fn validate_internal_drop_fast(
+    dragged: &DragEntries,
+    dest_dir: &Location,
+    operation: DropOperation,
+) -> Result<(), DropRejection> {
+    if dragged.items.is_empty() {
+        return Err(DropRejection::Empty);
+    }
+    for item in &dragged.items {
+        if is_self_or_subfolder_lexical(&item.location, item.is_dir, dest_dir) {
+            return Err(DropRejection::IntoSelfOrSubfolder);
+        }
+    }
+    if operation.is_move()
+        && dragged
+            .items
+            .iter()
+            .all(|item| item.location.parent().as_ref() == Some(dest_dir))
+    {
+        return Err(DropRejection::AlreadyInFolder);
+    }
+    Ok(())
+}
+
+/// Zero-syscall variant of [`validate_external_drop`] for per-frame `.drag_over` styling.
+pub fn validate_external_drop_fast(
+    paths: &[PathBuf],
+    dest_dir: &Location,
+) -> Result<(), DropRejection> {
+    if paths.is_empty() {
+        return Err(DropRejection::Empty);
+    }
+    let Location::Local(dst_path) = dest_dir else {
+        return Ok(());
+    };
+    for path in paths {
+        if path == dst_path || dst_path.starts_with(path) {
+            return Err(DropRejection::IntoSelfOrSubfolder);
+        }
+    }
+    Ok(())
 }
 
 /// Canonicalizes `path` when possible, or its nearest existing ancestor with the remaining

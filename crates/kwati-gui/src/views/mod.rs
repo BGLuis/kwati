@@ -1172,22 +1172,22 @@ pub fn format_status_selection_metadata(state: &AppState) -> String {
     if state.view_mode == ViewMode::Details {
         return String::new();
     }
-    let selected = state.selected_entries();
-    if selected.len() == 1 {
-        let entry = selected[0];
-        let name = entry.display_name();
-        let size_or_kind = if entry.is_dir() {
-            "Folder".to_string()
-        } else {
-            format_size(entry.size, false)
-        };
-        return match entry.modified {
-            Some(modified) => format!(
-                "{name} · {size_or_kind} · {}",
-                format_modified(Some(modified))
-            ),
-            None => format!("{name} · {size_or_kind}"),
-        };
+    if state.selection.len() == 1 {
+        if let Some(entry) = state.selected_entry() {
+            let name = entry.display_name();
+            let size_or_kind = if entry.is_dir() {
+                "Folder".to_string()
+            } else {
+                format_size(entry.size, false)
+            };
+            return match entry.modified {
+                Some(modified) => format!(
+                    "{name} · {size_or_kind} · {}",
+                    format_modified(Some(modified))
+                ),
+                None => format!("{name} · {size_or_kind}"),
+            };
+        }
     }
     let col = match state.sort_column {
         SortColumn::Name => "Name",

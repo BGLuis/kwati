@@ -85,7 +85,7 @@ pub use undo::{
     is_undo_refused, CopiedEntry, MovedEntry, PathSnapshot, TrashedTarget, UndoAction, UndoRefused,
     UndoStack, DEFAULT_MAX_UNDO,
 };
-pub use volume::{volume_kind, VolumeKind};
+pub use volume::{all_local_volumes, volume_kind, VolumeKind};
 pub use volumes::{
     device_volumes, filter_volumes, gvfs_share_name, is_pseudo_filesystem, list_volumes,
     mounted_volumes, network_mounts, parse_network_mounts, user_facing_volumes, NetworkMount,

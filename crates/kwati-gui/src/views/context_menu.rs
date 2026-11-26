@@ -1,7 +1,7 @@
 //! Context menu view for file list entries and empty space (#55).
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use gpui::{
@@ -9,7 +9,7 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
     Point, SharedString, Size, Window,
 };
-use kwati_core::{volume_kind, Location, SortColumn, SortDirection, ViewMode, VolumeKind};
+use kwati_core::{all_local_volumes, Location, SortColumn, SortDirection, ViewMode};
 
 use crate::actions::open_with::{menu_applications_for, AppInfo};
 use crate::actions::operations::get_location_clipboard;
@@ -324,9 +324,14 @@ pub fn build_context_menu_entries(
         ];
     }
 
-    let trash_available = selected
+    let local_paths: Vec<&Path> = selected
         .iter()
-        .all(|loc| matches!(loc, Location::Local(path) if volume_kind(path) == VolumeKind::Local));
+        .filter_map(|loc| match loc {
+            Location::Local(path) => Some(path.as_path()),
+            Location::Remote { .. } => None,
+        })
+        .collect();
+    let trash_available = local_paths.len() == selected.len() && all_local_volumes(&local_paths);
     let remove_label = if trash_available {
         "Move to Trash"
     } else {
@@ -1154,17 +1159,25 @@ impl Render for ContextMenuView {
                         .when(enabled, |el| {
                             el.cursor(CursorStyle::PointingHand)
                                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                    if *hovered {
+                                    let changed = if *hovered {
+                                        let prev_hover = this.hovered_index;
+                                        let had_sub = this.open_submenu.is_some();
                                         this.hovered_index = Some(ix);
-                                        if this.open_submenu.is_some() {
+                                        if had_sub {
                                             this.open_submenu = None;
                                             this.submenu_focused_index = None;
                                             this.submenu_hovered_index = None;
                                         }
+                                        prev_hover != Some(ix) || had_sub
                                     } else if this.hovered_index == Some(ix) {
                                         this.hovered_index = None;
+                                        true
+                                    } else {
+                                        false
+                                    };
+                                    if changed {
+                                        cx.notify();
                                     }
-                                    cx.notify();
                                 }))
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -1283,13 +1296,20 @@ impl Render for ContextMenuView {
                                     el.cursor(CursorStyle::PointingHand)
                                         .on_hover(cx.listener(
                                             move |this, hovered: &bool, _, cx| {
-                                                if *hovered {
+                                                let changed = if *hovered {
+                                                    let prev = this.submenu_hovered_index;
                                                     this.submenu_hovered_index = Some(sub_ix);
+                                                    prev != Some(sub_ix)
                                                 } else if this.submenu_hovered_index == Some(sub_ix)
                                                 {
                                                     this.submenu_hovered_index = None;
+                                                    true
+                                                } else {
+                                                    false
+                                                };
+                                                if changed {
+                                                    cx.notify();
                                                 }
-                                                cx.notify();
                                             },
                                         ))
                                         .on_mouse_down(
@@ -1343,6 +1363,7 @@ impl Render for ContextMenuView {
             None
         };
 
+        self.motion.prune_settled(now, reduced);
         request_frame_if_active(
             cascade_animating || self.motion.has_active(now, reduced),
             window,

@@ -368,3 +368,58 @@ fn applications_for_returns_empty_for_directory_or_unknown_extension() {
     write_file(&unknown, "x");
     assert!(applications_for(&unknown).is_empty());
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn applications_for_uses_mimeinfo_cache_and_respects_hidden_shadowing() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = TestDir::new("mimeinfo_cache");
+    let data_home = root.path.join("data");
+    let config_home = root.path.join("config");
+    let sys_data = root.path.join("sys_data");
+    let sys_config = root.path.join("sys_config");
+    let _env = EnvGuard::set(&[
+        ("XDG_DATA_HOME", &data_home),
+        ("XDG_CONFIG_HOME", &config_home),
+        ("XDG_DATA_DIRS", &sys_data),
+        ("XDG_CONFIG_DIRS", &sys_config),
+    ]);
+
+    let target = root.path.join("note.txt");
+    write_file(&target, "hello");
+
+    write_file(
+        &sys_data.join("applications/mimeinfo.cache"),
+        "[MIME Cache]\ntext/plain=cached-app.desktop;shadowed.desktop;missing-tryexec.desktop;\n",
+    );
+    write_file(
+        &sys_data.join("applications/cached-app.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Cached App\nExec=sh %f\nMimeType=text/plain;\n",
+    );
+    write_file(
+        &sys_data.join("applications/shadowed.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Shadowed App\nExec=sh %f\nMimeType=text/plain;\n",
+    );
+    write_file(
+        &sys_data.join("applications/missing-tryexec.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Missing TryExec\nExec=sh %f\nTryExec=definitely-missing-kwati-tryexec-999\nMimeType=text/plain;\n",
+    );
+    // Higher-precedence XDG_DATA_HOME masks shadowed.desktop with Hidden=true.
+    write_file(
+        &data_home.join("applications/shadowed.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Shadowed Hidden\nHidden=true\n",
+    );
+    // Unrelated cached entry not listed in mimeinfo.cache for text/plain.
+    write_file(
+        &sys_data.join("applications/other-app.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Other\nExec=sh %f\nMimeType=image/png;\n",
+    );
+
+    let apps = applications_for(&target);
+    assert_eq!(
+        apps.len(),
+        1,
+        "expected only cached-app.desktop, got {apps:?}"
+    );
+    assert_eq!(apps[0].id, "cached-app.desktop");
+}

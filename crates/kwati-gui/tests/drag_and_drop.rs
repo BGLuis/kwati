@@ -8,8 +8,10 @@ use gpui::{
 use kwati_core::{Location, PlaceEntry, Settings, ViewMode};
 use kwati_gui::state::AppState;
 use kwati_gui::views::drag_drop::{
-    is_copy_modifier_for_os, mount_point_for, resolve_drop_operation_for_os,
-    validate_external_drop, validate_internal_drop, DropOperation, DropRejection,
+    is_copy_modifier_for_os, mount_point_for, mount_point_for_lexical,
+    resolve_drop_operation_for_drag, resolve_drop_operation_for_os, validate_external_drop,
+    validate_external_drop_fast, validate_internal_drop, validate_internal_drop_fast,
+    DropOperation, DropRejection,
 };
 use kwati_gui::views::list_view::{DragEntries, DraggedEntry};
 use kwati_gui::views::sidebar_view::SidebarVolume;
@@ -813,6 +815,76 @@ fn drag_onto_folder_works_in_compact_and_grid_modes(cx: &mut TestAppContext) {
     pointer_drag_with_modifiers(cx, from, to, Modifiers::none());
     assert!(dest.join("grid.txt").exists());
     assert!(!grid_file.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fast_drag_over_helpers_match_drop_policy_without_syscalls() {
+    let dir = temp_dir("fast_drag_over");
+    let vol_a = dir.join("vol_a");
+    let vol_b = dir.join("vol_b");
+    let sub_a = vol_a.join("sub");
+    std::fs::create_dir_all(&sub_a).unwrap();
+    std::fs::create_dir_all(&vol_b).unwrap();
+    let file_a = vol_a.join("item.txt");
+    std::fs::write(&file_a, "x").unwrap();
+
+    let mounts = vec![dir.clone(), vol_a.clone(), vol_b.clone()];
+    assert_eq!(mount_point_for_lexical(&file_a, &mounts), vol_a.as_path());
+    assert_eq!(mount_point_for_lexical(&vol_b, &mounts), vol_b.as_path());
+
+    let dragged_file = DragEntries {
+        items: vec![DraggedEntry {
+            location: Location::Local(file_a.clone()),
+            is_dir: false,
+            name: "item.txt".into(),
+            icon: IconName::File,
+        }],
+    };
+    let sub_loc = Location::Local(sub_a.clone());
+    let vol_b_loc = Location::Local(vol_b.clone());
+    let vol_a_loc = Location::Local(vol_a.clone());
+
+    assert_eq!(
+        resolve_drop_operation_for_drag(&dragged_file, &sub_loc, Modifiers::none(), &mounts),
+        DropOperation::Move
+    );
+    assert_eq!(
+        resolve_drop_operation_for_drag(&dragged_file, &vol_b_loc, Modifiers::none(), &mounts),
+        DropOperation::Copy
+    );
+    assert_eq!(
+        resolve_drop_operation_for_drag(&dragged_file, &sub_loc, copy_modifier(), &mounts),
+        DropOperation::Copy
+    );
+
+    assert_eq!(
+        validate_internal_drop_fast(&dragged_file, &vol_a_loc, DropOperation::Move),
+        Err(DropRejection::AlreadyInFolder)
+    );
+    assert_eq!(
+        validate_internal_drop_fast(&dragged_file, &vol_a_loc, DropOperation::Copy),
+        Ok(())
+    );
+
+    let dragged_dir = DragEntries {
+        items: vec![DraggedEntry {
+            location: Location::Local(vol_a.clone()),
+            is_dir: true,
+            name: "vol_a".into(),
+            icon: IconName::Folder,
+        }],
+    };
+    assert_eq!(
+        validate_internal_drop_fast(&dragged_dir, &sub_loc, DropOperation::Move),
+        Err(DropRejection::IntoSelfOrSubfolder)
+    );
+    assert_eq!(
+        validate_external_drop_fast(std::slice::from_ref(&vol_a), &sub_loc),
+        Err(DropRejection::IntoSelfOrSubfolder)
+    );
+    assert_eq!(validate_external_drop_fast(&[file_a], &sub_loc), Ok(()));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

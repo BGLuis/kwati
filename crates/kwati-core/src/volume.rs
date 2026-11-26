@@ -17,6 +17,33 @@ pub fn volume_kind(path: &Path) -> VolumeKind {
     platform_kind(path)
 }
 
+/// Returns `true` when every path in `paths` resides on a [`VolumeKind::Local`] disk.
+///
+/// On Linux this reads `/proc/self/mountinfo` at most once for the entire slice rather than once
+/// per path.
+pub fn all_local_volumes(paths: &[&Path]) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if paths.is_empty() {
+            return true;
+        }
+        let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return false;
+        };
+        paths.iter().all(|path| {
+            path.canonicalize()
+                .ok()
+                .is_some_and(|canon| linux_kind(&mountinfo, &canon) == VolumeKind::Local)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        paths
+            .iter()
+            .all(|path| volume_kind(path) == VolumeKind::Local)
+    }
+}
+
 /// The mount point that holds `path`, used to group paths that share one filesystem.
 ///
 /// Falls back to the filesystem root of `path` when the mount table cannot be read, so every

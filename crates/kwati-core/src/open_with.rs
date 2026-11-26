@@ -299,24 +299,34 @@ mod linux {
 
     fn glob_matches(pattern: &str, name: &str, case_sensitive: bool) -> bool {
         if case_sensitive {
-            wildcard_match(pattern.as_bytes(), name.as_bytes())
+            wildcard_match(pattern.as_bytes(), name.as_bytes(), false)
         } else {
-            let p = pattern.to_ascii_lowercase();
-            let n = name.to_ascii_lowercase();
-            wildcard_match(p.as_bytes(), n.as_bytes())
+            wildcard_match(pattern.as_bytes(), name.as_bytes(), true)
         }
     }
 
-    fn wildcard_match(pat: &[u8], text: &[u8]) -> bool {
+    fn wildcard_match(pat: &[u8], text: &[u8], ignore_ascii_case: bool) -> bool {
         if let Some(suffix) = pat.strip_prefix(b"*") {
             if !suffix.contains(&b'*') && !suffix.contains(&b'?') && !suffix.contains(&b'[') {
-                return text.ends_with(suffix);
+                return if ignore_ascii_case {
+                    text.len() >= suffix.len()
+                        && text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+                } else {
+                    text.ends_with(suffix)
+                };
             }
         }
+        let eq = |a: u8, b: u8| {
+            if ignore_ascii_case {
+                a.eq_ignore_ascii_case(&b)
+            } else {
+                a == b
+            }
+        };
         let (mut pi, mut ti) = (0, 0);
         let (mut star, mut match_ti) = (None, 0);
         while ti < text.len() {
-            if pi < pat.len() && (pat[pi] == b'?' || pat[pi] == text[ti]) {
+            if pi < pat.len() && (pat[pi] == b'?' || eq(pat[pi], text[ti])) {
                 pi += 1;
                 ti += 1;
             } else if pi < pat.len() && pat[pi] == b'*' {
@@ -510,25 +520,57 @@ mod linux {
         }))
     }
 
-    /// Collects all `.desktop` entries across `$XDG_DATA_HOME/applications` and `$XDG_DATA_DIRS/applications`,
-    /// respecting XDG desktop-ID shadowing (including `Hidden=true` masking lower-precedence directories).
-    fn load_desktop_entries() -> HashMap<String, DesktopEntry> {
-        let mut seen_ids: HashSet<String> = HashSet::new();
-        let mut entries: HashMap<String, DesktopEntry> = HashMap::new();
-
-        for data_dir in xdg_data_dirs() {
-            let app_dir = data_dir.join("applications");
-            if !app_dir.is_dir() {
-                continue;
-            }
-            collect_desktop_dir(&app_dir, &app_dir, &mut seen_ids, &mut entries);
+    /// Resolves a single desktop ID across `data_dirs` in precedence order, respecting XDG
+    /// desktop-ID shadowing (including `Hidden=true` and subdirectory `-` mapping).
+    /// Returns `true` if a file for `desktop_id` was found in `data_dirs`.
+    fn resolve_desktop_entry(
+        desktop_id: &str,
+        data_dirs: &[PathBuf],
+        seen_ids: &mut HashSet<String>,
+        entries: &mut HashMap<String, DesktopEntry>,
+    ) -> bool {
+        if seen_ids.contains(desktop_id) {
+            return true;
         }
-        entries
+        for data_dir in data_dirs {
+            let app_dir = data_dir.join("applications");
+            let content = fs::read_to_string(app_dir.join(desktop_id))
+                .ok()
+                .or_else(|| read_hyphenated_desktop(&app_dir, desktop_id));
+            if let Some(content) = content {
+                seen_ids.insert(desktop_id.to_string());
+                if let Some(Some(entry)) = parse_desktop_file(desktop_id.to_string(), &content) {
+                    entries.insert(desktop_id.to_string(), entry);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn read_hyphenated_desktop(app_dir: &Path, desktop_id: &str) -> Option<String> {
+        let mut start = 0;
+        while let Some(rel_idx) = desktop_id[start..].find('-') {
+            let split_at = start + rel_idx;
+            let mut candidate = app_dir.to_path_buf();
+            let prefix = &desktop_id[..split_at];
+            let rest = &desktop_id[split_at + 1..];
+            for segment in prefix.split('-') {
+                candidate.push(segment);
+            }
+            candidate.push(rest);
+            if let Ok(content) = fs::read_to_string(&candidate) {
+                return Some(content);
+            }
+            start = split_at + 1;
+        }
+        None
     }
 
     fn collect_desktop_dir(
         root: &Path,
         dir: &Path,
+        higher_data_dirs: &[PathBuf],
         seen_ids: &mut HashSet<String>,
         entries: &mut HashMap<String, DesktopEntry>,
     ) {
@@ -540,7 +582,7 @@ mod linux {
 
         for path in dir_entries {
             if path.is_dir() {
-                collect_desktop_dir(root, &path, seen_ids, entries);
+                collect_desktop_dir(root, &path, higher_data_dirs, seen_ids, entries);
                 continue;
             }
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
@@ -558,6 +600,11 @@ mod linux {
             if seen_ids.contains(&desktop_id) {
                 continue;
             }
+            if !higher_data_dirs.is_empty()
+                && resolve_desktop_entry(&desktop_id, higher_data_dirs, seen_ids, entries)
+            {
+                continue;
+            }
             let Ok(content) = fs::read_to_string(&path) else {
                 continue;
             };
@@ -570,29 +617,23 @@ mod linux {
         }
     }
 
-    /// Reads `[MIME Cache]` entries for `mime` across all `mimeinfo.cache` files.
-    fn read_mimeinfo_cache(mime: &str) -> Vec<String> {
+    /// Reads `[MIME Cache]` entries for `mime` from a single `mimeinfo.cache` file.
+    fn parse_mimeinfo_cache(content: &str, mime: &str) -> Vec<String> {
         let mut ids = Vec::new();
-        for data_dir in xdg_data_dirs() {
-            let cache_path = data_dir.join("applications/mimeinfo.cache");
-            let Ok(content) = fs::read_to_string(&cache_path) else {
+        let mut in_cache = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_cache = trimmed == "[MIME Cache]";
                 continue;
-            };
-            let mut in_cache = false;
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with('[') {
-                    in_cache = trimmed == "[MIME Cache]";
-                    continue;
-                }
-                if !in_cache {
-                    continue;
-                }
-                if let Some((m, val)) = trimmed.split_once('=') {
-                    if m.trim().eq_ignore_ascii_case(mime) {
-                        for id in val.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                            ids.push(id.to_string());
-                        }
+            }
+            if !in_cache {
+                continue;
+            }
+            if let Some((m, val)) = trimmed.split_once('=') {
+                if m.trim().eq_ignore_ascii_case(mime) {
+                    for id in val.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                        ids.push(id.to_string());
                     }
                 }
             }
@@ -601,22 +642,76 @@ mod linux {
     }
 
     /// Lists all applications capable of opening `path` per XDG MIME Apps Spec 1.0.1.
+    ///
+    /// Uses `mimeapps.list` and `mimeinfo.cache` to resolve only candidate `.desktop` files on
+    /// cached directories, scanning `applications/` recursively only where `mimeinfo.cache` is
+    /// absent (such as `~/.local/share/applications` or isolated test directories).
     pub(super) fn applications_for(path: &Path) -> Vec<AppInfo> {
         let Some(mime) = detect_mime_type(path) else {
             return Vec::new();
         };
-        let entries = load_desktop_entries();
 
-        let mut default_candidate: Option<String> = None;
-        let mut ordered_ids: Vec<String> = Vec::new();
-        let mut removed: HashSet<String> = HashSet::new();
+        let data_dirs = xdg_data_dirs();
+        let mut parsed_mimeapps = Vec::new();
+        let mut candidate_ids: Vec<String> = Vec::new();
+        let mut candidate_seen: HashSet<String> = HashSet::new();
 
         for ma_path in mimeapps_list_paths() {
             let Ok(content) = fs::read_to_string(&ma_path) else {
                 continue;
             };
             let parsed = parse_mimeapps_file(&content);
+            for id in parsed
+                .default_apps
+                .get(&mime)
+                .into_iter()
+                .flatten()
+                .chain(parsed.added.get(&mime).into_iter().flatten())
+            {
+                if candidate_seen.insert(id.clone()) {
+                    candidate_ids.push(id.clone());
+                }
+            }
+            parsed_mimeapps.push(parsed);
+        }
 
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut entries: HashMap<String, DesktopEntry> = HashMap::new();
+        let mut cache_ids: Vec<String> = Vec::new();
+
+        for (dir_ix, data_dir) in data_dirs.iter().enumerate() {
+            let app_dir = data_dir.join("applications");
+            if !app_dir.is_dir() {
+                continue;
+            }
+            let cache_path = app_dir.join("mimeinfo.cache");
+            if let Ok(cache_content) = fs::read_to_string(&cache_path) {
+                for id in parse_mimeinfo_cache(&cache_content, &mime) {
+                    if candidate_seen.insert(id.clone()) {
+                        candidate_ids.push(id.clone());
+                    }
+                    cache_ids.push(id);
+                }
+            } else {
+                collect_desktop_dir(
+                    &app_dir,
+                    &app_dir,
+                    &data_dirs[..dir_ix],
+                    &mut seen_ids,
+                    &mut entries,
+                );
+            }
+        }
+
+        for id in &candidate_ids {
+            let _ = resolve_desktop_entry(id, &data_dirs, &mut seen_ids, &mut entries);
+        }
+
+        let mut default_candidate: Option<String> = None;
+        let mut ordered_ids: Vec<String> = Vec::new();
+        let mut removed: HashSet<String> = HashSet::new();
+
+        for parsed in &parsed_mimeapps {
             if default_candidate.is_none() {
                 if let Some(defs) = parsed.default_apps.get(&mime) {
                     for id in defs {
@@ -646,14 +741,13 @@ mod linux {
             }
         }
 
-        for id in read_mimeinfo_cache(&mime) {
+        for id in cache_ids {
             if !removed.contains(&id) && entries.contains_key(&id) && !ordered_ids.contains(&id) {
                 ordered_ids.push(id);
             }
         }
 
-        // Supplement from .desktop MimeType= lines so newly added .desktop files work even if
-        // mimeinfo.cache has not been regenerated.
+        // Supplement from .desktop MimeType= lines discovered in uncached directories.
         let mut scanned: Vec<&DesktopEntry> = entries
             .values()
             .filter(|e| e.mimes.iter().any(|m| m == &mime))

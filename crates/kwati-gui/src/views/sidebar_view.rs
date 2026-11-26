@@ -16,12 +16,12 @@ use gpui::{
 use kwati_core::{
     device_volumes, eject, is_trash_browsing_supported, mount, network_mounts, unmounted_drives,
     ConnectionState, DriveError, IconPreferences, IconResolver, Location, NetworkMount, PlaceEntry,
-    PlaceKind, UnmountedDrive, Volume,
+    PlaceKind, ResolvedIcon, UnmountedDrive, Volume,
 };
 
 use crate::actions::{open_system_trash, ManageServers};
 use crate::components::{
-    animated_icon_sized, icon, icon_for_with, resolve_icon_color, resolved_icon, Ellipsize,
+    animated_icon_sized, icon, icon_for_with, render_resolved_icon, resolve_icon_color, Ellipsize,
     IconMotion, IconName, SpecialFolders, TextInput, Tooltip,
 };
 use crate::motion::{
@@ -33,8 +33,9 @@ use crate::state::AppState;
 use crate::theme::Theme;
 use crate::tokens::{radius, size, space, TextRole};
 use crate::views::drag_drop::{
-    collect_volume_mounts, resolve_drop_operation, validate_external_drop, validate_internal_drop,
-    DropOperation,
+    collect_volume_mounts, resolve_drop_operation, resolve_drop_operation_for_drag,
+    validate_external_drop, validate_external_drop_fast, validate_internal_drop,
+    validate_internal_drop_fast, DropOperation,
 };
 use crate::views::list_view::DragEntries;
 
@@ -434,8 +435,8 @@ struct DragPlacePreview {
     icon: IconName,
     is_trash: bool,
     is_missing: bool,
-    icon_prefs: IconPreferences,
-    icon_resolver: Arc<IconResolver>,
+    resolved_icon: Option<ResolvedIcon>,
+    icon_color: Option<gpui::Hsla>,
 }
 
 impl Render for DragPlacePreview {
@@ -445,15 +446,8 @@ impl Render for DragPlacePreview {
             animated_icon_sized(IconName::Trash, IconMotion::Rest, size::ICON, theme.text)
         } else if self.is_missing {
             animated_icon_sized(IconName::Alert, IconMotion::Rest, size::ICON, theme.danger)
-        } else if self.icon.is_folder() {
-            resolved_icon(
-                self.icon,
-                IconMotion::Rest,
-                size::ICON,
-                resolve_icon_color(self.icon.key_name(), &self.icon_prefs, &theme),
-                &self.icon_prefs,
-                &self.icon_resolver,
-            )
+        } else if let (Some(resolved), Some(color)) = (&self.resolved_icon, self.icon_color) {
+            render_resolved_icon(resolved, self.icon, IconMotion::Rest, size::ICON, color)
         } else {
             animated_icon_sized(self.icon, IconMotion::Rest, size::ICON, theme.text)
         };
@@ -507,8 +501,8 @@ fn style_drag_over_local_dir(
     theme: &Theme,
 ) -> StyleRefinement {
     let dest_loc = Location::Local(dest.to_path_buf());
-    let op = resolve_drop_operation(&dragged.locations(), &dest_loc, modifiers, mounts);
-    if validate_internal_drop(dragged, &dest_loc, op).is_ok() {
+    let op = resolve_drop_operation_for_drag(dragged, &dest_loc, modifiers, mounts);
+    if validate_internal_drop_fast(dragged, &dest_loc, op).is_ok() {
         style
             .bg(theme.surface)
             .border_1()
@@ -525,7 +519,7 @@ fn style_drag_over_external_local_dir(
     theme: &Theme,
 ) -> StyleRefinement {
     let dest_loc = Location::Local(dest.to_path_buf());
-    if validate_external_drop(paths.paths(), &dest_loc).is_ok() {
+    if validate_external_drop_fast(paths.paths(), &dest_loc).is_ok() {
         style
             .bg(theme.surface)
             .border_1()
@@ -612,6 +606,8 @@ pub struct SidebarView {
     pressed: HashSet<SidebarKey>,
     last_server_states: Vec<(String, ServerConnectionStatus)>,
     motion: MotionTracker<SidebarMotionKey>,
+    resolved_icon_cache: HashMap<(IconName, u16), ResolvedIcon>,
+    cached_icon_prefs: IconPreferences,
     _state_sub: Subscription,
     _device_poll: Task<()>,
     device_refresh: Option<Task<()>>,
@@ -636,6 +632,7 @@ impl SidebarView {
             .map(|entry| SidebarPlace::from_entry(entry, &specials))
             .collect();
         let rename_input = cx.new(|cx| TextInput::with_placeholder("Nome do local", cx));
+        let initial_icon_prefs = app_state.read(cx).icon_config.active.clone();
         let state_sub = cx.observe(&app_state, |this, app_state, cx| {
             this.sync_places_from_state(app_state.read(cx));
             cx.notify();
@@ -674,10 +671,33 @@ impl SidebarView {
             pressed: HashSet::new(),
             last_server_states: Vec::new(),
             motion: MotionTracker::new(),
+            resolved_icon_cache: HashMap::new(),
+            cached_icon_prefs: initial_icon_prefs,
             _state_sub: state_sub,
             _device_poll: device_poll,
             device_refresh: None,
         }
+    }
+
+    fn cached_resolved_icon(
+        &mut self,
+        builtin: IconName,
+        icon_size: Pixels,
+        prefs: &IconPreferences,
+        resolver: &IconResolver,
+    ) -> ResolvedIcon {
+        if *prefs != self.cached_icon_prefs {
+            self.cached_icon_prefs = prefs.clone();
+            self.resolved_icon_cache.clear();
+        }
+        let size_px = (icon_size / px(1.0)).round().max(1.0) as u16;
+        let key = (builtin, size_px);
+        if let Some(resolved) = self.resolved_icon_cache.get(&key) {
+            return resolved.clone();
+        }
+        let resolved = resolver.resolve(prefs, builtin.key_name(), size_px);
+        self.resolved_icon_cache.insert(key, resolved.clone());
+        resolved
     }
 
     /// Synchronizes `self.places` with `state.places()`.
@@ -1731,8 +1751,17 @@ impl SidebarView {
                     is_trash,
                     is_missing,
                 };
-                let drag_prefs = icon_prefs.clone();
-                let drag_resolver = icon_resolver.clone();
+                let app_state_drag_preview = self.app_state.clone();
+                let resolved_place_icon = if !is_trash && !is_missing && glyph_name.is_folder() {
+                    Some(self.cached_resolved_icon(
+                        glyph_name,
+                        size::ICON * scale,
+                        &icon_prefs,
+                        &icon_resolver,
+                    ))
+                } else {
+                    None
+                };
 
                 div()
                     .id(("place", ix))
@@ -1749,13 +1778,30 @@ impl SidebarView {
                         this.set_hover(key, *hovered, cx);
                     }))
                     .on_drag(drag_payload, move |dragged, _, _, cx| {
+                        let (resolved_icon, icon_color) = if !dragged.is_trash
+                            && !dragged.is_missing
+                            && dragged.icon.is_folder()
+                        {
+                            let theme = Theme::get(cx);
+                            let state = app_state_drag_preview.read(cx);
+                            let prefs = &state.icon_config.active;
+                            let resolved = state.icon_resolver.resolve(
+                                prefs,
+                                dragged.icon.key_name(),
+                                (size::ICON / px(1.0)).round().max(1.0) as u16,
+                            );
+                            let color = resolve_icon_color(dragged.icon.key_name(), prefs, &theme);
+                            (Some(resolved), Some(color))
+                        } else {
+                            (None, None)
+                        };
                         cx.new(|_| DragPlacePreview {
                             name: dragged.name.clone(),
                             icon: dragged.icon,
                             is_trash: dragged.is_trash,
                             is_missing: dragged.is_missing,
-                            icon_prefs: drag_prefs.clone(),
-                            icon_resolver: drag_resolver.clone(),
+                            resolved_icon,
+                            icon_color,
                         })
                     })
                     .drag_over::<DragSidebarPlace>(move |style, dragged, _, cx| {
@@ -1846,14 +1892,13 @@ impl SidebarView {
                             this.navigate_to_path(path, cx);
                         }
                     }))
-                    .child(if !is_trash && !is_missing && glyph_name.is_folder() {
-                        resolved_icon(
+                    .child(if let Some(resolved) = resolved_place_icon {
+                        render_resolved_icon(
+                            &resolved,
                             glyph_name,
                             glyph_motion,
                             size::ICON * scale,
                             glyph_color,
-                            &icon_prefs,
-                            &icon_resolver,
                         )
                     } else {
                         animated_icon_sized(glyph_name, glyph_motion, size::ICON * scale, glyph_color)
@@ -2018,6 +2063,12 @@ impl SidebarView {
                 } else {
                     lerp_f32(1.0, PRESS_SCALE, press_t)
                 };
+                let resolved_share_icon = self.cached_resolved_icon(
+                    IconName::FolderNetwork,
+                    size::ICON * scale,
+                    &icon_prefs,
+                    &icon_resolver,
+                );
                 div()
                     .id(("share", ix))
                     .h(size::SIDEBAR_ROW)
@@ -2074,13 +2125,12 @@ impl SidebarView {
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.set_press(key, false, cx)),
                     )
-                    .child(resolved_icon(
+                    .child(render_resolved_icon(
+                        &resolved_share_icon,
                         IconName::FolderNetwork,
                         IconMotion::Rest,
                         size::ICON * scale,
                         resolve_icon_color(IconName::FolderNetwork.key_name(), &icon_prefs, &theme),
-                        &icon_prefs,
-                        &icon_resolver,
                     ))
             })
             .collect();
@@ -2388,8 +2438,17 @@ impl Render for SidebarView {
                     is_trash,
                     is_missing,
                 };
-                let drag_prefs = icon_prefs.clone();
-                let drag_resolver = icon_resolver.clone();
+                let app_state_drag_preview = self.app_state.clone();
+                let resolved_place_icon = if !is_trash && !is_missing && place.icon.is_folder() {
+                    Some(self.cached_resolved_icon(
+                        place.icon,
+                        size::ICON * scale,
+                        &icon_prefs,
+                        &icon_resolver,
+                    ))
+                } else {
+                    None
+                };
 
                 div()
                     .id(("place-row", ix))
@@ -2408,13 +2467,30 @@ impl Render for SidebarView {
                         this.set_hover(key, *hovered, cx);
                     }))
                     .on_drag(drag_payload, move |dragged, _, _, cx| {
+                        let (resolved_icon, icon_color) = if !dragged.is_trash
+                            && !dragged.is_missing
+                            && dragged.icon.is_folder()
+                        {
+                            let theme = Theme::get(cx);
+                            let state = app_state_drag_preview.read(cx);
+                            let prefs = &state.icon_config.active;
+                            let resolved = state.icon_resolver.resolve(
+                                prefs,
+                                dragged.icon.key_name(),
+                                (size::ICON / px(1.0)).round().max(1.0) as u16,
+                            );
+                            let color = resolve_icon_color(dragged.icon.key_name(), prefs, &theme);
+                            (Some(resolved), Some(color))
+                        } else {
+                            (None, None)
+                        };
                         cx.new(|_| DragPlacePreview {
                             name: dragged.name.clone(),
                             icon: dragged.icon,
                             is_trash: dragged.is_trash,
                             is_missing: dragged.is_missing,
-                            icon_prefs: drag_prefs.clone(),
-                            icon_resolver: drag_resolver.clone(),
+                            resolved_icon,
+                            icon_color,
                         })
                     })
                     .drag_over::<DragSidebarPlace>(move |style, dragged, _, cx| {
@@ -2494,14 +2570,13 @@ impl Render for SidebarView {
                                     size::ICON * scale,
                                     color,
                                 )
-                            } else if place.icon.is_folder() {
-                                resolved_icon(
+                            } else if let Some(resolved) = resolved_place_icon {
+                                render_resolved_icon(
+                                    &resolved,
                                     place.icon,
                                     icon_motion,
                                     size::ICON * scale,
                                     color,
-                                    &icon_prefs,
-                                    &icon_resolver,
                                 )
                             } else {
                                 animated_icon_sized(
@@ -2963,6 +3038,12 @@ impl Render for SidebarView {
                 let path_ext_drop = path.clone();
                 let app_state_net_drag = self.app_state.clone();
 
+                let resolved_share_icon = self.cached_resolved_icon(
+                    IconName::FolderNetwork,
+                    size::ICON * scale,
+                    &icon_prefs,
+                    &icon_resolver,
+                );
                 div()
                     .id(("network-share", ix))
                     .h(size::SIDEBAR_ROW)
@@ -3008,13 +3089,12 @@ impl Render for SidebarView {
                     .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
                         this.handle_external_paths_drop(paths.paths(), &path_ext_drop, cx);
                     }))
-                    .child(resolved_icon(
+                    .child(render_resolved_icon(
+                        &resolved_share_icon,
                         IconName::FolderNetwork,
                         IconMotion::Rest,
                         size::ICON * scale,
                         resolve_icon_color(IconName::FolderNetwork.key_name(), &icon_prefs, &theme),
-                        &icon_prefs,
-                        &icon_resolver,
                     ))
                     .child(div().flex_1().ellipsize().child(share.name.clone()))
                     .on_mouse_down(

@@ -2105,9 +2105,20 @@ impl AppState {
 
     /// Total byte size of selected files (directories contribute 0 bytes).
     pub fn selected_total_size(&self) -> u64 {
-        self.selected_entries()
-            .into_iter()
-            .filter(|entry| !entry.is_dir())
+        if self.selection.is_empty() {
+            return 0;
+        }
+        if self.selection.len() == 1 {
+            return self
+                .selected_entry()
+                .filter(|entry| !entry.is_dir())
+                .and_then(|entry| entry.size)
+                .unwrap_or(0);
+        }
+        self.entries
+            .iter()
+            .filter(|entry| !entry.is_dir() && entry.size.is_some())
+            .filter(|entry| self.selection.contains(&self.location_of(entry)))
             .filter_map(|entry| entry.size)
             .sum()
     }
