@@ -10,22 +10,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    div, img, prelude::*, px, uniform_list, Context, Entity, FontWeight, Pixels, ScrollStrategy,
-    SharedString, Subscription, Task, UniformListScrollHandle, Window,
+    div, img, prelude::*, px, uniform_list, Context, Entity, FontWeight, ObjectFit, Pixels,
+    RenderImage, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, Window,
 };
 use kwati_core::preview::{preview_from_reader, read_preview, Preview};
+use kwati_core::thumbnail::generate_preview_image;
 use kwati_core::{
     is_streamable_media, Backend, Entry, EntryKind, IconConfig, Location, RemoteFileCache,
 };
 
+use crate::components::thumbnails::{global_thumbnail_pool, render_image_from_rgba};
 use crate::components::{
-    icon, icon_for, resolve_icon_color, resolved_icon, Ellipsize, IconMotion, IconName,
+    fast_icon_for_entry, icon, resolve_icon_color, resolved_icon, Ellipsize, IconMotion, IconName,
+    SpecialFolders,
 };
 use crate::state::{AppState, PreviewData, PreviewKind};
 use crate::theme::Theme;
 use crate::tokens::{size, Fonts, DATA_SIZE};
 
 const MAX_IMAGE_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_PREVIEW_IMAGE_PX: u32 = 1024;
 const MAX_PREVIEW_LINE_CHARS: usize = 200;
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(50);
 const PREVIEW_LINE_HEIGHT: Pixels = px(18.);
@@ -446,10 +450,14 @@ pub struct PreviewView {
     pub metadata: Option<MetadataSummary>,
     text_lines: Arc<Vec<SharedString>>,
     text_lines_path: Option<PathBuf>,
+    decoded_image: Option<(PathBuf, Arc<RenderImage>)>,
+    decoded_image_failed_path: Option<PathBuf>,
     text_scroll_handle: UniformListScrollHandle,
     load_task: Option<Task<()>>,
     request_generation: u64,
+    preview_generation: Arc<AtomicU64>,
     last_icon_config: IconConfig,
+    special_folders: SpecialFolders,
     _subscription: Subscription,
 }
 
@@ -467,12 +475,27 @@ impl PreviewView {
             metadata: None,
             text_lines: Arc::new(Vec::new()),
             text_lines_path: None,
+            decoded_image: None,
+            decoded_image_failed_path: None,
             text_scroll_handle: UniformListScrollHandle::new(),
             load_task: None,
             request_generation: 0,
+            preview_generation: Arc::new(AtomicU64::new(0)),
             last_icon_config,
+            special_folders: SpecialFolders::from_system(),
             _subscription: subscription,
         }
+    }
+
+    pub fn has_decoded_image(&self) -> bool {
+        self.decoded_image.is_some()
+    }
+
+    pub fn decoded_image_dimensions(&self) -> Option<(i32, i32)> {
+        self.decoded_image.as_ref().map(|(_, img)| {
+            let size = img.size(0);
+            (size.width.0, size.height.0)
+        })
     }
 
     fn clear_text_cache(&mut self) {
@@ -482,6 +505,13 @@ impl PreviewView {
         self.text_lines_path = None;
     }
 
+    fn clear_image_cache(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, old)) = self.decoded_image.take() {
+            cx.drop_image(old, None);
+        }
+        self.decoded_image_failed_path = None;
+    }
+
     fn spawn_preview_load(
         &mut self,
         target_path: PathBuf,
@@ -489,6 +519,7 @@ impl PreviewView {
         compute: impl FnOnce() -> (PreviewData, MetadataSummary) + Send + 'static,
     ) {
         let generation = self.request_generation;
+        let preview_gen = Arc::clone(&self.preview_generation);
         self.load_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PREVIEW_DEBOUNCE).await;
             let still_current = this
@@ -510,14 +541,43 @@ impl PreviewView {
                 })
                 .await;
 
+            let decoded_image = if let PreviewKind::Image(ref img_path) = preview_data.kind {
+                let decode_path = img_path.clone();
+                global_thumbnail_pool()
+                    .submit(Some((preview_gen, generation)), move || {
+                        generate_preview_image(&decode_path, MAX_PREVIEW_IMAGE_PX)
+                            .ok()
+                            .map(render_image_from_rgba)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
             let _ = this.update(cx, |view, cx| {
                 if view.request_generation != generation {
+                    if let Some(unused) = decoded_image {
+                        cx.drop_image(unused, None);
+                    }
                     return;
                 }
                 view.load_task = None;
                 view.metadata = Some(summary);
                 view.text_lines = Arc::new(lines);
                 view.text_lines_path = Some(target_path.clone());
+                view.clear_image_cache(cx);
+                if let PreviewKind::Image(ref img_path) = preview_data.kind {
+                    match decoded_image {
+                        Some(img) => {
+                            view.decoded_image = Some((img_path.clone(), img));
+                        }
+                        None => {
+                            view.decoded_image_failed_path = Some(img_path.clone());
+                        }
+                    }
+                }
                 view.text_scroll_handle
                     .scroll_to_item(0, ScrollStrategy::Top);
                 view.app_state.update(cx, |state, _cx| {
@@ -531,6 +591,8 @@ impl PreviewView {
     fn cancel_pending_load(&mut self) {
         self.load_task = None;
         self.request_generation = self.request_generation.wrapping_add(1);
+        self.preview_generation
+            .store(self.request_generation, Ordering::Relaxed);
     }
 
     /// Synchronizes preview with the currently selected entry in AppState.
@@ -551,6 +613,7 @@ impl PreviewView {
 
         if !preview_open {
             self.cancel_pending_load();
+            self.clear_image_cache(cx);
             if self.current_path.is_some()
                 || self.current_location.is_some()
                 || self.metadata.is_some()
@@ -566,6 +629,7 @@ impl PreviewView {
 
         let Some(location) = selected_location else {
             self.cancel_pending_load();
+            self.clear_image_cache(cx);
             let had_preview = app_state.read(cx).preview_state.is_some();
             if self.current_path.is_some()
                 || self.current_location.is_some()
@@ -615,6 +679,7 @@ impl PreviewView {
                 self.current_location = Some(remote_loc.clone());
                 self.metadata = listed.as_ref().map(MetadataSummary::from_listing);
                 self.clear_text_cache();
+                self.clear_image_cache(cx);
 
                 if listed.as_ref().is_some_and(|e| e.is_dir()) {
                     let name = path
@@ -660,6 +725,7 @@ impl PreviewView {
                 self.current_location = Some(local_loc);
                 self.metadata = listed.as_ref().map(MetadataSummary::from_listing);
                 self.clear_text_cache();
+                self.clear_image_cache(cx);
 
                 app_state.update(cx, |state, _cx| {
                     state.set_preview(Some(PreviewData {
@@ -678,7 +744,7 @@ impl PreviewView {
 
 enum RenderPreviewBody {
     Text(Arc<Vec<SharedString>>),
-    Image(PathBuf),
+    Image(Arc<RenderImage>),
     Binary { name: String, size: u64 },
     Unavailable(String),
     Loading,
@@ -701,7 +767,21 @@ impl Render for PreviewView {
                             Err((path.clone(), text.clone()))
                         }
                     }
-                    PreviewKind::Image(img_path) => Ok(RenderPreviewBody::Image(img_path.clone())),
+                    PreviewKind::Image(img_path) => {
+                        if let Some((cached_path, image)) = &self.decoded_image {
+                            if cached_path == img_path {
+                                Ok(RenderPreviewBody::Image(Arc::clone(image)))
+                            } else {
+                                Ok(RenderPreviewBody::Loading)
+                            }
+                        } else if self.decoded_image_failed_path.as_ref() == Some(img_path) {
+                            Ok(RenderPreviewBody::Unavailable(
+                                "Cannot preview image".into(),
+                            ))
+                        } else {
+                            Ok(RenderPreviewBody::Loading)
+                        }
+                    }
                     PreviewKind::Binary { name, size } => Ok(RenderPreviewBody::Binary {
                         name: name.clone(),
                         size: *size,
@@ -767,7 +847,9 @@ impl Render for PreviewView {
             .map(|m| m.kind_label.clone())
             .unwrap_or_else(|| "File".to_string());
         let is_dir = self.metadata.as_ref().is_some_and(|m| m.is_dir);
-        let header_icon = icon_for(&preview_path, is_dir);
+        let is_remote = matches!(self.current_location, Some(Location::Remote { .. }));
+        let header_icon =
+            fast_icon_for_entry(&preview_path, is_dir, is_remote, &self.special_folders).0;
         let header_icon_color = resolve_icon_color(header_icon.key_name(), &icon_prefs, &theme);
 
         div()
@@ -886,7 +968,7 @@ impl Render for PreviewView {
                             )
                     }
                 }
-                RenderPreviewBody::Image(path) => div()
+                RenderPreviewBody::Image(image) => div()
                     .flex_1()
                     .flex()
                     .items_center()
@@ -894,7 +976,12 @@ impl Render for PreviewView {
                     .p_2()
                     .bg(theme.surface)
                     .rounded_md()
-                    .child(img(path).max_w_full().max_h_full()),
+                    .child(
+                        img(image)
+                            .max_w_full()
+                            .max_h_full()
+                            .object_fit(ObjectFit::Contain),
+                    ),
                 RenderPreviewBody::Binary { name, size } => div()
                     .flex_1()
                     .flex()

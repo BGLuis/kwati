@@ -164,3 +164,29 @@ fn poll_watcher_signals() {
         "unexpected extra signal"
     );
 }
+
+#[test]
+fn watcher_ignores_read_only_access() {
+    let dir = TestDir::new("watcher_ignores_access");
+    let sample = dir.path.join("sample.txt");
+    std::fs::write(&sample, b"hello").unwrap();
+
+    let (_watcher, rx) = watch(&dir);
+
+    for _ in 0..5 {
+        let _: Vec<_> = std::fs::read_dir(&dir.path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let _ = std::fs::read(&sample).unwrap();
+    }
+
+    assert!(
+        rx.recv_timeout(WINDOW * 3).is_err(),
+        "read-only directory/file access should not trigger watcher reloads"
+    );
+
+    std::fs::write(dir.path.join("created.txt"), b"new").unwrap();
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("actual file creation must still trigger watcher");
+}

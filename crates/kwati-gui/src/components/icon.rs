@@ -6,7 +6,10 @@
 //! so every icon needs an explicit `.text_color(..)`.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use gpui::{
     canvas, div, img, point, px, radians, svg, AnyElement, AssetSource, Bounds, Hsla, IntoElement,
@@ -734,14 +737,29 @@ pub struct Assets;
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if let Some(fs_path) = path.strip_prefix("fs-symbolic:") {
+            type SymbolicSvgCache = Mutex<HashMap<PathBuf, Option<Arc<[u8]>>>>;
+            const MAX_SYMBOLIC_SVG_CACHE: usize = 256;
+            static SYMBOLIC_SVG_CACHE: OnceLock<SymbolicSvgCache> = OnceLock::new();
+
             let p = std::path::Path::new(fs_path);
             if p.extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
             {
-                if let Ok(bytes) = std::fs::read(p) {
-                    return Ok(Some(Cow::Owned(bytes)));
+                let cache = SYMBOLIC_SVG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                {
+                    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(cached) = guard.get(p) {
+                        return Ok(cached.as_ref().map(|b| Cow::Owned(b.to_vec())));
+                    }
                 }
+                let loaded: Option<Arc<[u8]>> = std::fs::read(p).ok().map(Arc::from);
+                let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.len() >= MAX_SYMBOLIC_SVG_CACHE {
+                    guard.clear();
+                }
+                guard.insert(p.to_path_buf(), loaded.clone());
+                return Ok(loaded.map(|b| Cow::Owned(b.to_vec())));
             }
             return Ok(None);
         }

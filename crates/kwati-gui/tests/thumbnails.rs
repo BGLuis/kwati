@@ -3,13 +3,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{px, size, AppContext as _, Entity, TestAppContext, VisualTestContext};
 use image::{Rgba, RgbaImage};
 use kwati_core::{Entry, Location, Settings, ViewMode};
 use kwati_gui::components::thumbnails::{
-    render_image_from_rgba, ThumbnailCache, ThumbnailKey, MAX_QUEUED_THUMBNAILS,
-    MAX_READY_THUMBNAILS, MAX_THUMBNAIL_JOBS,
+    render_image_from_rgba, ThumbnailCache, ThumbnailKey, MAX_FAILED_THUMBNAILS,
+    MAX_QUEUED_THUMBNAILS, MAX_READY_THUMBNAILS, MAX_THUMBNAIL_JOBS,
 };
 use kwati_gui::state::AppState;
 use kwati_gui::views::MainView;
@@ -66,7 +67,7 @@ fn cache_requests_once_limits_jobs_and_serves_the_result() {
     assert_eq!(cache.queued_count(), 2, "failures are not retried");
     assert_eq!(
         cache.start_jobs().len(),
-        2,
+        MAX_THUMBNAIL_JOBS,
         "finished jobs free their workers"
     );
 }
@@ -141,6 +142,79 @@ fn changing_settings_discards_pictures_and_late_results() {
 }
 
 #[test]
+fn sync_settings_preserves_in_flight_count_until_stale_jobs_finish() {
+    let mut settings = Settings::default();
+    let mut cache = ThumbnailCache::default();
+    cache.sync_settings(&settings, 80);
+
+    for i in 0..MAX_THUMBNAIL_JOBS + 1 {
+        cache.get_or_request(&key(&format!("busy_{i}.png")));
+    }
+    let stale_jobs = cache.start_jobs();
+    assert_eq!(stale_jobs.len(), MAX_THUMBNAIL_JOBS);
+    assert_eq!(cache.in_flight_count(), MAX_THUMBNAIL_JOBS);
+
+    settings.thumbnail_max_file_size_mb = 42;
+    cache.sync_settings(&settings, 80);
+    assert_eq!(cache.in_flight_count(), MAX_THUMBNAIL_JOBS);
+    cache.get_or_request(&key("fresh.png"));
+    assert!(
+        cache.start_jobs().is_empty(),
+        "stale workers still occupy the pool until they finish"
+    );
+
+    for job in stale_jobs {
+        assert!(!cache.finish(&job, Some(picture())));
+    }
+    assert_eq!(cache.in_flight_count(), 0);
+    assert_eq!(cache.ready_count(), 0, "stale results were dropped");
+    assert_eq!(cache.start_jobs().len(), 1, "fresh job can now start");
+}
+
+#[test]
+fn cancel_pending_clears_queue_and_keeps_ready_cache() {
+    let mut cache = ThumbnailCache::default();
+    cache.sync_settings(&Settings::default(), 80);
+    let ready = key("ready.png");
+    let queued = key("queued.png");
+    cache.get_or_request(&ready);
+    let job = cache.start_jobs().remove(0);
+    assert!(cache.finish(&job, Some(picture())));
+
+    assert!(cache.get_or_request(&queued).is_none());
+    assert_eq!(cache.queued_count(), 1);
+    cache.cancel_pending();
+    assert_eq!(cache.queued_count(), 0);
+    assert_eq!(cache.ready_count(), 1);
+    assert!(cache.get_or_request(&ready).is_some());
+}
+
+#[test]
+fn failed_slots_are_bounded() {
+    let mut cache = ThumbnailCache::default();
+    cache.sync_settings(&Settings::default(), 80);
+    let first = key("broken_0.png");
+    cache.get_or_request(&first);
+    let job = cache.start_jobs().remove(0);
+    assert!(cache.finish(&job, None));
+
+    for i in 1..=MAX_FAILED_THUMBNAILS + 10 {
+        let k = key(&format!("broken_{i}.png"));
+        cache.get_or_request(&k);
+        for job in cache.start_jobs() {
+            assert!(cache.finish(&job, None));
+        }
+    }
+
+    assert!(cache.get_or_request(&first).is_none());
+    assert_eq!(
+        cache.queued_count(),
+        1,
+        "oldest failure was evicted and can be queued again"
+    );
+}
+
+#[test]
 fn a_changed_file_is_a_new_key() {
     let path = PathBuf::from("/pics/a.png");
     let location = Location::Local(path.clone());
@@ -195,11 +269,32 @@ fn ready_thumbnails(main: &Entity<MainView>, cx: &mut VisualTestContext) -> usiz
     main.read_with(cx, |main, cx| main.list.read(cx).ready_thumbnail_count())
 }
 
+fn wait_until(
+    cx: &mut VisualTestContext,
+    timeout: Duration,
+    mut condition: impl FnMut(&mut VisualTestContext) -> bool,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        cx.run_until_parked();
+        if condition(cx) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for thumbnail condition"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[gpui::test]
 fn grid_builds_thumbnails_only_for_decodable_listed_images(cx: &mut TestAppContext) {
     let dir = image_fixture("grid");
     let (main, cx) = open_window(cx, &dir, ViewMode::Grid);
-    cx.run_until_parked();
+    wait_until(cx, Duration::from_secs(5), |cx| {
+        ready_thumbnails(&main, cx) == 2
+    });
     assert_eq!(
         ready_thumbnails(&main, cx),
         2,
@@ -214,7 +309,9 @@ fn grid_builds_thumbnails_only_for_decodable_listed_images(cx: &mut TestAppConte
             cx.notify();
         });
     });
-    cx.run_until_parked();
+    wait_until(cx, Duration::from_secs(5), |cx| {
+        ready_thumbnails(&main, cx) == 1
+    });
     assert_eq!(
         ready_thumbnails(&main, cx),
         1,
@@ -232,7 +329,9 @@ fn grid_builds_thumbnails_only_for_decodable_listed_images(cx: &mut TestAppConte
             cx.notify();
         });
     });
-    cx.run_until_parked();
+    wait_until(cx, Duration::from_secs(5), |cx| {
+        ready_thumbnails(&main, cx) == 0
+    });
     assert_eq!(ready_thumbnails(&main, cx), 0);
 
     let _ = fs::remove_dir_all(&dir);

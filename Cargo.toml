@@ -15,3 +15,77 @@ smb = { path = "patches/smb-0.12.1" }
 # `extern crate proc_macro`, triggering a future-incompatibility warning (E0365).
 # Drop this patch once proc-macro-error2 releases a fix or gpui updates stacksafe.
 proc-macro-error2 = { path = "patches/proc-macro-error2-2.0.1" }
+
+# Pure-Rust media/raster decoders are 10x-50x slower at opt-level = 0 and freeze dev runs.
+[profile.dev.package.hayro]
+opt-level = 2
+[profile.dev.package.hayro-interpret]
+opt-level = 2
+[profile.dev.package.hayro-syntax]
+opt-level = 2
+[profile.dev.package.hayro-font]
+opt-level = 2
+[profile.dev.package.hayro-jpeg2000]
+opt-level = 2
+[profile.dev.package.hayro-jbig2]
+opt-level = 2
+[profile.dev.package.hayro-ccitt]
+opt-level = 2
+[profile.dev.package.hayro-postscript]
+opt-level = 2
+[profile.dev.package.hayro-cmap]
+opt-level = 2
+[profile.dev.package.vello_cpu]
+opt-level = 2
+[profile.dev.package.vello_common]
+opt-level = 2
+[profile.dev.package.resvg]
+opt-level = 2
+[profile.dev.package.usvg]
+opt-level = 2
+[profile.dev.package.tiny-skia]
+opt-level = 2
+[profile.dev.package.tiny-skia-path]
+opt-level = 2
+[profile.dev.package.image]
+opt-level = 2
+[profile.dev.package.image-webp]
+opt-level = 2
+[profile.dev.package.zune-jpeg]
+opt-level = 2
+[profile.dev.package.zune-inflate]
+opt-level = 2
+[profile.dev.package.png]
+opt-level = 2
+[profile.dev.package.flate2]
+opt-level = 2
+[profile.dev.package.gif]
+opt-level = 2
+[profile.dev.package.tiff]
+opt-level = 2
+[profile.dev.package.qoi]
+opt-level = 2
+[profile.dev.package.pic-scale]
+opt-level = 2
+[profile.dev.package.kurbo]
+opt-level = 2
+
+# Text shaping, layout, and startup D-Bus crypto crates used in GPUI render/init hot paths.
+[profile.dev.package.cosmic-text]
+opt-level = 2
+[profile.dev.package.rustybuzz]
+opt-level = 2
+[profile.dev.package.ttf-parser]
+opt-level = 2
+[profile.dev.package.swash]
+opt-level = 2
+[profile.dev.package.taffy]
+opt-level = 2
+[profile.dev.package.unicode-bidi]
+opt-level = 2
+[profile.dev.package.unicode-linebreak]
+opt-level = 2
+[profile.dev.package.num-bigint]
+opt-level = 2
+[profile.dev.package.num-bigint-dig]
+opt-level = 2

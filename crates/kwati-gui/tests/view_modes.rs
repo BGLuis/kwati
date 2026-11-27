@@ -622,6 +622,27 @@ fn grid_two_line_labels_fit_within_tile_width_and_ellipsize_on_overflow(cx: &mut
         assert!(measure(&l1) <= max_width, "line 1 overflowed: {l1:?}");
         assert!(measure(&l2) <= max_width, "line 2 overflowed: {l2:?}");
         assert!(l2.ends_with('…'), "expected ellipsis on line 2, got {l2:?}");
+
+        // Realistic long filenames from Pictures and Downloads wrap and stay within tile width.
+        for sample in [
+            "2025-12-30-113111_hyprshot.png",
+            "AQNCo5X-yUh38y7xls57FwY6B9mHOBRaF8ljml85KBej.mp4",
+        ] {
+            let (l1, l2) = fit_two_line_label(sample, max_width, font.clone(), BODY_SIZE, window);
+            let l2 = l2.expect("realistic long name should wrap onto second line");
+            assert!(
+                measure(&l1) <= max_width,
+                "line 1 overflowed for {sample}: {l1:?}"
+            );
+            assert!(
+                measure(&l2) <= max_width,
+                "line 2 overflowed for {sample}: {l2:?}"
+            );
+            assert!(
+                l2.ends_with('…'),
+                "expected ellipsis on line 2 for {sample}, got {l2:?}"
+            );
+        }
     })
     .unwrap();
 

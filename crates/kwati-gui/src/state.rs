@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc;
@@ -268,6 +268,10 @@ pub struct AppState {
     trash_task: Option<Task<()>>,
     watch_task: Option<Task<()>>,
     remote_edit_task: Option<Task<()>>,
+    pending_settings_save: Arc<Mutex<Option<(PathBuf, Settings)>>>,
+    pending_icons_save: Arc<Mutex<Option<(PathBuf, IconConfig)>>>,
+    settings_save_task: Option<Task<()>>,
+    icons_save_task: Option<Task<()>>,
 }
 
 impl AppState {
@@ -346,6 +350,10 @@ impl AppState {
             trash_task: None,
             watch_task: None,
             remote_edit_task: None,
+            pending_settings_save: Arc::new(Mutex::new(None)),
+            pending_icons_save: Arc::new(Mutex::new(None)),
+            settings_save_task: None,
+            icons_save_task: None,
         }
     }
 
@@ -433,19 +441,73 @@ impl AppState {
     }
 
     /// Applies `f` to a copy of `settings`, persists if `settings_path` is set, and commits on success.
+    /// When attached to the UI, disk writes are coalesced onto `background_executor`.
     pub fn update_settings(
         &mut self,
         f: impl FnOnce(&mut Settings) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut next = self.settings.clone();
         f(&mut next)?;
-        if let Some(path) = &self.settings_path {
-            next.save_to(path)
+        if let Some(path) = self.settings_path.clone() {
+            if self.foreground.is_some() {
+                set_active_motion_preference(next.motion_preference);
+                self.settings = next.clone();
+                *self
+                    .pending_settings_save
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((path, next));
+                self.ensure_settings_save_task();
+                return Ok(());
+            }
+            next.save_to(&path)
                 .map_err(|err| format!("Cannot save settings: {err}"))?;
         }
         set_active_motion_preference(next.motion_preference);
         self.settings = next;
         Ok(())
+    }
+
+    fn ensure_settings_save_task(&mut self) {
+        if self.settings_save_task.is_some() {
+            return;
+        }
+        let Some(foreground) = &self.foreground else {
+            return;
+        };
+        let this = foreground.this.clone();
+        let background = foreground.cx.background_executor().clone();
+        let pending = Arc::clone(&self.pending_settings_save);
+        self.settings_save_task = Some(foreground.cx.spawn(async move |cx| loop {
+            let next = pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let Some((path, snapshot)) = next else {
+                let keep_going = this
+                    .update(cx, |state, _| {
+                        let has_more = state
+                            .pending_settings_save
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some();
+                        if !has_more {
+                            state.settings_save_task = None;
+                        }
+                        has_more
+                    })
+                    .unwrap_or(false);
+                if keep_going {
+                    continue;
+                }
+                break;
+            };
+            let res = background
+                .spawn(async move { snapshot.save_to(&path) })
+                .await;
+            if let Err(err) = res {
+                let _ = this.update(cx, |state, cx| {
+                    state.set_status(format!("Cannot save settings: {err}"));
+                    cx.notify();
+                });
+            }
+        }));
     }
 
     /// Resets settings to defaults and persists them if `settings_path` is configured.
@@ -506,19 +568,73 @@ impl AppState {
     }
 
     /// Applies `f` to a copy of `icon_config`, persists if `icons_path` is set, and commits.
+    /// When attached to the UI, disk writes are coalesced onto `background_executor`.
     pub fn update_icon_config(
         &mut self,
         f: impl FnOnce(&mut IconConfig) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut next = self.icon_config.clone();
         f(&mut next)?;
-        if let Some(path) = &self.icons_path {
-            next.save_to(path)
+        if let Some(path) = self.icons_path.clone() {
+            if self.foreground.is_some() {
+                self.icon_config = next.clone();
+                self.icon_resolver.clear_cache();
+                *self
+                    .pending_icons_save
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((path, next));
+                self.ensure_icons_save_task();
+                return Ok(());
+            }
+            next.save_to(&path)
                 .map_err(|err| format!("Cannot save icon preferences: {err}"))?;
         }
         self.icon_config = next;
         self.icon_resolver.clear_cache();
         Ok(())
+    }
+
+    fn ensure_icons_save_task(&mut self) {
+        if self.icons_save_task.is_some() {
+            return;
+        }
+        let Some(foreground) = &self.foreground else {
+            return;
+        };
+        let this = foreground.this.clone();
+        let background = foreground.cx.background_executor().clone();
+        let pending = Arc::clone(&self.pending_icons_save);
+        self.icons_save_task = Some(foreground.cx.spawn(async move |cx| loop {
+            let next = pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let Some((path, snapshot)) = next else {
+                let keep_going = this
+                    .update(cx, |state, _| {
+                        let has_more = state
+                            .pending_icons_save
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some();
+                        if !has_more {
+                            state.icons_save_task = None;
+                        }
+                        has_more
+                    })
+                    .unwrap_or(false);
+                if keep_going {
+                    continue;
+                }
+                break;
+            };
+            let res = background
+                .spawn(async move { snapshot.save_to(&path) })
+                .await;
+            if let Err(err) = res {
+                let _ = this.update(cx, |state, cx| {
+                    state.set_status(format!("Cannot save icon preferences: {err}"));
+                    cx.notify();
+                });
+            }
+        }));
     }
 
     pub fn set_icon_base(&mut self, source: IconSource) -> Result<(), String> {
@@ -1216,18 +1332,28 @@ impl AppState {
         self.load_task = Some(foreground.cx.spawn(async move |cx| {
             let result = background.spawn(async move { read() }).await;
             this.update(cx, |state, cx| {
-                state.finish_load(target, arrival, result);
-                cx.notify();
+                if state.finish_load(target, arrival, result) {
+                    cx.notify();
+                }
             })
             .ok();
         }));
     }
 
-    fn finish_load(&mut self, target: Location, arrival: Arrival, result: io::Result<Vec<Entry>>) {
+    fn finish_load(
+        &mut self,
+        target: Location,
+        arrival: Arrival,
+        result: io::Result<Vec<Entry>>,
+    ) -> bool {
         self.pending_navigation = None;
         let origin = std::mem::take(&mut self.pending_change_origin);
         match result {
             Ok(entries) => {
+                let is_noop_background_reload = arrival == Arrival::Reload
+                    && origin == EntryChangeOrigin::WatcherOrPoll
+                    && self.current_location == target
+                    && entries == *self.entries;
                 self.last_arrival = match arrival {
                     Arrival::Visit => NavigationDirection::Visit,
                     Arrival::Back => NavigationDirection::Back,
@@ -1236,11 +1362,21 @@ impl AppState {
                 };
                 self.last_change_origin = origin;
                 self.arrive(target, arrival);
+                if is_noop_background_reload {
+                    let prev_net = self.network_status;
+                    self.sync_network_status();
+                    let cleared_err = std::mem::take(&mut self.read_failure_shown);
+                    if cleared_err {
+                        self.clear_status();
+                    }
+                    return cleared_err || self.network_status != prev_net;
+                }
                 self.set_entries(entries);
                 self.sync_network_status();
                 if std::mem::take(&mut self.read_failure_shown) {
                     self.clear_status();
                 }
+                true
             }
             Err(err) => {
                 self.read_failure_shown = true;
@@ -1267,6 +1403,7 @@ impl AppState {
                 if let Some(status) = next_net {
                     self.set_network_status(status);
                 }
+                true
             }
         }
     }

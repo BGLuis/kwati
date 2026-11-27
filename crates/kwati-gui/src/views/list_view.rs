@@ -7,15 +7,16 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
     div, font, img, point, prelude::*, px, transparent_black, uniform_list, ClickEvent, Context,
     CursorStyle, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, Font, Hsla,
-    KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    Pixels, Point, RenderImage, ScrollStrategy, SharedString, Stateful, TextRun,
-    UniformListScrollHandle, Window,
+    KeyDownEvent, LineFragment, LineWrapper, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, RenderImage, ScrollStrategy,
+    SharedString, Stateful, Task, UniformListScrollHandle, Window,
 };
 use kwati_core::thumbnail::{generate_thumbnail, wants_thumbnail};
 use kwati_core::{
@@ -30,12 +31,12 @@ use crate::actions::navigation::{
 use crate::actions::operations::cut_location_set;
 use crate::components::interactive::focus_ring_color;
 use crate::components::thumbnails::{
-    render_image_from_rgba, ThumbnailCache, ThumbnailJob, ThumbnailKey,
+    global_thumbnail_pool, render_image_from_rgba, ThumbnailCache, ThumbnailJob, ThumbnailKey,
 };
 use crate::components::{
-    fast_icon_for_entry, icon_for_entry, probe_entry_icon, render_resolved_icon,
-    resolve_icon_color, uniform_list_scroll_metrics, uniform_list_scrollbar, Ellipsize, IconMotion,
-    IconName, ScrollbarDrag, ScrollbarState, SpecialFolders,
+    fast_icon_for_entry, probe_entry_icon, render_resolved_icon, resolve_icon_color,
+    uniform_list_scroll_metrics, uniform_list_scrollbar, Ellipsize, IconMotion, IconName,
+    ScrollbarDrag, ScrollbarState, SpecialFolders,
 };
 use crate::motion::{
     color_lerp, is_reduced_motion, lerp_f32, request_frame_if_active, Curve, MotionKind,
@@ -216,6 +217,8 @@ pub struct ListView {
     base_icon_color_cache: HashMap<IconName, Hsla>,
     cached_icon_prefs: IconPreferences,
     thumbnails: ThumbnailCache,
+    thumbnail_generation: Arc<AtomicU64>,
+    thumbnail_notify_task: Option<Task<()>>,
     cached_theme: Option<Theme>,
     cached_grid_font: Option<SharedString>,
     requested_frame_in_render: bool,
@@ -285,6 +288,8 @@ impl ListView {
             base_icon_color_cache: HashMap::new(),
             cached_icon_prefs: initial_icon_prefs,
             thumbnails: ThumbnailCache::default(),
+            thumbnail_generation: Arc::new(AtomicU64::new(0)),
+            thumbnail_notify_task: None,
             cached_theme: None,
             cached_grid_font: None,
             requested_frame_in_render: false,
@@ -1047,91 +1052,64 @@ pub fn fit_two_line_label(
         return (String::new(), None);
     }
 
-    let text_system = window.text_system();
-    let make_run = |len: usize| {
-        [TextRun {
-            len,
-            font: font.clone(),
-            color: gpui::black(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        }]
-    };
-    let line_width = |s: &str| -> Pixels {
-        if s.is_empty() {
-            return px(0.);
-        }
-        text_system
-            .shape_line(s.to_string().into(), font_size, &make_run(s.len()), None)
-            .width
-    };
-
-    if line_width(&clean) <= max_width {
-        return (clean.into_owned(), None);
-    }
-
-    let Ok(lines) = text_system.shape_text(
-        clean.as_ref().to_string().into(),
-        font_size,
-        &make_run(clean.len()),
-        Some(max_width),
-        None,
-    ) else {
-        return (clean.into_owned(), None);
-    };
-
-    let Some(first) = lines.first() else {
-        return (clean.into_owned(), None);
-    };
-    let Some(b0) = first.wrap_boundaries().first() else {
-        return (truncate_to_width(&clean, max_width, &line_width), None);
-    };
-    let Some(split_ix) = first
-        .runs()
-        .get(b0.run_ix)
-        .and_then(|r| r.glyphs.get(b0.glyph_ix))
-        .map(|g| g.index)
+    let safe_width = (max_width - px(1.)).max(px(0.));
+    let mut wrapper = window.text_system().line_wrapper(font, font_size);
+    let Some(boundary) = wrapper
+        .wrap_line(&[LineFragment::text(&clean)], safe_width)
+        .next()
     else {
         return (clean.into_owned(), None);
     };
+
+    let split_ix = boundary.ix;
     if split_ix == 0 || split_ix >= clean.len() {
-        return (truncate_to_width(&clean, max_width, &line_width), None);
+        return (
+            truncate_line_with_wrapper(&mut wrapper, &clean, safe_width),
+            None,
+        );
     }
 
     let line1 = clean[..split_ix].trim_end();
     let rest = clean[split_ix..].trim_start();
+    if line1.is_empty() {
+        return if rest.is_empty() {
+            (String::new(), None)
+        } else {
+            (
+                truncate_line_with_wrapper(&mut wrapper, rest, safe_width),
+                None,
+            )
+        };
+    }
     if rest.is_empty() {
         return (line1.to_string(), None);
     }
-    if line_width(rest) <= max_width {
+    if wrapper
+        .wrap_line(&[LineFragment::text(rest)], safe_width)
+        .next()
+        .is_none()
+    {
         return (line1.to_string(), Some(rest.to_string()));
     }
     (
         line1.to_string(),
-        Some(truncate_to_width(rest, max_width, &line_width)),
+        Some(truncate_line_with_wrapper(&mut wrapper, rest, safe_width)),
     )
 }
 
-fn truncate_to_width(text: &str, max_width: Pixels, measure: &impl Fn(&str) -> Pixels) -> String {
-    let mut offsets: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
-    offsets.push(text.len());
-    let mut lo = 0usize;
-    let mut hi = offsets.len() - 1;
-    let mut best = 0usize;
-    while lo <= hi {
-        let mid = lo + (hi - lo) / 2;
-        let candidate = format!("{}…", &text[..offsets[mid]]);
-        if measure(&candidate) <= max_width {
-            best = mid;
-            lo = mid + 1;
-        } else if mid == 0 {
-            break;
-        } else {
-            hi = mid - 1;
-        }
+fn truncate_line_with_wrapper(wrapper: &mut LineWrapper, text: &str, max_width: Pixels) -> String {
+    let mut runs = Vec::new();
+    let truncated = wrapper.truncate_line(
+        SharedString::from(text.to_owned()),
+        max_width,
+        "…",
+        &mut runs,
+    );
+    if truncated.ends_with('…') {
+        truncated.to_string()
+    } else {
+        "…".to_string()
     }
-    format!("{}…", &text[..offsets[best]])
 }
 
 /// Computes how many `104 px` tiles fit horizontally inside `width` with `12 px` outer
@@ -1410,6 +1388,8 @@ impl Render for DragEntriesPreview {
     }
 }
 
+const THUMBNAIL_NOTIFY_COALESCE: Duration = Duration::from_millis(16);
+
 impl ListView {
     fn cached_entry_icon(&mut self, ix: usize, entry: &Entry, is_remote: bool) -> IconName {
         if self.entry_icon_cache.len() <= ix {
@@ -1482,15 +1462,44 @@ impl ListView {
             .get_or_request(&ThumbnailKey::for_entry(loc.clone(), entry))
     }
 
-    fn flush_thumbnails(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for image in self.thumbnails.take_evicted() {
-            let _ = window.drop_image(image);
+    fn sync_thumbnail_generation(&self) {
+        self.thumbnail_generation
+            .store(self.thumbnails.generation(), Ordering::Relaxed);
+    }
+
+    fn cancel_pending_thumbnails(&mut self) {
+        self.thumbnails.cancel_pending();
+        self.sync_thumbnail_generation();
+        self.thumbnail_notify_task = None;
+    }
+
+    fn schedule_thumbnail_notify(&mut self, cx: &mut Context<Self>) {
+        if self.thumbnails.in_flight_count() == 0 && self.thumbnails.queued_count() == 0 {
+            self.thumbnail_notify_task = None;
+            cx.notify();
+            return;
         }
+        if self.thumbnail_notify_task.is_some() {
+            return;
+        }
+        self.thumbnail_notify_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(THUMBNAIL_NOTIFY_COALESCE)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.thumbnail_notify_task = None;
+                cx.notify();
+            });
+        }));
+    }
+
+    fn start_pending_thumbnails(&mut self, cx: &mut Context<Self>) {
         let jobs = self.thumbnails.start_jobs();
         if jobs.is_empty() {
             return;
         }
         let max_px = self.thumbnails.max_px();
+        let pool = global_thumbnail_pool();
         for job in jobs {
             let remote = match &job.key.location {
                 Location::Local(_) => None,
@@ -1505,23 +1514,34 @@ impl ListView {
                     }
                 }
             };
+            let work = job.clone();
+            let rx = pool.submit(
+                Some((Arc::clone(&self.thumbnail_generation), job.generation)),
+                move || {
+                    build_thumbnail(&work, remote, max_px)
+                        .ok()
+                        .map(render_image_from_rgba)
+                },
+            );
             cx.spawn(async move |this, cx| {
-                let work = job.clone();
-                let image = cx
-                    .background_executor()
-                    .spawn(async move {
-                        build_thumbnail(&work, remote, max_px)
-                            .ok()
-                            .map(render_image_from_rgba)
-                    })
-                    .await;
+                let image = rx.await.ok().flatten();
                 let _ = this.update(cx, |this, cx| {
-                    this.thumbnails.finish(&job, image);
-                    cx.notify();
+                    let applied = this.thumbnails.finish(&job, image);
+                    this.start_pending_thumbnails(cx);
+                    if applied {
+                        this.schedule_thumbnail_notify(cx);
+                    }
                 });
             })
             .detach();
         }
+    }
+
+    fn flush_thumbnails(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for image in self.thumbnails.take_evicted() {
+            let _ = window.drop_image(image);
+        }
+        self.start_pending_thumbnails(cx);
     }
 
     fn cached_row_text(
@@ -2291,6 +2311,9 @@ impl ListView {
         self.pending_icon_probes.clear();
         self.row_text_cache.clear();
         self.grid_label_cache.clear();
+        if dir_changed {
+            self.cancel_pending_thumbnails();
+        }
 
         let new_entries: Vec<(Location, Entry)> = state
             .entries
@@ -2361,7 +2384,6 @@ impl ListView {
 
             if !del_set.is_empty() && view_mode != ViewMode::Grid {
                 let is_remote = matches!(state.current_location, Location::Remote { .. });
-                let specials = SpecialFolders::from_system();
                 self.exiting_scroll_top = scroll_top;
                 for (old_ix, (loc, entry)) in self.prev_entries.iter().enumerate() {
                     if del_set.contains(loc)
@@ -2369,9 +2391,15 @@ impl ListView {
                         && old_ix >= scroll_top.saturating_sub(8)
                         && old_ix < scroll_top + 48
                     {
+                        let (icon, _) = fast_icon_for_entry(
+                            &entry.path,
+                            entry.is_dir(),
+                            is_remote,
+                            &self.special_folders,
+                        );
                         self.exiting_rows.push(ExitingRow {
                             name: entry.display_name(),
-                            icon: icon_for_entry(&entry.path, entry.is_dir(), is_remote, &specials),
+                            icon,
                             is_dir: entry.is_dir(),
                             is_hidden: entry.is_hidden,
                             size_str: format_size(entry.size, entry.is_dir()),
@@ -2470,6 +2498,9 @@ impl Render for ListView {
             self.reorder_offsets.clear();
             self.hovered_location = None;
             self.pressed_location = None;
+            if view_mode != ViewMode::Grid {
+                self.cancel_pending_thumbnails();
+            }
             if let Some(ix) = self.app_state.read(cx).selected_index() {
                 self.scroll_to_item(ix);
             } else {
@@ -2522,6 +2553,7 @@ impl Render for ListView {
             }
             let thumbnail_px = (GRID_ICON_SIZE / px(1.) * window.scale_factor()).round() as u32;
             self.thumbnails.sync_settings(&state.settings, thumbnail_px);
+            self.sync_thumbnail_generation();
             (
                 state.entries.clone(),
                 state.current_location.clone(),

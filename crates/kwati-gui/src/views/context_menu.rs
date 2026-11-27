@@ -7,7 +7,7 @@ use std::time::Instant;
 use gpui::{
     anchored, deferred, div, point, prelude::*, px, AnyElement, Context, CursorStyle, Entity,
     EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
-    Point, SharedString, Size, Window,
+    Point, SharedString, Size, Task, Window,
 };
 use kwati_core::{
     all_local_volumes, volume_kind, Location, SortColumn, SortDirection, ViewMode, VolumeKind,
@@ -583,6 +583,8 @@ pub struct ContextMenuView {
     submenu_hovered_index: Option<usize>,
     opened_at: Option<Instant>,
     motion: MotionTracker<usize>,
+    load_generation: u64,
+    load_task: Option<Task<()>>,
 }
 
 impl EventEmitter<ContextMenuEvent> for ContextMenuView {}
@@ -610,6 +612,39 @@ impl ContextMenuView {
             submenu_hovered_index: None,
             opened_at: None,
             motion: MotionTracker::new(),
+            load_generation: 0,
+            load_task: None,
+        }
+    }
+
+    fn cancel_pending_load(&mut self) {
+        self.load_task = None;
+        self.load_generation = self.load_generation.wrapping_add(1);
+    }
+
+    fn clamp_focus_indices(&mut self) {
+        if self
+            .focused_index
+            .is_some_and(|ix| !self.entries.get(ix).is_some_and(is_entry_navigable))
+        {
+            self.focused_index = first_enabled_index_in(&self.entries);
+        }
+        if let Some(sub_ix) = self.open_submenu {
+            match self.entries.get(sub_ix) {
+                Some(ContextMenuEntry::Submenu { items, .. }) => {
+                    if self
+                        .submenu_focused_index
+                        .is_some_and(|ix| !items.get(ix).is_some_and(is_entry_navigable))
+                    {
+                        self.submenu_focused_index = first_enabled_index_in(items);
+                    }
+                }
+                _ => {
+                    self.open_submenu = None;
+                    self.submenu_focused_index = None;
+                    self.submenu_hovered_index = None;
+                }
+            }
         }
     }
 
@@ -652,6 +687,8 @@ impl ContextMenuView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_pending_load();
+
         enum MenuSelectionKind {
             Empty,
             Single {
@@ -660,7 +697,7 @@ impl ContextMenuView {
                 open_with_target: Option<PathBuf>,
             },
             Multi {
-                trash_available: bool,
+                local_dir: Option<PathBuf>,
             },
         }
 
@@ -673,7 +710,7 @@ impl ContextMenuView {
                         let location = state.location_of(entry);
                         let (folder_bookmarked, open_with_target) = match &location {
                             Location::Local(path) => {
-                                if entry.is_dir() || path.is_dir() {
+                                if entry.is_dir() {
                                     (Some(state.is_place_pinned(path)), None)
                                 } else {
                                     (None, Some(path.clone()))
@@ -690,11 +727,11 @@ impl ContextMenuView {
                     None => MenuSelectionKind::Empty,
                 },
                 _ => {
-                    let trash_available = match &state.current_location {
-                        Location::Local(dir) => volume_kind(dir) == VolumeKind::Local,
-                        Location::Remote { .. } => false,
+                    let local_dir = match &state.current_location {
+                        Location::Local(dir) => Some(dir.clone()),
+                        Location::Remote { .. } => None,
                     };
-                    MenuSelectionKind::Multi { trash_available }
+                    MenuSelectionKind::Multi { local_dir }
                 }
             };
             let folder_state = FolderMenuState {
@@ -728,27 +765,69 @@ impl ContextMenuView {
                 folder_bookmarked,
                 open_with_target,
             } => {
-                let open_with_apps = open_with_target
-                    .as_deref()
-                    .map(menu_applications_for)
-                    .unwrap_or_default();
-                self.open_with_target = open_with_target;
-                self.open_with_apps = open_with_apps;
+                self.open_with_target = open_with_target.clone();
+                self.open_with_apps.clear();
                 self.entries = build_context_menu_entries(
                     std::slice::from_ref(&location),
                     has_clipboard,
                     folder_bookmarked,
-                    self.open_with_target
-                        .as_ref()
-                        .map(|_| self.open_with_apps.as_slice()),
+                    self.open_with_target.as_ref().map(|_| [].as_slice()),
                     folder_state,
                     undo_label,
                 );
+                if let Some(target_path) = open_with_target {
+                    let generation = self.load_generation;
+                    let loc = location;
+                    self.load_task = Some(cx.spawn(async move |this, cx| {
+                        let apps = cx
+                            .background_executor()
+                            .spawn(async move { menu_applications_for(&target_path) })
+                            .await;
+                        let _ = this.update(cx, |menu, cx| {
+                            if !menu.is_open || menu.load_generation != generation {
+                                return;
+                            }
+                            menu.load_task = None;
+                            menu.open_with_apps = apps;
+                            menu.entries = build_context_menu_entries(
+                                std::slice::from_ref(&loc),
+                                has_clipboard,
+                                folder_bookmarked,
+                                Some(menu.open_with_apps.as_slice()),
+                                folder_state,
+                                undo_label,
+                            );
+                            menu.clamp_focus_indices();
+                            cx.notify();
+                        });
+                    }));
+                }
             }
-            MenuSelectionKind::Multi { trash_available } => {
+            MenuSelectionKind::Multi { local_dir } => {
                 self.open_with_target = None;
                 self.open_with_apps.clear();
-                self.entries = build_multi_selection_menu_entries(trash_available);
+                let initial_trash = local_dir.is_some();
+                self.entries = build_multi_selection_menu_entries(initial_trash);
+                if let Some(dir) = local_dir {
+                    let generation = self.load_generation;
+                    self.load_task = Some(cx.spawn(async move |this, cx| {
+                        let trash_available = cx
+                            .background_executor()
+                            .spawn(async move { volume_kind(&dir) == VolumeKind::Local })
+                            .await;
+                        let _ = this.update(cx, |menu, cx| {
+                            if !menu.is_open || menu.load_generation != generation {
+                                return;
+                            }
+                            menu.load_task = None;
+                            if trash_available != initial_trash {
+                                menu.entries = build_multi_selection_menu_entries(trash_available);
+                                menu.clamp_focus_indices();
+                                cx.notify();
+                            }
+                        });
+                    }));
+                }
             }
         }
         self.position = position;
@@ -773,6 +852,7 @@ impl ContextMenuView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_pending_load();
         self.open_with_target = None;
         self.open_with_apps.clear();
         self.entries = build_sidebar_place_menu_entries(index, is_trash);
@@ -791,6 +871,7 @@ impl ContextMenuView {
 
     /// Closes the menu and notifies listeners to restore focus.
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.cancel_pending_load();
         if !self.is_open {
             return;
         }
@@ -810,6 +891,7 @@ impl ContextMenuView {
     }
 
     fn trigger(&mut self, action: ContextMenuAction, cx: &mut Context<Self>) {
+        self.cancel_pending_load();
         self.is_open = false;
         self.entries.clear();
         self.focused_index = None;

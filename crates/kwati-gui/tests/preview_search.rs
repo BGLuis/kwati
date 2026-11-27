@@ -685,3 +685,65 @@ fn preview_loads_asynchronously_cancels_stale_and_skips_when_closed(cx: &mut Tes
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[gpui::test]
+fn image_preview_decodes_off_thread_bounded_and_clears_on_close(cx: &mut TestAppContext) {
+    let temp_dir = std::env::temp_dir().join(format!("kwati_preview_img_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let large_png = temp_dir.join("wide.png");
+    image::RgbaImage::from_pixel(1600, 800, image::Rgba([20, 120, 220, 255]))
+        .save(&large_png)
+        .unwrap();
+
+    cx.update(|cx| {
+        register_keybindings(cx);
+        register_text_input_keybindings(cx);
+    });
+
+    let location = Location::Local(temp_dir.clone());
+    let (main, cx) = cx.add_window_view(|window, cx| {
+        let state = cx.new(|cx| {
+            let mut state = AppState::new(location);
+            state.attach(cx);
+            state.reload_entries();
+            state
+        });
+        MainView::new(state, window, cx)
+    });
+    cx.run_until_parked();
+
+    main.update(cx, |main, cx| {
+        main.list.update(cx, |list, cx| {
+            list.select_next(cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(60));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        cx.run_until_parked();
+        let ready = main.read_with(cx, |main, cx| main.preview.read(cx).has_decoded_image());
+        if ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for decoded preview image"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let dims = main.read_with(cx, |main, cx| {
+        main.preview.read(cx).decoded_image_dimensions()
+    });
+    assert_eq!(dims, Some((1024, 512)));
+
+    cx.simulate_keystrokes("alt-p");
+    cx.run_until_parked();
+    let cleared = main.read_with(cx, |main, cx| !main.preview.read(cx).has_decoded_image());
+    assert!(cleared, "closing preview must release decoded RenderImage");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

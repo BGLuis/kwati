@@ -3,7 +3,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use notify::{PollWatcher, RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{Config, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher as _};
 
 use crate::volume::{volume_kind, VolumeKind};
 
@@ -80,7 +80,7 @@ impl DirWatcher {
             WatcherBackend::Native => {
                 let tx_native = tx.clone();
                 match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                    if event.is_ok() {
+                    if matches!(event, Ok(ref ev) if is_relevant_event(ev)) {
                         let _ = tx_native.send(());
                     }
                 }) {
@@ -92,10 +92,10 @@ impl DirWatcher {
                         )
                     }
                     Err(_) => {
-                        let config = notify::Config::default().with_poll_interval(poll_interval);
-                        let mut poll_watcher = notify::PollWatcher::new(
+                        let config = Config::default().with_poll_interval(poll_interval);
+                        let mut poll_watcher = PollWatcher::new(
                             move |event: notify::Result<notify::Event>| {
-                                if event.is_ok() {
+                                if matches!(event, Ok(ref ev) if is_relevant_event(ev)) {
                                     let _ = tx.send(());
                                 }
                             },
@@ -107,10 +107,10 @@ impl DirWatcher {
                 }
             }
             WatcherBackend::Poll => {
-                let config = notify::Config::default().with_poll_interval(poll_interval);
-                let mut poll_watcher = notify::PollWatcher::new(
+                let config = Config::default().with_poll_interval(poll_interval);
+                let mut poll_watcher = PollWatcher::new(
                     move |event: notify::Result<notify::Event>| {
-                        if event.is_ok() {
+                        if matches!(event, Ok(ref ev) if is_relevant_event(ev)) {
                             let _ = tx.send(());
                         }
                     },
@@ -165,6 +165,10 @@ impl DirWatcher {
     pub fn is_polling(&self) -> bool {
         self.backend == WatcherBackend::Poll
     }
+}
+
+fn is_relevant_event(event: &notify::Event) -> bool {
+    !matches!(event.kind, EventKind::Access(_))
 }
 
 impl Drop for DirWatcher {

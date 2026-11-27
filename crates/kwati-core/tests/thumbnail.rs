@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use image::{Rgba, RgbaImage};
 use kwati_core::thumbnail::{
-    generate_thumbnail, parse_thumbnail_extensions, wants_thumbnail, SUPPORTED_THUMBNAIL_EXTENSIONS,
+    generate_preview_image, generate_thumbnail, parse_thumbnail_extensions, wants_thumbnail,
+    SUPPORTED_THUMBNAIL_EXTENSIONS,
 };
 use kwati_core::Settings;
 
@@ -202,4 +203,49 @@ fn parse_extensions_normalizes_and_reports_unsupported() {
     for ext in SUPPORTED_THUMBNAIL_EXTENSIONS {
         assert_eq!(parse_thumbnail_extensions(ext), Ok(vec![ext.to_string()]));
     }
+}
+
+#[test]
+fn svg_zero_size_and_excessive_complexity_are_rejected() {
+    let dir = TestDir::new("thumb_svg_limits");
+
+    let zero_svg = dir.file("zero.svg");
+    std::fs::write(
+        &zero_svg,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"><rect width="1" height="1"/></svg>"##,
+    )
+    .unwrap();
+    assert!(generate_thumbnail(&zero_svg, 64).is_err());
+
+    let mut complex =
+        String::from(r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">"##);
+    for i in 0..10_005 {
+        complex.push_str(&format!(
+            r#"<rect x="{}" y="0" width="1" height="1"/>"#,
+            i % 100
+        ));
+    }
+    complex.push_str("</svg>");
+    let complex_svg = dir.file("complex.svg");
+    std::fs::write(&complex_svg, complex).unwrap();
+    assert!(generate_thumbnail(&complex_svg, 64).is_err());
+}
+
+#[test]
+fn preview_image_downscales_large_images_without_upscaling_small_ones() {
+    let dir = TestDir::new("preview_image_bounds");
+
+    let small_path = dir.file("small.png");
+    RgbaImage::from_pixel(16, 16, RED)
+        .save(&small_path)
+        .unwrap();
+    let small_preview = generate_preview_image(&small_path, 1024).unwrap();
+    assert_eq!(small_preview.dimensions(), (16, 16));
+
+    let large_path = dir.file("large.png");
+    RgbaImage::from_pixel(2000, 1000, BLUE)
+        .save(&large_path)
+        .unwrap();
+    let large_preview = generate_preview_image(&large_path, 1024).unwrap();
+    assert_eq!(large_preview.dimensions(), (1024, 512));
 }
